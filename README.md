@@ -19,11 +19,11 @@ This means:
 
 | Document | Description |
 |----------|-------------|
-| **[BENCHMARK.md](BENCHMARK.md)** | Complete benchmark suite documentation (methodology, usage, statistical analysis) |
-| **[EBPF_DESIGN.md](EBPF_DESIGN.md)** | eBPF tracer architecture and implementation |
-| **[LTTNG_DESIGN.md](LTTNG_DESIGN.md)** | LTTng tracer architecture and implementation |
-| **[SAMPLE_APP.md](SAMPLE_APP.md)** | Sample library and application documentation |
-| **[VALIDATION.md](VALIDATION.md)** | Trace validation script documentation |
+| **[BENCHMARK.md](docs/BENCHMARK.md)** | Complete benchmark suite documentation (methodology, usage, statistical analysis) |
+| **[EBPF_DESIGN.md](docs/EBPF_DESIGN.md)** | eBPF tracer architecture and implementation |
+| **[LTTNG_DESIGN.md](docs/LTTNG_DESIGN.md)** | LTTng tracer architecture and implementation |
+| **[SAMPLE_APP.md](docs/SAMPLE_APP.md)** | Sample library and application documentation |
+| **[VALIDATION.md](docs/VALIDATION.md)** | Trace validation script documentation |
 | **[BUILD.md](BUILD.md)** | Build system and compilation guide |
 
 ---
@@ -58,7 +58,7 @@ sudo apt-get install linux-tools-generic linux-tools-$(uname -r)
 Ensure both tracers work correctly:
 
 ```bash
-sudo ./validate_output.sh
+sudo ./scripts/validate_output.sh
 ```
 
 Expected output:
@@ -71,7 +71,7 @@ Expected output:
 ### 4. Run Benchmark
 
 ```bash
-sudo ./benchmark.py ./build
+sudo ./scripts/benchmark.py ./build
 ```
 
 This runs **1,800 tests** (6 scenarios × 3 methods × 100 runs) and generates an HTML report with interactive charts.
@@ -130,25 +130,34 @@ Function Duration vs Overhead %
 ### Components
 
 ```
-├── sample_library/          # Target library to trace
+├── src/sample/sample_library/          # Target library to trace
 │   ├── mylib.c             # Function with configurable work duration
 │   └── mylib.h
 │
-├── sample_app/              # Test application
+├── src/sample/sample_app/              # Test application
 │   └── main.c              # Calls traced function repeatedly
 │
-├── lttng_tracer/            # LTTng implementation
+├── src/tools/lttng_tracer/            # LTTng implementation
 │   ├── mylib_tp.h          # Tracepoint definitions
 │   ├── mylib_tp.c          # Tracepoint implementation
 │   └── mylib_wrapper.c     # LD_PRELOAD wrapper
 │
-├── ebpf_tracer/             # eBPF implementation
+├── src/tools/ebpf_tracer/             # eBPF implementation
 │   ├── mylib_tracer.bpf.c  # Kernel-side eBPF program (uprobes)
 │   └── mylib_tracer.c      # Userspace loader
 │
-├── benchmark.py  # Python benchmark suite
-├── validate_output.sh          # Correctness validation
-└── build.sh                    # Build wrapper
+├── scripts/                 # Automation scripts
+│   ├── benchmark.py        # Python benchmark suite
+│   └── validate_output.sh  # Correctness validation
+│
+├── docs/                    # Documentation
+│   ├── BENCHMARK.md        # Benchmark documentation
+│   ├── EBPF_DESIGN.md      # eBPF design documentation
+│   ├── LTTNG_DESIGN.md     # LTTng design documentation
+│   ├── SAMPLE_APP.md       # Sample app documentation
+│   └── VALIDATION.md       # Validation documentation
+│
+└── build.sh                 # Build wrapper
 ```
 
 ### How It Works
@@ -230,18 +239,18 @@ cat /tmp/trace.txt
 ### Validation
 
 ```bash
-sudo ./validate_output.sh  # Verify both tracers work correctly
+sudo ./scripts/validate_output.sh  # Verify both tracers work correctly
 ```
 
 ### Benchmarking
 
 ```bash
 # Full benchmark (100 runs per scenario, ~40-60 min)
-sudo ./benchmark.py ./build
+sudo ./scripts/benchmark.py ./build
 
 # Quick test (10 runs, ~5-10 min)
-# Edit line 59: num_runs=10
-sudo ./benchmark.py ./build
+# Edit line 59 in scripts/benchmark.py: num_runs=10
+sudo ./scripts/benchmark.py ./build
 ```
 
 ### View Results
@@ -363,8 +372,8 @@ This makes eBPF ideal for GPU tracing, where function durations far exceed the t
 ---
 
 **Quick Links**:
-- 📖 [Complete Benchmark Guide](BENCHMARK.md)
-- 🔬 [eBPF Design](EBPF_DESIGN.md)
-- 🔬 [LTTng Design](LTTNG_DESIGN.md)
+- 📖 [Complete Benchmark Guide](docs/BENCHMARK.md)
+- 🔬 [eBPF Design](docs/EBPF_DESIGN.md)
+- 🔬 [LTTng Design](docs/LTTNG_DESIGN.md)
 - 🏗️ [Build Guide](BUILD.md)
-- ✅ [Validation Guide](VALIDATION.md)
+- ✅ [Validation Guide](docs/VALIDATION.md)

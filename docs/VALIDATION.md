@@ -65,7 +65,7 @@ The `validate_output.sh` script is an **automated correctness test** that verifi
 ### Basic Usage
 
 ```bash
-sudo ./validate_output.sh
+sudo ../scripts/validate_output.sh
 ```
 
 **Why sudo?**
@@ -288,10 +288,10 @@ rm -f $EBPF_TRACE_FILE           # /tmp/ebpf_validation_12345.txt
 **Usage in CI/CD:**
 ```bash
 #!/bin/bash
-sudo ./validate_output.sh
+sudo ../scripts/validate_output.sh
 if [ $? -eq 0 ]; then
     echo "✓ Validation passed, proceeding to benchmarks..."
-    ./benchmark.py ./build
+    ../scripts/benchmark.py ./build
 else
     echo "✗ Validation failed, aborting!"
     exit 1
@@ -309,7 +309,7 @@ fi
 
 **Solution:**
 ```bash
-sudo ./validate_output.sh
+sudo ../scripts/validate_output.sh
 ```
 
 ### Build Artifacts Not Found
@@ -323,7 +323,7 @@ Please build first with: ./build.sh
 **Solution:**
 ```bash
 ./build.sh -c
-sudo ./validate_output.sh
+sudo ../scripts/validate_output.sh
 ```
 
 ### eBPF Tracer Failed to Start
@@ -403,10 +403,10 @@ jobs:
         run: ./build.sh -c
 
       - name: Run Validation
-        run: sudo ./validate_output.sh
+        run: sudo ../scripts/validate_output.sh
 
       - name: Run Benchmarks (if validation passes)
-        run: sudo ./benchmark.py ./build
+        run: sudo ../scripts/benchmark.py ./build
 ```
 
 ### Pre-Benchmark Check
@@ -416,7 +416,7 @@ jobs:
 # run_benchmarks.sh
 
 # Validate first
-sudo ./validate_output.sh
+sudo ../scripts/validate_output.sh
 if [ $? -ne 0 ]; then
     echo "❌ Validation failed, aborting benchmarks"
     exit 1
@@ -424,7 +424,7 @@ fi
 
 # Validation passed, run benchmarks
 echo "✅ Validation passed, starting benchmarks..."
-sudo ./benchmark.py ./build
+sudo ../scripts/benchmark.py ./build
 ```
 
 ## Advanced Usage
@@ -444,7 +444,7 @@ Or make it a command-line argument:
 #!/bin/bash
 NUM_ITERATIONS=${1:-1000}  # Default 1000, or first arg
 
-sudo ./validate_output.sh 5000  # Run with 5000 iterations
+sudo ../scripts/validate_output.sh 5000  # Run with 5000 iterations
 ```
 
 ### Save Traces for Inspection
@@ -457,7 +457,7 @@ Disable cleanup to inspect traces:
 # rm -f $LTTNG_TEXT
 # rm -f $EBPF_TRACE_FILE
 
-sudo ./validate_output.sh
+sudo ../scripts/validate_output.sh
 
 # Traces remain in /tmp/lttng_validation_* and /tmp/ebpf_validation_*
 cat /tmp/ebpf_validation_*.txt | head -20
@@ -495,5 +495,5 @@ The validation script ensures:
 **Best practice**: Run validation before every benchmark to ensure tracers work correctly!
 
 ```bash
-sudo ./validate_output.sh && sudo ./benchmark.py ./build
+sudo ../scripts/validate_output.sh && sudo ../scripts/benchmark.py ./build
 ```

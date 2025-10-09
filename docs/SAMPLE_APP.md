@@ -330,7 +330,7 @@ cat /tmp/trace.txt
 The comprehensive benchmark uses the sample library/app:
 
 ```bash
-sudo ./benchmark.py ./build
+sudo ../scripts/benchmark.py ./build
 ```
 
 Internally runs:

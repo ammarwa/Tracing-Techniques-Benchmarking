@@ -15,7 +15,7 @@ This project includes a comprehensive Python-based benchmark suite that measures
 ### 2. Run Comprehensive Benchmark
 
 ```bash
-sudo ./benchmark.py ./build
+sudo ../scripts/benchmark.py ./build
 ```
 
 ### 3. View Results
@@ -113,7 +113,7 @@ The HTML report displays confidence intervals in the results table:
 The sample library supports configurable work duration via environment variable:
 
 ```c
-// In sample_library/mylib.c
+// In src/sample/sample_library/mylib.c
 void set_simulated_work_duration(unsigned int sleep_us);
 
 // Called automatically from environment variable
@@ -350,7 +350,7 @@ The benchmark uses only standard library modules (no external dependencies):
 eBPF tracing requires root:
 
 ```bash
-sudo ./benchmark.py ./build
+sudo ../scripts/benchmark.py ./build
 ```
 
 ### LTTng Session Errors

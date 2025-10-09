@@ -49,13 +49,13 @@ jobs:
       - name: Build project
         run: |
           export CC=clang-14
-          ./build.sh -c
+          ./build.sh
         env:
           CC: clang-14
 
       - name: Run validation tests
         run: |
-          sudo ./validate_output.sh
+          sudo ./scripts/validate_output.sh
 
   benchmark:
     needs: build-and-validate
@@ -104,7 +104,7 @@ jobs:
           # Create modified benchmark script with fewer runs for CI speed
           # Original: 100 runs per scenario (~40-60 min)
           # CI: 20 runs per scenario (~8-12 min)
-          sed 's/num_runs = 100/num_runs = 20/g' benchmark.py > benchmark_ci.py
+          sed 's/num_runs = 100/num_runs = 20/g' scripts/benchmark.py > benchmark_ci.py
           chmod +x benchmark_ci.py
           sudo python3 benchmark_ci.py ./build
         timeout-minutes: 30
