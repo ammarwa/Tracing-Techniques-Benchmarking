@@ -143,7 +143,22 @@ if(BUILD_EBPF)
         set(BPF_OBJ ${CMAKE_BINARY_DIR}/mylib_tracer.bpf.o)
         set(BPF_SKEL ${CMAKE_BINARY_DIR}/mylib_tracer.skel.h)
 
-        # Compile BPF program
+        # Find kernel headers directory
+        execute_process(
+            COMMAND uname -r
+            OUTPUT_VARIABLE KERNEL_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+
+        # Try multiple possible kernel header locations
+        set(KERNEL_HEADER_PATHS
+            "/usr/src/linux-headers-${KERNEL_VERSION}/include"
+            "/usr/src/linux-headers-${KERNEL_VERSION}/arch/${BPF_ARCH}/include"
+            "/lib/modules/${KERNEL_VERSION}/build/include"
+            "/lib/modules/${KERNEL_VERSION}/build/arch/${BPF_ARCH}/include"
+        )
+
+        # Compile BPF program with comprehensive include paths
         add_custom_command(
             OUTPUT ${BPF_OBJ}
             COMMAND ${CLANG}
@@ -151,6 +166,10 @@ if(BUILD_EBPF)
                 -D__TARGET_ARCH_${BPF_ARCH}
                 -I/usr/include
                 -I/usr/include/bpf
+                -I/usr/include/${ARCH}-linux-gnu
+                -I/usr/src/linux-headers-${KERNEL_VERSION}/include
+                -I/usr/src/linux-headers-${KERNEL_VERSION}/arch/${BPF_ARCH}/include
+                -I/usr/src/linux-headers-${KERNEL_VERSION}/arch/${BPF_ARCH}/include/generated
                 -c ${BPF_SRC}
                 -o ${BPF_OBJ}
             DEPENDS ${BPF_SRC}
