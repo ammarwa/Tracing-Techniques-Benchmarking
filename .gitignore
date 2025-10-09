@@ -37,5 +37,52 @@
 *.out
 *.app
 
-# debug information files
+# Debug information files
 *.dwo
+
+# Build directories
+build/
+cmake-build-*/
+.cmake/
+
+# BPF generated files
+*.skel.h
+*.bpf.o
+
+# LTTng trace outputs
+lttng_traces/
+lttng-traces/
+**/lttng_traces/
+**/lttng-traces/
+
+# eBPF trace outputs
+ebpf_traces/
+**/ebpf_traces/
+*.txt
+
+# Benchmark outputs
+benchmark_results_*/
+results/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+dist/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+/tmp/
