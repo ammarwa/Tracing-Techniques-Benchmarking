@@ -58,7 +58,6 @@ lttng-traces/
 # eBPF trace outputs
 ebpf_traces/
 **/ebpf_traces/
-*.txt
 
 # Benchmark outputs
 benchmark_results_*/
