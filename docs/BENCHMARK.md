@@ -15,7 +15,22 @@ This project includes a comprehensive Python-based benchmark suite that measures
 ### 2. Run Comprehensive Benchmark
 
 ```bash
+# Default: 10 repetitions per scenario (~4-6 minutes)
 sudo ../scripts/benchmark.py ./build
+
+# Quick test: 5 repetitions (~2-4 minutes)
+sudo ../scripts/benchmark.py ./build --runs 5
+
+# CI analysis: 20 repetitions (~8-12 minutes)
+sudo ../scripts/benchmark.py ./build --runs 20
+
+# Full statistical analysis: 100 repetitions (~40-60 minutes)
+sudo ../scripts/benchmark.py ./build --runs 100
+```
+
+**Help and Options:**
+```bash
+../scripts/benchmark.py --help
 ```
 
 ### 3. View Results
@@ -26,9 +41,11 @@ The benchmark creates a timestamped results directory:
 benchmark_results_YYYYMMDD_HHMMSS/
 ├── benchmark_report.html       # Interactive HTML report (open this!)
 ├── results.json                # Raw benchmark data
-├── lttng_*us_r*/              # LTTng trace files (100 runs per scenario)
-└── ebpf_*us_r*.txt           # eBPF trace files (100 runs per scenario)
+├── lttng_*us_r*/              # LTTng trace files (N runs per scenario)
+└── ebpf_*us_r*.txt           # eBPF trace files (N runs per scenario)
 ```
+
+where N is the number of repetitions (default: 10)
 
 Open the HTML report in your browser:
 ```bash
@@ -56,28 +73,47 @@ The benchmark tests 6 scenarios representing different function durations:
 
 ### Multiple Runs for Trustworthy Results
 
-Each scenario is run **100 times** by default to ensure statistical reliability:
+Each scenario runs **multiple times** to ensure statistical reliability. The number of repetitions is configurable via the `--runs` option:
 
 - **Mean**: Average value across all runs
 - **Standard Deviation**: Measure of variability/spread
 - **Min/Max**: Range of observed values
 - **95% Confidence Interval**: ±margin of error (1.96 × std_err)
 
-**Total tests executed**: 1,800 (6 scenarios × 3 methods × 100 runs)
-**Total runtime**: ~40-60 minutes
+### Recommended Run Counts
 
-### Configurable Run Count
+| Runs | Total Tests | Duration | Use Case |
+|------|-------------|----------|----------|
+| **5** | 90 (6×3×5) | ~2-4 min | Quick development test, smoke tests |
+| **10** *(default)* | 180 (6×3×10) | ~4-6 min | Daily development, fast iteration |
+| **20** | 360 (6×3×20) | ~8-12 min | **CI/CD, automated testing, GitHub Actions** |
+| **50** | 900 (6×3×50) | ~20-30 min | Production analysis, detailed reports |
+| **100** | 1,800 (6×3×100) | ~40-60 min | Research, publication-quality statistics |
+| **200** | 3,600 (6×3×200) | ~80-120 min | Maximum precision, long-term benchmarks |
 
-```python
-# Default: 100 runs per scenario
-suite = BenchmarkSuite(build_dir)
+### Command-Line Usage
 
-# Custom: 200 runs for extra precision
-suite = BenchmarkSuite(build_dir, num_runs=200)
+```bash
+# Quick test (5 runs)
+sudo ../scripts/benchmark.py ./build --runs 5
 
-# Quick test: 10 runs for development
-suite = BenchmarkSuite(build_dir, num_runs=10)
+# Default (10 runs)
+sudo ../scripts/benchmark.py ./build
+
+# CI/CD (20 runs) - recommended for automated testing
+sudo ../scripts/benchmark.py ./build --runs 20
+
+# Production analysis (50 runs)
+sudo ../scripts/benchmark.py ./build --runs 50
+
+# Full statistical analysis (100 runs)
+sudo ../scripts/benchmark.py ./build --runs 100
+
+# Maximum precision (200 runs)
+sudo ../scripts/benchmark.py ./build --runs 200
 ```
+
+The script will show a warning and ask for confirmation if you specify more than 200 runs.
 
 ### Statistical Output
 
@@ -271,12 +307,12 @@ Each benchmark run follows this sequence:
 
 ### Statistical Validity
 
-- **Sample size**: n=100 runs per scenario
+- **Sample size**: Configurable (default n=10, CI uses n=20, research n=100)
 - **Confidence level**: 95% (1.96 × std_err)
-- **Why 100 runs?**
-  - Good statistical power (can detect 10-20% differences)
-  - Narrow confidence intervals (±1-5% of mean)
-  - Reasonable runtime (~40-60 minutes total)
+- **Why multiple runs?**
+  - Good statistical power (can detect 10-20% differences with n≥20)
+  - Narrow confidence intervals (±1-5% of mean with n≥20)
+  - Configurable tradeoff between speed and precision
   - Industry standard for performance benchmarks
 
 ### Interpreting Confidence Intervals
@@ -376,7 +412,7 @@ If confidence intervals are wide (>10% of mean):
 - Close unnecessary applications
 - Disable CPU frequency scaling: `sudo cpupower frequency-set -g performance`
 - Run during low system load
-- Increase number of runs: `BenchmarkSuite(build_dir, num_runs=200)`
+- Increase number of runs: `sudo ../scripts/benchmark.py ./build --runs 100` or `--runs 200`
 
 ---
 
@@ -396,22 +432,17 @@ Scenario: 100 μs Function
   Description: Typical API: ~100μs (e.g., hipMalloc small, hipMemcpy small)
 ======================================================================
 
-  [BASELINE] 100 μs Function - Running 100 times for statistical reliability
-    Run 1/100...
-    Run 11/100...
-    ...
-    Run 91/100...
-    Completed 100 runs
+  [BASELINE] 100 μs Function - Running 10 times for statistical reliability
+    Run 1/10...
+    Completed 10 runs
 
-  [LTTNG] 100 μs Function - Running 100 times for statistical reliability
-    Run 1/100...
-    ...
-    Completed 100 runs
+  [LTTNG] 100 μs Function - Running 10 times for statistical reliability
+    Run 1/10...
+    Completed 10 runs
 
-  [EBPF] 100 μs Function - Running 100 times for statistical reliability
-    Run 1/100...
-    ...
-    Completed 100 runs
+  [EBPF] 100 μs Function - Running 10 times for statistical reliability
+    Run 1/10...
+    Completed 10 runs
 
 ======================================================================
 ✅ BENCHMARK COMPLETE!
@@ -435,7 +466,7 @@ View in browser: file:///home/.../benchmark_report.html
   "max_rss_kb": 332416,
   "avg_time_per_call_ns": 143567.89,
   "trace_size_mb": 145.67,
-  "num_runs": 100,
+  "num_runs": 10,
   "avg_time_stddev": 1234.56,
   "avg_time_min": 140123.45,
   "avg_time_max": 147890.12,
@@ -489,39 +520,93 @@ For GPU and HIP API tracing, **eBPF is highly recommended** because:
 
 ## Integration with CI/CD
 
+### GitHub Actions Configuration
+
+This project includes a GitHub Actions workflow (`.github/workflows/benchmark-ci.yml`) that:
+
+1. **Builds the project** with both LTTng and eBPF support
+2. **Runs validation tests** to ensure tracers work correctly
+3. **Executes benchmark with 20 repetitions** for CI statistical analysis
+4. **Publishes HTML report** to GitHub Pages
+5. **Archives results** as workflow artifacts
+
+**Key features:**
+- Runs on: push to main/master, pull requests, manual trigger
+- Duration: ~8-12 minutes for 20 repetitions
+- Publishes interactive benchmark report at `https://<username>.github.io/<repo>/`
+- Stores raw results as artifacts for 30 days
+
+**Workflow snippet:**
+```yaml
+- name: Run benchmark with 20 repetitions
+  run: |
+    sudo python3 scripts/benchmark.py ./build --runs 20
+  timeout-minutes: 30
+```
+
+### Local CI Testing
+
+Test the CI configuration locally:
+
+```bash
+# Build like CI does
+./build.sh -c
+
+# Run validation like CI does
+sudo ./scripts/validate_output.sh
+
+# Run benchmark with CI settings (20 runs)
+sudo ./scripts/benchmark.py ./build --runs 20
+```
+
 ### Automated Regression Testing
 
-Add to your CI pipeline:
+Create a custom CI script with regression checks:
 
 ```bash
 #!/bin/bash
-# ci_benchmark.sh
+# ci_benchmark_with_checks.sh
 
 # Build
 ./build.sh -c
 
-# Quick benchmark (10 runs for CI)
-python3 << 'PYTHON'
-from pathlib import Path
-from comprehensive_benchmark import BenchmarkSuite
-
-suite = BenchmarkSuite(Path('./build'), num_runs=10)
-suite.run_all_scenarios()
-report = suite.generate_html_report()
+# Run benchmark (adjust repetitions based on CI time budget)
+sudo python3 scripts/benchmark.py ./build --runs 20
 
 # Check for regressions
+python3 << 'PYTHON'
 import json
-with open(suite.output_dir / 'results.json') as f:
+from pathlib import Path
+import sys
+
+# Load results
+results_dir = max(Path('.').glob('benchmark_results_*'), key=lambda p: p.stat().st_mtime)
+with open(results_dir / 'results.json') as f:
     results = json.load(f)
 
+# Find baseline for each scenario
+baselines = {r['scenario']: r['avg_time_per_call_ns']
+             for r in results if r['method'] == 'baseline'}
+
+# Check eBPF overhead for realistic workloads
+failed = False
 for r in results:
     if r['method'] == 'ebpf' and r['simulated_work_us'] >= 100:
+        baseline_ns = baselines[r['scenario']]
         overhead_pct = ((r['avg_time_per_call_ns'] / baseline_ns) - 1) * 100
-        if overhead_pct > 10:  # Threshold: 10% for realistic workloads
-            print(f"REGRESSION: {r['scenario']} has {overhead_pct}% overhead!")
-            exit(1)
 
-print("✅ All benchmarks passed!")
+        # Threshold: 10% for realistic workloads (≥100μs)
+        if overhead_pct > 10:
+            print(f"❌ REGRESSION: {r['scenario']} has {overhead_pct:.1f}% overhead (threshold: 10%)")
+            failed = True
+        else:
+            print(f"✅ PASS: {r['scenario']} has {overhead_pct:.1f}% overhead")
+
+if failed:
+    print("\n❌ Benchmark regression detected!")
+    sys.exit(1)
+else:
+    print("\n✅ All benchmarks passed!")
 PYTHON
 ```
 
@@ -549,22 +634,36 @@ with open('benchmark_results.csv', 'w', newline='') as f:
 
 ### Benchmark Duration
 
-With 100 runs per scenario:
+Time depends on number of repetitions:
 
-| Scenario | Single Run | 100 Runs |
-|----------|-----------|----------|
-| Empty Function (1M iter) | 1-2 sec | 2-3 min |
-| 5 μs Function (100K iter) | 1-2 sec | 2-3 min |
-| 50 μs Function (50K iter) | 1-2 sec | 2-3 min |
-| 100 μs Function (10K iter) | 1-2 sec | 2-3 min |
-| 500 μs Function (5K iter) | 2-3 sec | 3-5 min |
-| 1000 μs Function (2K iter) | 2-3 sec | 3-5 min |
+| Runs | Total Tests | Estimated Duration |
+|------|-------------|-------------------|
+| 5 | 90 (6×3×5) | ~2-4 minutes |
+| **10** *(default)* | 180 (6×3×10) | ~4-6 minutes |
+| **20** *(CI)* | 360 (6×3×20) | ~8-12 minutes |
+| 50 | 900 (6×3×50) | ~20-30 minutes |
+| 100 | 1,800 (6×3×100) | ~40-60 minutes |
+| 200 | 3,600 (6×3×200) | ~80-120 minutes |
 
-**Total**: ~40-60 minutes for complete benchmark (1,800 tests)
+**Formula**: `duration_minutes ≈ num_runs × 0.4 to 0.6`
 
 ### Disk Usage
 
-Each run creates trace files:
+Each run creates trace files (scales with number of repetitions):
+
+**For default 10 runs:**
+- **LTTng**: ~150 MB per run × 10 runs × 6 scenarios = ~9 GB (temporary)
+- **eBPF**: ~1-5 MB per run × 10 runs × 6 scenarios = ~300 MB
+
+**For CI 20 runs:**
+- **LTTng**: ~150 MB per run × 20 runs × 6 scenarios = ~18 GB (temporary)
+- **eBPF**: ~1-5 MB per run × 20 runs × 6 scenarios = ~600 MB
+
+**For production 50 runs:**
+- **LTTng**: ~150 MB per run × 50 runs × 6 scenarios = ~45 GB (temporary)
+- **eBPF**: ~1-5 MB per run × 50 runs × 6 scenarios = ~1.5 GB
+
+**For research 100 runs:**
 - **LTTng**: ~150 MB per run × 100 runs × 6 scenarios = ~90 GB (temporary)
 - **eBPF**: ~1-5 MB per run × 100 runs × 6 scenarios = ~3 GB
 

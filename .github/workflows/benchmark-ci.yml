@@ -34,9 +34,8 @@ jobs:
             clang-14 \
             llvm-14 \
             libbpf-dev \
-            linux-headers-$(uname -r) \
+            linux-headers-generic \
             linux-tools-generic \
-            linux-tools-$(uname -r) \
             lttng-tools \
             liblttng-ust-dev \
             babeltrace2 \
@@ -49,7 +48,7 @@ jobs:
       - name: Build project
         run: |
           export CC=clang-14
-          ./build.sh
+          ./build.sh -c
         env:
           CC: clang-14
 
@@ -74,9 +73,8 @@ jobs:
             clang-14 \
             llvm-14 \
             libbpf-dev \
-            linux-headers-$(uname -r) \
+            linux-headers-generic \
             linux-tools-generic \
-            linux-tools-$(uname -r) \
             lttng-tools \
             liblttng-ust-dev \
             babeltrace2 \
@@ -99,14 +97,12 @@ jobs:
           # May not work in all environments (e.g., GitHub Actions VMs)
           sudo cpupower frequency-set -g performance || echo "Could not set CPU governor (may not be supported in this environment)"
 
-      - name: Run benchmark (reduced iteration count for CI)
+      - name: Run benchmark with 20 repetitions
         run: |
-          # Create modified benchmark script with fewer runs for CI speed
-          # Original: 100 runs per scenario (~40-60 min)
-          # CI: 20 runs per scenario (~8-12 min)
-          sed 's/num_runs = 100/num_runs = 20/g' scripts/benchmark.py > benchmark_ci.py
-          chmod +x benchmark_ci.py
-          sudo python3 benchmark_ci.py ./build
+          # Run benchmark with 20 repetitions for CI statistical analysis
+          # Default: 10 runs per scenario (~4-6 minutes)
+          # CI: 20 runs per scenario (~8-12 minutes) for reasonable statistics
+          sudo python3 scripts/benchmark.py ./build --runs 20
         timeout-minutes: 30
 
       - name: Upload benchmark results
@@ -154,7 +150,7 @@ jobs:
           ## CI Information
 
           - **Build**: GitHub Actions CI
-          - **Runs per scenario**: 20 (reduced from 100 for CI speed)
+          - **Runs per scenario**: 20 (for CI statistical analysis)
           - **Generated**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           - **Commit**: ${{ github.sha }}
           - **Branch**: ${{ github.ref_name }}
@@ -217,6 +213,6 @@ jobs:
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Configuration" >> $GITHUB_STEP_SUMMARY
-          echo "- **Runs per scenario**: 20 (reduced for CI)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runs per scenario**: 20 (for CI statistical analysis)" >> $GITHUB_STEP_SUMMARY
           echo "- **Scenarios tested**: 6 (0μs, 5μs, 50μs, 100μs, 500μs, 1000μs)" >> $GITHUB_STEP_SUMMARY
           echo "- **Methods compared**: Baseline, LTTng, eBPF" >> $GITHUB_STEP_SUMMARY

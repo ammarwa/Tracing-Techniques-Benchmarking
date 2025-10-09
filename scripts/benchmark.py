@@ -15,6 +15,7 @@ import time
 import json
 import re
 import statistics
+import argparse
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -56,7 +57,7 @@ class BenchmarkResult:
 class BenchmarkSuite:
     """Manages the comprehensive benchmark suite"""
 
-    def __init__(self, build_dir: Path, num_runs: int = 100):
+    def __init__(self, build_dir: Path, num_runs: int = 10):
         self.build_dir = Path(build_dir)
         self.num_runs = num_runs  # Number of times to run each test for statistical reliability
         self.results: List[BenchmarkResult] = []
@@ -898,12 +899,48 @@ class BenchmarkSuite:
 
 def main():
     """Main entry point"""
-    if len(sys.argv) < 2:
-        print("Usage: ./comprehensive_benchmark.py <build_dir>")
-        print("Example: ./comprehensive_benchmark.py ./build")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description='eBPF vs LTTng Comprehensive Benchmark Suite',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Run with default 10 repetitions per scenario (~4-6 minutes)
+  %(prog)s ./build
 
-    build_dir = Path(sys.argv[1])
+  # Run with 50 repetitions for more reliable statistics (~20-30 minutes)
+  %(prog)s ./build -r 50
+
+  # Quick test with 5 repetitions (~2-4 minutes)
+  %(prog)s ./build -r 5
+
+  # Full statistical analysis with 100 repetitions (~40-60 minutes)
+  %(prog)s ./build --runs 100
+
+Output:
+  - benchmark_results_<timestamp>/benchmark_report.html (interactive report)
+  - benchmark_results_<timestamp>/results.json (raw data)
+  - benchmark_results_<timestamp>/lttng_*/  (LTTng trace files)
+  - benchmark_results_<timestamp>/ebpf_*.txt (eBPF trace files)
+        '''
+    )
+
+    parser.add_argument(
+        'build_dir',
+        type=str,
+        help='Path to the build directory (e.g., ./build)'
+    )
+
+    parser.add_argument(
+        '-r', '--runs',
+        type=int,
+        default=10,
+        metavar='N',
+        help='Number of repetitions per scenario for statistical reliability (default: 10)'
+    )
+
+    args = parser.parse_args()
+
+    build_dir = Path(args.build_dir)
     if not build_dir.exists():
         print(f"Error: Build directory not found: {build_dir}")
         sys.exit(1)
@@ -922,8 +959,29 @@ def main():
             print("Please build the project first: ./build.sh -c")
             sys.exit(1)
 
+    # Validate repetitions count
+    if args.runs < 1:
+        print(f"Error: Number of runs must be at least 1 (got {args.runs})")
+        sys.exit(1)
+
+    if args.runs > 200:
+        print(f"Warning: {args.runs} runs will take a very long time!")
+        print(f"Estimated time: ~{args.runs * 0.5:.0f}-{args.runs * 0.7:.0f} minutes")
+        response = input("Continue? (y/n): ")
+        if response.lower() != 'y':
+            print("Benchmark cancelled")
+            sys.exit(0)
+
     # Create and run benchmark suite
-    suite = BenchmarkSuite(build_dir)
+    print(f"\n{'='*70}")
+    print(f"Benchmark Configuration:")
+    print(f"  Build Directory: {build_dir.absolute()}")
+    print(f"  Repetitions per scenario: {args.runs}")
+    print(f"  Total tests: {args.runs * 6 * 3} (6 scenarios × 3 methods × {args.runs} runs)")
+    print(f"  Estimated time: ~{args.runs * 0.4:.0f}-{args.runs * 0.6:.0f} minutes")
+    print(f"{'='*70}\n")
+
+    suite = BenchmarkSuite(build_dir, num_runs=args.runs)
 
     try:
         suite.run_all_scenarios()
