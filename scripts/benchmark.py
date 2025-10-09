@@ -58,7 +58,47 @@ class BenchmarkResult:
 class BenchmarkSuite:
     """Manages the comprehensive benchmark suite"""
 
-    def __init__(self, build_dir: Path, num_runs: int = 10):
+    # Define all available scenarios as class attribute
+    ALL_SCENARIOS = [
+        BenchmarkScenario(
+            name="Empty Function",
+            simulated_work_us=0,
+            iterations=1000000,
+            description="Worst case: ~6ns function (just arithmetic)"
+        ),
+        BenchmarkScenario(
+            name="5 μs Function",
+            simulated_work_us=5,
+            iterations=100000,
+            description="Ultra-fast API: ~5μs (comparable to uprobe overhead)"
+        ),
+        BenchmarkScenario(
+            name="50 μs Function",
+            simulated_work_us=50,
+            iterations=50000,
+            description="Fast API: ~50μs (e.g., hipGetDevice, simple queries)"
+        ),
+        BenchmarkScenario(
+            name="100 μs Function",
+            simulated_work_us=100,
+            iterations=10000,
+            description="Typical API: ~100μs (e.g., hipMalloc small, hipMemcpy small)"
+        ),
+        BenchmarkScenario(
+            name="500 μs Function",
+            simulated_work_us=500,
+            iterations=5000,
+            description="Medium API: ~500μs (e.g., hipMemcpy medium, hipLaunchKernel)"
+        ),
+        BenchmarkScenario(
+            name="1000 μs (1ms) Function",
+            simulated_work_us=1000,
+            iterations=2000,
+            description="Slow API: ~1ms (e.g., hipMalloc large, complex operations)"
+        ),
+    ]
+
+    def __init__(self, build_dir: Path, num_runs: int = 10, scenario_indices: Optional[List[int]] = None):
         self.build_dir = Path(build_dir)
         self.num_runs = num_runs  # Number of times to run each test for statistical reliability
         self.results: List[BenchmarkResult] = []
@@ -66,45 +106,13 @@ class BenchmarkSuite:
         self.output_dir = Path(f"benchmark_results_{self.timestamp}")
         self.output_dir.mkdir(exist_ok=True)
 
-        # Benchmark scenarios - from empty function to realistic HIP API durations
-        self.scenarios = [
-            BenchmarkScenario(
-                name="Empty Function",
-                simulated_work_us=0,
-                iterations=1000000,
-                description="Worst case: ~6ns function (just arithmetic)"
-            ),
-            BenchmarkScenario(
-                name="5 μs Function",
-                simulated_work_us=5,
-                iterations=100000,
-                description="Ultra-fast API: ~5μs (comparable to uprobe overhead)"
-            ),
-            BenchmarkScenario(
-                name="50 μs Function",
-                simulated_work_us=50,
-                iterations=50000,
-                description="Fast API: ~50μs (e.g., hipGetDevice, simple queries)"
-            ),
-            BenchmarkScenario(
-                name="100 μs Function",
-                simulated_work_us=100,
-                iterations=10000,
-                description="Typical API: ~100μs (e.g., hipMalloc small, hipMemcpy small)"
-            ),
-            BenchmarkScenario(
-                name="500 μs Function",
-                simulated_work_us=500,
-                iterations=5000,
-                description="Medium API: ~500μs (e.g., hipMemcpy medium, hipLaunchKernel)"
-            ),
-            BenchmarkScenario(
-                name="1000 μs (1ms) Function",
-                simulated_work_us=1000,
-                iterations=2000,
-                description="Slow API: ~1ms (e.g., hipMalloc large, complex operations)"
-            ),
-        ]
+        # Filter scenarios based on user selection
+        if scenario_indices is not None:
+            self.scenarios = [self.ALL_SCENARIOS[i] for i in scenario_indices if 0 <= i < len(self.ALL_SCENARIOS)]
+            if not self.scenarios:
+                raise ValueError("No valid scenarios selected")
+        else:
+            self.scenarios = self.ALL_SCENARIOS.copy()
 
     def run_command(self, cmd: str, env: Optional[Dict[str, str]] = None,
                     capture_output: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -521,6 +529,18 @@ class BenchmarkSuite:
 
                 overhead_data.append(row)
 
+        # Prepare chart data as JSON strings (to be embedded in JavaScript)
+        js_work_us = json.dumps([d['work_us'] for d in overhead_data])
+        js_lttng_overhead_pct = json.dumps([d.get('lttng_overhead_pct', 0) for d in overhead_data])
+        js_ebpf_overhead_pct = json.dumps([d.get('ebpf_overhead_pct', 0) for d in overhead_data])
+        js_scenario_names = json.dumps([d['scenario'] for d in overhead_data])
+        js_baseline_ns = json.dumps([d['baseline_ns'] for d in overhead_data])
+        js_lttng_overhead_ns = json.dumps([d.get('lttng_overhead_ns', 0) for d in overhead_data])
+        js_ebpf_overhead_ns = json.dumps([d.get('ebpf_overhead_ns', 0) for d in overhead_data])
+        js_memory_baseline = json.dumps([scenarios_data[d['scenario']]['baseline'].max_rss_kb for d in overhead_data if 'baseline' in scenarios_data[d['scenario']]])
+        js_memory_lttng = json.dumps([scenarios_data[d['scenario']]['lttng'].max_rss_kb if 'lttng' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
+        js_memory_ebpf = json.dumps([scenarios_data[d['scenario']]['ebpf'].max_rss_kb if 'ebpf' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
+
         # Generate HTML
         html = f"""<!DOCTYPE html>
 <html>
@@ -713,7 +733,7 @@ class BenchmarkSuite:
                 </tr>
 """
 
-        html += """
+        html += f"""
             </tbody>
         </table>
 
@@ -780,11 +800,25 @@ class BenchmarkSuite:
     </div>
 
     <script>
+        // Prepare data for charts
+        const work_us_data = {js_work_us};
+        const lttng_overhead_pct = {js_lttng_overhead_pct};
+        const ebpf_overhead_pct = {js_ebpf_overhead_pct};
+
+        const scenario_names = {js_scenario_names};
+        const baseline_ns_data = {js_baseline_ns};
+        const lttng_overhead_ns = {js_lttng_overhead_ns};
+        const ebpf_overhead_ns = {js_ebpf_overhead_ns};
+
+        const memory_baseline = {js_memory_baseline};
+        const memory_lttng = {js_memory_lttng};
+        const memory_ebpf = {js_memory_ebpf};
+
         // Overhead percentage chart
         const overheadData = [
             {{
-                x: {json.dumps([d['work_us'] for d in overhead_data])},
-                y: {json.dumps([d.get('lttng_overhead_pct', 0) for d in overhead_data])},
+                x: work_us_data,
+                y: lttng_overhead_pct,
                 name: 'LTTng',
                 type: 'scatter',
                 mode: 'lines+markers',
@@ -792,8 +826,8 @@ class BenchmarkSuite:
                 line: {{ width: 3 }}
             }},
             {{
-                x: {json.dumps([d['work_us'] for d in overhead_data])},
-                y: {json.dumps([d.get('ebpf_overhead_pct', 0) for d in overhead_data])},
+                x: work_us_data,
+                y: ebpf_overhead_pct,
                 name: 'eBPF',
                 type: 'scatter',
                 mode: 'lines+markers',
@@ -803,16 +837,14 @@ class BenchmarkSuite:
         ];
 
         const overheadLayout = {{
-            title: 'Relative Overhead vs Function Duration (Log Scale)',
+            title: 'Relative Overhead vs Function Duration',
             xaxis: {{
                 title: 'Simulated Work Duration (μs)',
-                type: 'log',
-                autorange: true
+                type: 'category'
             }},
             yaxis: {{
                 title: 'Overhead (%)',
-                type: 'log',
-                autorange: true
+                zeroline: true
             }},
             hovermode: 'closest',
             height: 500
@@ -823,20 +855,20 @@ class BenchmarkSuite:
         // Absolute timing chart
         const timingData = [
             {{
-                x: {json.dumps([d['scenario'] for d in overhead_data])},
-                y: {json.dumps([d['baseline_ns'] for d in overhead_data])},
+                x: scenario_names,
+                y: baseline_ns_data,
                 name: 'Baseline',
                 type: 'bar'
             }},
             {{
-                x: {json.dumps([d['scenario'] for d in overhead_data])},
-                y: {json.dumps([d.get('lttng_overhead_ns', 0) for d in overhead_data])},
+                x: scenario_names,
+                y: lttng_overhead_ns,
                 name: 'LTTng Overhead',
                 type: 'bar'
             }},
             {{
-                x: {json.dumps([d['scenario'] for d in overhead_data])},
-                y: {json.dumps([d.get('ebpf_overhead_ns', 0) for d in overhead_data])},
+                x: scenario_names,
+                y: ebpf_overhead_ns,
                 name: 'eBPF Overhead',
                 type: 'bar'
             }}
@@ -855,28 +887,23 @@ class BenchmarkSuite:
 
         Plotly.newPlot('timing-chart', timingData, timingLayout);
 
-        // Memory usage chart - build data from scenarios_data
-        const memoryScenarios = {json.dumps([d['scenario'] for d in overhead_data])};
-        const memoryBaseline = {json.dumps([scenarios_data[d['scenario']]['baseline'].max_rss_kb for d in overhead_data if 'baseline' in scenarios_data[d['scenario']]])};
-        const memoryLttng = {json.dumps([scenarios_data[d['scenario']]['lttng'].max_rss_kb if 'lttng' in scenarios_data[d['scenario']] else 0 for d in overhead_data])};
-        const memoryEbpf = {json.dumps([scenarios_data[d['scenario']]['ebpf'].max_rss_kb if 'ebpf' in scenarios_data[d['scenario']] else 0 for d in overhead_data])};
-
+        // Memory usage chart
         const memoryData = [
             {{
-                x: memoryScenarios,
-                y: memoryBaseline,
+                x: scenario_names,
+                y: memory_baseline,
                 name: 'Baseline',
                 type: 'bar'
             }},
             {{
-                x: memoryScenarios,
-                y: memoryLttng,
+                x: scenario_names,
+                y: memory_lttng,
                 name: 'LTTng',
                 type: 'bar'
             }},
             {{
-                x: memoryScenarios,
-                y: memoryEbpf,
+                x: scenario_names,
+                y: memory_ebpf,
                 name: 'eBPF',
                 type: 'bar'
             }}
@@ -903,18 +930,29 @@ def main():
         description='eBPF vs LTTng Comprehensive Benchmark Suite',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
+Available Scenarios:
+  0: Empty Function (0 μs, 1,000,000 iterations)
+  1: 5 μs Function (100,000 iterations)
+  2: 50 μs Function (50,000 iterations)
+  3: 100 μs Function (10,000 iterations)
+  4: 500 μs Function (5,000 iterations)
+  5: 1000 μs (1ms) Function (2,000 iterations)
+
 Examples:
-  # Run with default 10 repetitions per scenario (~4-6 minutes)
+  # Run all scenarios with default 10 repetitions (~4-6 minutes)
   %(prog)s ./build
 
-  # Run with 50 repetitions for more reliable statistics (~20-30 minutes)
-  %(prog)s ./build -r 50
+  # Run only scenarios 3, 4, and 5 (longer function durations)
+  %(prog)s ./build --scenarios 3 4 5
 
-  # Quick test with 5 repetitions (~2-4 minutes)
-  %(prog)s ./build -r 5
+  # Run scenario 0 (empty function) with 50 repetitions for detailed analysis
+  %(prog)s ./build -s 0 -r 50
 
-  # Full statistical analysis with 100 repetitions (~40-60 minutes)
-  %(prog)s ./build --runs 100
+  # Run scenarios 2 and 3 with 5 repetitions for quick testing
+  %(prog)s ./build --scenarios 2 3 --runs 5
+
+  # List available scenarios
+  %(prog)s --list-scenarios
 
 Output:
   - benchmark_results_<timestamp>/benchmark_report.html (interactive report)
@@ -928,6 +966,7 @@ to minimize disk usage. Only the final aggregated results are kept.
     parser.add_argument(
         'build_dir',
         type=str,
+        nargs='?',
         help='Path to the build directory (e.g., ./build)'
     )
 
@@ -939,7 +978,38 @@ to minimize disk usage. Only the final aggregated results are kept.
         help='Number of repetitions per scenario for statistical reliability (default: 10)'
     )
 
+    parser.add_argument(
+        '-s', '--scenarios',
+        type=int,
+        nargs='+',
+        metavar='N',
+        help='Specific scenario indices to run (0-5). Run all if not specified.'
+    )
+
+    parser.add_argument(
+        '--list-scenarios',
+        action='store_true',
+        help='List all available scenarios and exit'
+    )
+
     args = parser.parse_args()
+
+    # Handle --list-scenarios
+    if args.list_scenarios:
+        print("\n" + "="*70)
+        print("AVAILABLE BENCHMARK SCENARIOS")
+        print("="*70 + "\n")
+        for i, scenario in enumerate(BenchmarkSuite.ALL_SCENARIOS):
+            print(f"[{i}] {scenario.name}")
+            print(f"    Work Duration: {scenario.simulated_work_us} μs")
+            print(f"    Iterations: {scenario.iterations:,}")
+            print(f"    Description: {scenario.description}")
+            print()
+        return 0
+
+    # Validate build_dir is provided (unless listing scenarios)
+    if not args.build_dir:
+        parser.error("the following arguments are required: build_dir")
 
     build_dir = Path(args.build_dir)
     if not build_dir.exists():
@@ -960,6 +1030,15 @@ to minimize disk usage. Only the final aggregated results are kept.
             print("Please build the project first: ./build.sh -c")
             sys.exit(1)
 
+    # Validate scenario indices
+    if args.scenarios:
+        invalid_scenarios = [s for s in args.scenarios if s < 0 or s >= len(BenchmarkSuite.ALL_SCENARIOS)]
+        if invalid_scenarios:
+            print(f"Error: Invalid scenario indices: {invalid_scenarios}")
+            print(f"Valid range: 0-{len(BenchmarkSuite.ALL_SCENARIOS) - 1}")
+            print("Use --list-scenarios to see all available scenarios")
+            sys.exit(1)
+
     # Validate repetitions count
     if args.runs < 1:
         print(f"Error: Number of runs must be at least 1 (got {args.runs})")
@@ -973,16 +1052,25 @@ to minimize disk usage. Only the final aggregated results are kept.
             print("Benchmark cancelled")
             sys.exit(0)
 
+    # Determine number of scenarios to run
+    num_scenarios = len(args.scenarios) if args.scenarios else len(BenchmarkSuite.ALL_SCENARIOS)
+
     # Create and run benchmark suite
     print(f"\n{'='*70}")
     print(f"Benchmark Configuration:")
     print(f"  Build Directory: {build_dir.absolute()}")
     print(f"  Repetitions per scenario: {args.runs}")
-    print(f"  Total tests: {args.runs * 6 * 3} (6 scenarios × 3 methods × {args.runs} runs)")
-    print(f"  Estimated time: ~{args.runs * 0.4:.0f}-{args.runs * 0.6:.0f} minutes")
+    if args.scenarios:
+        print(f"  Selected Scenarios: {args.scenarios}")
+        for idx in args.scenarios:
+            print(f"    [{idx}] {BenchmarkSuite.ALL_SCENARIOS[idx].name} ({BenchmarkSuite.ALL_SCENARIOS[idx].simulated_work_us} μs)")
+    else:
+        print(f"  Scenarios: All ({num_scenarios} scenarios)")
+    print(f"  Total tests: {args.runs * num_scenarios * 3} ({num_scenarios} scenarios × 3 methods × {args.runs} runs)")
+    print(f"  Estimated time: ~{args.runs * num_scenarios * 0.07:.0f}-{args.runs * num_scenarios * 0.1:.0f} minutes")
     print(f"{'='*70}\n")
 
-    suite = BenchmarkSuite(build_dir, num_runs=args.runs)
+    suite = BenchmarkSuite(build_dir, num_runs=args.runs, scenario_indices=args.scenarios)
 
     try:
         suite.run_all_scenarios()

@@ -150,6 +150,12 @@ int main(int argc, char **argv) {
 
     const char *output_file = NULL;
 
+    // Unbuffer stdout to ensure messages appear immediately
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
+    fprintf(stderr, "eBPF tracer starting (PID %d)...\n", getpid());
+
     // Check if we should write trace to file (via environment variable or command line)
     // By default, we only collect statistics (no file output) for minimal overhead
     const char *write_trace_env = getenv("EBPF_TRACE_WRITE_FILE");

@@ -116,32 +116,56 @@ TRACER_LOG="/tmp/ebpf_tracer_log_$$.txt"
 EBPF_TRACE_WRITE_FILE=1 $MYLIB_TRACER $EBPF_TRACE_FILE > $TRACER_LOG 2>&1 &
 TRACER_PID=$!
 
-# Wait for tracer to attach
-sleep 3
+# Wait for tracer to be ready by checking its output
+echo "Waiting for tracer to attach..."
+READY=false
+for i in {1..20}; do
+    # Check if tracer is still running
+    if ! kill -0 $TRACER_PID 2>/dev/null; then
+        print_error "eBPF tracer failed to start"
+        echo "Tracer output:"
+        cat $TRACER_LOG
+        exit 1
+    fi
 
-# Check if tracer is running
-if ! kill -0 $TRACER_PID 2>/dev/null; then
-    print_error "eBPF tracer failed to start"
+    # Check if tracer has attached successfully
+    if grep -q "Successfully attached uprobes" $TRACER_LOG 2>/dev/null; then
+        READY=true
+        break
+    fi
+
+    sleep 0.5
+done
+
+if [ "$READY" = false ]; then
+    print_error "eBPF tracer did not attach within timeout"
     echo "Tracer output:"
     cat $TRACER_LOG
+    kill -INT $TRACER_PID 2>/dev/null
     exit 1
 fi
+
+# Give it a bit more time to fully initialize
+sleep 1
+print_success "eBPF tracer ready"
 
 # Run application
 echo "Running application with eBPF..."
 $SAMPLE_APP $NUM_ITERATIONS >/dev/null 2>&1
 
-# Wait for events to be processed
-sleep 2
+# Wait for events to be processed and flushed to ring buffer
+echo "Waiting for events to be captured..."
+sleep 3
 
 # Stop tracer gracefully
+echo "Stopping tracer..."
 kill -INT $TRACER_PID 2>/dev/null
 
 # Wait for tracer to finish writing the file
 wait $TRACER_PID 2>/dev/null || true
 
 # Give it extra time to flush the file
-sleep 1
+sleep 2
 
 # Check if trace file was created
 if [ ! -f "$EBPF_TRACE_FILE" ]; then
