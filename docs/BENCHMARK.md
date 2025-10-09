@@ -40,12 +40,10 @@ The benchmark creates a timestamped results directory:
 ```
 benchmark_results_YYYYMMDD_HHMMSS/
 ├── benchmark_report.html       # Interactive HTML report (open this!)
-├── results.json                # Raw benchmark data
-├── lttng_*us_r*/              # LTTng trace files (N runs per scenario)
-└── ebpf_*us_r*.txt           # eBPF trace files (N runs per scenario)
+└── results.json                # Raw benchmark data
 ```
 
-where N is the number of repetitions (default: 10)
+**Note:** Individual trace files (`lttng_*us_r*/` directories and `ebpf_*us_r*.txt` files) are automatically cleaned up immediately after their data is extracted to minimize disk usage. Only the final aggregated results are kept.
 
 Open the HTML report in your browser:
 ```bash
@@ -298,9 +296,10 @@ Each benchmark run follows this sequence:
 3. **Collection Phase**
    - Stop trace session
    - Calculate trace file size
+   - Clean up trace files immediately to save disk space
    - Parse timing and resource data
 
-4. **Aggregation Phase** (100 runs)
+4. **Aggregation Phase** (multiple runs)
    - Collect individual measurements
    - Calculate mean, stddev, min, max
    - Compute 95% confidence interval
@@ -649,25 +648,28 @@ Time depends on number of repetitions:
 
 ### Disk Usage
 
-Each run creates trace files (scales with number of repetitions):
+**Automatic Cleanup:** The benchmark automatically deletes individual trace files immediately after extracting their data. This minimizes peak disk usage significantly.
 
-**For default 10 runs:**
-- **LTTng**: ~150 MB per run × 10 runs × 6 scenarios = ~9 GB (temporary)
-- **eBPF**: ~1-5 MB per run × 10 runs × 6 scenarios = ~300 MB
+**Peak disk usage during benchmark run:**
+- **LTTng**: ~150 MB (only one trace at a time)
+- **eBPF**: ~1-5 MB (only one trace at a time)
 
-**For CI 20 runs:**
-- **LTTng**: ~150 MB per run × 20 runs × 6 scenarios = ~18 GB (temporary)
-- **eBPF**: ~1-5 MB per run × 20 runs × 6 scenarios = ~600 MB
+**Final results directory size (all runs):**
+- **HTML report + JSON**: ~1-5 MB (regardless of number of runs)
 
-**For production 50 runs:**
-- **LTTng**: ~150 MB per run × 50 runs × 6 scenarios = ~45 GB (temporary)
-- **eBPF**: ~1-5 MB per run × 50 runs × 6 scenarios = ~1.5 GB
+This is a dramatic improvement over the old behavior where trace files accumulated:
 
-**For research 100 runs:**
-- **LTTng**: ~150 MB per run × 100 runs × 6 scenarios = ~90 GB (temporary)
-- **eBPF**: ~1-5 MB per run × 100 runs × 6 scenarios = ~3 GB
+**Old behavior (without cleanup):**
+- 10 runs: ~9 GB LTTng + ~300 MB eBPF
+- 20 runs: ~18 GB LTTng + ~600 MB eBPF
+- 50 runs: ~45 GB LTTng + ~1.5 GB eBPF
+- 100 runs: ~90 GB LTTng + ~3 GB eBPF
 
-Trace files are kept for debugging but can be cleaned up:
+**New behavior (with automatic cleanup):**
+- Peak: ~150 MB (during LTTng trace collection)
+- Final: ~1-5 MB (only HTML report and JSON)
+
+Clean up old benchmark results directories when done:
 
 ```bash
 # Clean up old benchmark results

@@ -16,6 +16,7 @@ import json
 import re
 import statistics
 import argparse
+import shutil
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -277,6 +278,11 @@ class BenchmarkSuite:
         trace_size = 0
         if trace_path.exists():
             trace_size = sum(f.stat().st_size for f in trace_path.rglob('*') if f.is_file())
+            # Clean up trace directory immediately to save disk space
+            try:
+                shutil.rmtree(trace_path)
+            except Exception as e:
+                print(f"    Warning: Could not remove trace directory {trace_path}: {e}")
 
         return BenchmarkResult(
             scenario=scenario.name,
@@ -402,6 +408,11 @@ class BenchmarkSuite:
                     events_captured = sum(1 for _ in f)
             except:
                 pass
+            # Clean up trace file immediately to save disk space
+            try:
+                trace_file.unlink()
+            except Exception as e:
+                print(f"    Warning: Could not remove trace file {trace_file}: {e}")
 
         return BenchmarkResult(
             scenario=scenario.name,
@@ -776,7 +787,7 @@ class BenchmarkSuite:
 
         <h2>📚 Data Files</h2>
         <p>Raw benchmark data: <code>{self.output_dir}/results.json</code></p>
-        <p>Trace files: <code>{self.output_dir}/</code></p>
+        <p><em>Note: Individual trace files are automatically cleaned up after data extraction to minimize disk usage.</em></p>
     </div>
 
     <script>
@@ -919,8 +930,9 @@ Examples:
 Output:
   - benchmark_results_<timestamp>/benchmark_report.html (interactive report)
   - benchmark_results_<timestamp>/results.json (raw data)
-  - benchmark_results_<timestamp>/lttng_*/  (LTTng trace files)
-  - benchmark_results_<timestamp>/ebpf_*.txt (eBPF trace files)
+
+Note: Individual trace files are automatically cleaned up after data extraction
+to minimize disk usage. Only the final aggregated results are kept.
         '''
     )
 
