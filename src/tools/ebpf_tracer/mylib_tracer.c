@@ -17,8 +17,8 @@ struct trace_event_entry {
     uint64_t timestamp;
     int32_t arg1;
     uint64_t arg2;
-    uint64_t arg3_ptr;  // Pointer to string
-    uint64_t arg5;
+    double arg3;
+    uint64_t arg4;
     uint32_t event_type;  // 0=entry
 } __attribute__((packed));
 
@@ -97,13 +97,13 @@ static void write_events_to_file(const char *filename) {
             const struct trace_event_entry *e = &event_buffer[i].entry;
             fprintf(f,
                     "[%lu.%09lu] mylib:my_traced_function_entry: "
-                    "{ arg1 = %d, arg2 = %lu, arg3_ptr = 0x%lx, arg5 = 0x%lx }\n",
+                    "{ arg1 = %d, arg2 = %lu, arg3 = %f, arg4 = 0x%lx }\n",
                     e->timestamp / 1000000000,
                     e->timestamp % 1000000000,
                     e->arg1,
                     e->arg2,
-                    e->arg3_ptr,
-                    e->arg5);
+                    e->arg3,
+                    e->arg4);
         } else if (event_sizes[i] == sizeof(struct trace_event_exit)) {
             const struct trace_event_exit *e = &event_buffer[i].exit;
             fprintf(f,
@@ -148,9 +148,34 @@ int main(int argc, char **argv) {
     struct bpf_link *link_entry = NULL;
     struct bpf_link *link_exit = NULL;
 
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <output_file>\n", argv[0]);
+    const char *output_file = NULL;
+
+    // Check if we should write trace to file (via environment variable or command line)
+    // By default, we only collect statistics (no file output) for minimal overhead
+    const char *write_trace_env = getenv("EBPF_TRACE_WRITE_FILE");
+    int should_write_file = (write_trace_env != NULL && strcmp(write_trace_env, "1") == 0);
+
+    if (argc == 2) {
+        output_file = argv[1];
+        should_write_file = 1;  // If file specified on command line, always write
+    } else if (argc > 2) {
+        fprintf(stderr, "Usage: %s [output_file]\n", argv[0]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "By default, traces events in memory only (no file output).\n");
+        fprintf(stderr, "To write trace to file:\n");
+        fprintf(stderr, "  1. Specify output_file on command line, OR\n");
+        fprintf(stderr, "  2. Set EBPF_TRACE_WRITE_FILE=1 environment variable\n");
+        fprintf(stderr, "\n");
+        fprintf(stderr, "Examples:\n");
+        fprintf(stderr, "  %s /tmp/trace.txt          # Write to file (command line)\n", argv[0]);
+        fprintf(stderr, "  EBPF_TRACE_WRITE_FILE=1 %s /tmp/trace.txt  # Write to file (env var)\n", argv[0]);
+        fprintf(stderr, "  %s                         # No file output (benchmark mode)\n", argv[0]);
         return 1;
+    }
+
+    // If env var is set but no file specified, use default location
+    if (should_write_file && !output_file) {
+        output_file = "/tmp/ebpf_trace.txt";
     }
 
     // Find the library
@@ -259,9 +284,12 @@ int main(int argc, char **argv) {
 
     printf("\nTracing stopped. Captured %lu events.\n", event_count);
 
-    // Write all buffered events to file (AFTER tracing completes)
-    if (event_count > 0) {
-        write_events_to_file(argv[1]);
+    // Write all buffered events to file (AFTER tracing completes) - only if requested
+    if (should_write_file && event_count > 0 && output_file) {
+        write_events_to_file(output_file);
+    } else if (!should_write_file) {
+        printf("File output disabled. Events captured in memory only.\n");
+        printf("Set EBPF_TRACE_WRITE_FILE=1 or specify output file to write trace.\n");
     }
 
 cleanup:

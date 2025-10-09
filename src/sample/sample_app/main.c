@@ -41,9 +41,8 @@ int main(int argc, char* argv[]) {
         my_traced_function(
             42,                    // int arg1
             0xDEADBEEF,           // uint64_t arg2
-            "test_string",        // const char* arg3
-            3.14159,              // double arg4
-            (void*)0x12345678     // void* arg5
+            3.14159,              // double arg3
+            (void*)0x12345678     // void* arg4
         );
     }
 

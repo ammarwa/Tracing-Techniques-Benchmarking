@@ -8,7 +8,7 @@
 
 // Function pointers to the real implementations
 // Use __attribute__((visibility("hidden"))) to avoid symbol interposition overhead
-static void (*real_my_traced_function)(int, uint64_t, const char*, double, void*) __attribute__((visibility("hidden"))) = NULL;
+static void (*real_my_traced_function)(int, uint64_t, double, void*) __attribute__((visibility("hidden"))) = NULL;
 static void (*real_set_simulated_work_duration)(unsigned int) __attribute__((visibility("hidden"))) = NULL;
 
 // Use GCC constructor to initialize once at library load time
@@ -63,15 +63,14 @@ __attribute__((hot))
 void my_traced_function(
     int arg1,
     uint64_t arg2,
-    const char* arg3,
-    double arg4,
-    void* arg5)
+    double arg3,
+    void* arg4)
 {
     // Entry tracepoint - optimized: single tracepoint, no exit needed for overhead comparison
-    tracepoint(mylib, my_traced_function_entry, arg1, arg2, arg3, arg4, arg5);
+    tracepoint(mylib, my_traced_function_entry, arg1, arg2, arg3, arg4);
 
     // Call the real function - real_my_traced_function is now guaranteed to be initialized
-    real_my_traced_function(arg1, arg2, arg3, arg4, arg5);
+    real_my_traced_function(arg1, arg2, arg3, arg4);
 
     // Exit tracepoint - kept for compatibility but can be disabled for performance
     tracepoint(mylib, my_traced_function_exit);

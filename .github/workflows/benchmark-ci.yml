@@ -54,7 +54,7 @@ jobs:
 
       - name: Run validation tests
         run: |
-          sudo ./scripts/validate_output.sh;
+          sudo ./scripts/validate_output.sh
 
   benchmark:
     needs: build-and-validate

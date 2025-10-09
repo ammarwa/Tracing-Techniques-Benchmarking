@@ -30,20 +30,14 @@ void set_simulated_work_duration(unsigned int sleep_us) {
 void my_traced_function(
     int arg1,
     uint64_t arg2,
-    const char* arg3,
-    double arg4,
-    void* arg5)
+    double arg3,
+    void* arg4)
 {
     // Do some minimal work to prevent complete optimization
     dummy = arg1 + (int)arg2;
+    dummy += (int)arg3;
 
-    if (arg3) {
-        dummy += strlen(arg3);
-    }
-
-    dummy += (int)arg4;
-
-    if (arg5) {
+    if (arg4) {
         dummy += 1;
     }
 

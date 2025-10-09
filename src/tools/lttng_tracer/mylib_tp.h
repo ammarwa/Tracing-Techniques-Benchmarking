@@ -15,16 +15,14 @@ TRACEPOINT_EVENT(
     TP_ARGS(
         int, arg1,
         uint64_t, arg2,
-        const char*, arg3,
-        double, arg4,
-        void*, arg5
+        double, arg3,
+        void*, arg4
     ),
     TP_FIELDS(
         ctf_integer(int, arg1, arg1)
         ctf_integer(uint64_t, arg2, arg2)
-        ctf_string(arg3, arg3)
-        ctf_float(double, arg4, arg4)
-        ctf_integer_hex(unsigned long, arg5, (unsigned long)arg5)
+        ctf_float(double, arg3, arg3)
+        ctf_integer_hex(unsigned long, arg4, (unsigned long)arg4)
     )
 )
 

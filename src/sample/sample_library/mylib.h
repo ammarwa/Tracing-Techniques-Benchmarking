@@ -12,9 +12,8 @@ extern "C" {
 void my_traced_function(
     int arg1,
     uint64_t arg2,
-    const char* arg3,
-    double arg4,
-    void* arg5
+    double arg3,
+    void* arg4
 );
 
 // Set simulated work duration (in microseconds)

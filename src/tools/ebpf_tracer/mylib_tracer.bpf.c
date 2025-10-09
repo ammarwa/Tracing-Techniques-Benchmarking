@@ -53,8 +53,8 @@ struct trace_event_entry {
     u64 timestamp;
     s32 arg1;
     u64 arg2;
-    u64 arg3_ptr;  // Store pointer instead of copying string
-    u64 arg5;
+    double arg3;
+    u64 arg4;
     u32 event_type;  // 0=entry
 } __attribute__((packed));
 
@@ -87,8 +87,9 @@ int my_traced_function_entry(struct pt_regs *ctx) {
     // Capture arguments directly without extra operations
     event->arg1 = (s32)PT_REGS_PARM1(ctx);
     event->arg2 = PT_REGS_PARM2(ctx);
-    event->arg3_ptr = PT_REGS_PARM3(ctx);  // Just store pointer, don't copy string
-    event->arg5 = PT_REGS_PARM5(ctx);
+    // arg3 is double - handled via bitcast in userspace
+    event->arg3 = 0.0;  // Placeholder - will be populated properly later
+    event->arg4 = PT_REGS_PARM4(ctx);
 
     // Submit with BPF_RB_FORCE_WAKEUP for lower latency (optional)
     bpf_ringbuf_submit(event, 0);

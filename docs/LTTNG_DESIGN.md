@@ -78,25 +78,22 @@ TRACEPOINT_EVENT(
     TP_ARGS(
         int, arg1,
         uint64_t, arg2,
-        const char*, arg3,
-        double, arg4,
-        void*, arg5
+        double, arg3,
+        void*, arg4
     ),
     TP_FIELDS(
         ctf_integer(int, arg1, arg1)
         ctf_integer(uint64_t, arg2, arg2)
-        ctf_string(arg3, arg3)
-        ctf_float(double, arg4, arg4)
-        ctf_integer_hex(unsigned long, arg5, (unsigned long)arg5)
+        ctf_float(double, arg3, arg3)
+        ctf_integer_hex(unsigned long, arg4, (unsigned long)arg4)
     )
 )
 ```
 
 **CTF field types**:
 - `ctf_integer()`: Integer field
-- `ctf_string()`: Null-terminated string (copied to buffer)
-- `ctf_float()`: Floating-point field
-- `ctf_integer_hex()`: Integer displayed as hexadecimal
+- `ctf_float()`: Floating-point field (double)
+- `ctf_integer_hex()`: Integer displayed as hexadecimal (pointer)
 
 #### Exit Tracepoint
 
@@ -168,15 +165,14 @@ __attribute__((hot))  // Compiler hint: optimize for hot path
 void my_traced_function(
     int arg1,
     uint64_t arg2,
-    const char* arg3,
-    double arg4,
-    void* arg5)
+    double arg3,
+    void* arg4)
 {
     // Entry tracepoint (captures all arguments)
-    tracepoint(mylib, my_traced_function_entry, arg1, arg2, arg3, arg4, arg5);
+    tracepoint(mylib, my_traced_function_entry, arg1, arg2, arg3, arg4);
 
     // Call original function
-    real_my_traced_function(arg1, arg2, arg3, arg4, arg5);
+    real_my_traced_function(arg1, arg2, arg3, arg4);
 
     // Exit tracepoint (just timestamp)
     tracepoint(mylib, my_traced_function_exit);
@@ -300,9 +296,9 @@ tracecompass /tmp/lttng_traces/my_session-*
 ### Example Trace Output
 
 ```
-[12:34:56.123456789] (+0.000000000) hostname mylib:my_traced_function_entry: { cpu_id = 0 }, { arg1 = 42, arg2 = 1234567890, arg3 = "test", arg4 = 3.14, arg5 = 0xdeadbeef }
+[12:34:56.123456789] (+0.000000000) hostname mylib:my_traced_function_entry: { cpu_id = 0 }, { arg1 = 42, arg2 = 1234567890, arg3 = 3.14159, arg4 = 0x12345678 }
 [12:34:56.123556789] (+0.000100000) hostname mylib:my_traced_function_exit: { cpu_id = 0 }
-[12:34:56.123656789] (+0.000100000) hostname mylib:my_traced_function_entry: { cpu_id = 0 }, { arg1 = 42, arg2 = 1234567891, arg3 = "test", arg4 = 3.14, arg5 = 0xdeadbeef }
+[12:34:56.123656789] (+0.000100000) hostname mylib:my_traced_function_entry: { cpu_id = 0 }, { arg1 = 42, arg2 = 1234567891, arg3 = 3.14159, arg4 = 0x12345678 }
 [12:34:56.123756789] (+0.000100000) hostname mylib:my_traced_function_exit: { cpu_id = 0 }
 ```
 

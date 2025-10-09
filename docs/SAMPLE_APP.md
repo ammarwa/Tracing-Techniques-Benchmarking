@@ -59,9 +59,8 @@ extern "C" {
 void my_traced_function(
     int arg1,
     uint64_t arg2,
-    const char* arg3,
-    double arg4,
-    void* arg5
+    double arg3,
+    void* arg4
 );
 
 // Set simulated work duration (in microseconds)
@@ -93,14 +92,9 @@ static volatile int dummy = 0;
 void my_traced_function(...) {
     // Do some minimal work to prevent complete optimization
     dummy = arg1 + (int)arg2;
+    dummy += (int)arg3;
 
-    if (arg3) {
-        dummy += strlen(arg3);
-    }
-
-    dummy += (int)arg4;
-
-    if (arg5) {
+    if (arg4) {
         dummy += 1;
     }
 }
@@ -359,10 +353,9 @@ stop_tracer()
 ```c
 void my_traced_function(
     int arg1,           // Common: integer
-    uint64_t arg2,      // Common: large integer
-    const char* arg3,   // Common: string pointer
-    double arg4,        // Less common: floating-point
-    void* arg5          // Common: opaque pointer
+    uint64_t arg2,      // Common: large integer (e.g., size_t)
+    double arg3,        // Floating-point value
+    void* arg4          // Common: opaque pointer
 );
 ```
 
@@ -372,9 +365,9 @@ void my_traced_function(
 - `hipLaunchKernel(void* func, dim3 grid, dim3 block, ...)` → many args
 
 **Tests tracer capabilities**:
-- Argument capture (registers, stack)
-- Different data types (int, uint64_t, pointer, float)
-- String handling (pointer vs value)
+- Argument capture from registers (x86-64: RDI, RSI, XMM0, RCX)
+- Different data types (int, uint64_t, double, pointer)
+- Floating-point register handling (XMM registers)
 
 #### 2. Configurable Work Duration
 
@@ -506,7 +499,7 @@ Potential improvements:
 
 The sample library and application provide a **flexible, realistic test workload** for comparing eBPF and LTTng tracing overhead. Key features:
 
-✅ **Realistic function signature**: Multiple argument types (int, uint64_t, string, float, pointer)
+✅ **Realistic function signature**: Multiple argument types (int, uint64_t, double, pointer)
 ✅ **Configurable work duration**: Simulates API calls from 0 μs (empty) to 1000 μs (slow)
 ✅ **Accurate timing**: Busy-wait sleep ensures microsecond precision
 ✅ **Minimal overhead**: ~6 ns baseline (worst-case empty function)
