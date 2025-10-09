@@ -5,7 +5,11 @@ Comprehensive eBPF vs LTTng Benchmark Suite
 Tests multiple scenarios with different function durations to demonstrate
 how uprobe overhead scales with realistic function execution times.
 
-Generates an HTML report with detailed analysis and visualizations.
+Generates an HTML report with detailed analysis and visualizations:
+- Interactive charts with consistent color coding (Gray=Baseline, Orange=LTTng, Blue=eBPF)
+- Overhead percentage comparison
+- Absolute timing comparison (grouped bars)
+- Memory usage comparison
 """
 
 import os
@@ -814,6 +818,13 @@ class BenchmarkSuite:
         const memory_lttng = {js_memory_lttng};
         const memory_ebpf = {js_memory_ebpf};
 
+        // Color scheme: LTTng = orange, eBPF = blue, Baseline = gray
+        const colors = {{
+            baseline: '#7f8c8d',
+            lttng: '#e67e22',
+            ebpf: '#3498db'
+        }};
+
         // Overhead percentage chart
         const overheadData = [
             {{
@@ -822,8 +833,8 @@ class BenchmarkSuite:
                 name: 'LTTng',
                 type: 'scatter',
                 mode: 'lines+markers',
-                marker: {{ size: 10 }},
-                line: {{ width: 3 }}
+                marker: {{ size: 10, color: colors.lttng }},
+                line: {{ width: 3, color: colors.lttng }}
             }},
             {{
                 x: work_us_data,
@@ -831,8 +842,8 @@ class BenchmarkSuite:
                 name: 'eBPF',
                 type: 'scatter',
                 mode: 'lines+markers',
-                marker: {{ size: 10 }},
-                line: {{ width: 3 }}
+                marker: {{ size: 10, color: colors.ebpf }},
+                line: {{ width: 3, color: colors.ebpf }}
             }}
         ];
 
@@ -852,36 +863,39 @@ class BenchmarkSuite:
 
         Plotly.newPlot('overhead-chart', overheadData, overheadLayout);
 
-        // Absolute timing chart
+        // Absolute timing chart - grouped bars (not stacked)
         const timingData = [
             {{
                 x: scenario_names,
                 y: baseline_ns_data,
                 name: 'Baseline',
-                type: 'bar'
+                type: 'bar',
+                marker: {{ color: colors.baseline }}
             }},
             {{
                 x: scenario_names,
                 y: lttng_overhead_ns,
                 name: 'LTTng Overhead',
-                type: 'bar'
+                type: 'bar',
+                marker: {{ color: colors.lttng }}
             }},
             {{
                 x: scenario_names,
                 y: ebpf_overhead_ns,
                 name: 'eBPF Overhead',
-                type: 'bar'
+                type: 'bar',
+                marker: {{ color: colors.ebpf }}
             }}
         ];
 
         const timingLayout = {{
-            title: 'Absolute Time Per Call (Stacked)',
+            title: 'Absolute Timing Comparison',
             xaxis: {{ title: 'Scenario' }},
             yaxis: {{
                 title: 'Time (nanoseconds)',
                 type: 'log'
             }},
-            barmode: 'stack',
+            barmode: 'group',
             height: 500
         }};
 
@@ -893,19 +907,22 @@ class BenchmarkSuite:
                 x: scenario_names,
                 y: memory_baseline,
                 name: 'Baseline',
-                type: 'bar'
+                type: 'bar',
+                marker: {{ color: colors.baseline }}
             }},
             {{
                 x: scenario_names,
                 y: memory_lttng,
                 name: 'LTTng',
-                type: 'bar'
+                type: 'bar',
+                marker: {{ color: colors.lttng }}
             }},
             {{
                 x: scenario_names,
                 y: memory_ebpf,
                 name: 'eBPF',
-                type: 'bar'
+                type: 'bar',
+                marker: {{ color: colors.ebpf }}
             }}
         ];
 

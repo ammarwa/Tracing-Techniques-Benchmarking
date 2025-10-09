@@ -4,6 +4,13 @@
 
 This project includes a comprehensive Python-based benchmark suite that measures eBPF and LTTng tracing overhead across multiple realistic scenarios. The benchmark demonstrates how uprobe overhead scales with function duration and proves that eBPF is suitable for GPU/HIP API tracing.
 
+The benchmark generates interactive HTML reports with:
+- **Color-coded charts** for easy visual comparison (Gray=Baseline, Orange=LTTng, Blue=eBPF)
+- **Statistical confidence intervals** from multiple runs
+- **Scenario selection** for faster targeted testing
+
+---
+
 ## Quick Start
 
 ### 1. Build the Project
@@ -12,25 +19,28 @@ This project includes a comprehensive Python-based benchmark suite that measures
 ./build.sh -c
 ```
 
-### 2. Run Comprehensive Benchmark
+### 2. Run Benchmark
 
 ```bash
-# Default: 10 repetitions per scenario (~4-6 minutes)
-sudo ../scripts/benchmark.py ./build
+# Run all scenarios with default 10 repetitions (~4-6 minutes)
+python3 scripts/benchmark.py ./build
 
-# Quick test: 5 repetitions (~2-4 minutes)
-sudo ../scripts/benchmark.py ./build --runs 5
+# List available scenarios
+python3 scripts/benchmark.py --list-scenarios
 
-# CI analysis: 20 repetitions (~8-12 minutes)
-sudo ../scripts/benchmark.py ./build --runs 20
+# Run specific scenarios (faster testing)
+python3 scripts/benchmark.py ./build --scenarios 3 4 5
 
-# Full statistical analysis: 100 repetitions (~40-60 minutes)
-sudo ../scripts/benchmark.py ./build --runs 100
+# Quick test with fewer repetitions
+python3 scripts/benchmark.py ./build -s 5 -r 2
+
+# Full statistical analysis
+python3 scripts/benchmark.py ./build --runs 50
 ```
 
-**Help and Options:**
+**View all options:**
 ```bash
-../scripts/benchmark.py --help
+python3 scripts/benchmark.py --help
 ```
 
 ### 3. View Results
@@ -43,27 +53,175 @@ benchmark_results_YYYYMMDD_HHMMSS/
 └── results.json                # Raw benchmark data
 ```
 
-**Note:** Individual trace files (`lttng_*us_r*/` directories and `ebpf_*us_r*.txt` files) are automatically cleaned up immediately after their data is extracted to minimize disk usage. Only the final aggregated results are kept.
-
 Open the HTML report in your browser:
 ```bash
 firefox benchmark_results_*/benchmark_report.html
+```
+
+**Note:** Individual trace files are automatically cleaned up after data extraction to minimize disk usage.
+
+---
+
+## New Features (2025 Update)
+
+### ✅ Fixed Chart Rendering
+**Problem:** Charts were showing empty sections
+
+**Solution:** Fixed f-string interpolation bug - charts now render properly with all data
+
+### ✅ Improved Visualizations
+- **Consistent color scheme** across all charts:
+  - Gray (`#7f8c8d`) = Baseline
+  - Orange (`#e67e22`) = LTTng
+  - Blue (`#3498db`) = eBPF
+- **Grouped bar charts** (not stacked) for easier side-by-side comparison
+- **Interactive features**: hover, zoom, pan, download
+
+### ✅ Scenario Selection
+Run specific scenarios instead of all 6:
+
+```bash
+# Run only scenarios 3, 4, and 5 (longer durations)
+python3 scripts/benchmark.py ./build --scenarios 3 4 5
+
+# Run single scenario with more repetitions
+python3 scripts/benchmark.py ./build -s 0 -r 50
+
+# Quick test with fewer scenarios
+python3 scripts/benchmark.py ./build -s 2 3 --runs 5
+```
+
+**Time savings:**
+- Full benchmark (6 scenarios × 10 runs): ~4-6 minutes
+- Single scenario (1 scenario × 10 runs): ~40-60 seconds
+- Quick test (3 scenarios × 5 runs): ~1-2 minutes
+
+### ✅ Report Regeneration Tool
+Regenerate HTML reports from existing results without re-running benchmarks:
+
+```bash
+# Regenerate from results directory
+python3 scripts/regenerate_report.py benchmark_results_20251009_174347
+
+# Useful for:
+# - Applying chart fixes to old results
+# - Updating report styling
+# - Re-generating after visualization improvements
 ```
 
 ---
 
 ## Test Scenarios
 
-The benchmark tests 6 scenarios representing different function durations:
+The benchmark includes 6 scenarios representing different function durations:
 
-| Scenario | Work Duration | Iterations | Represents |
-|----------|---------------|------------|------------|
-| **Empty Function** | 0 μs | 1,000,000 | Worst case: minimal work function |
-| **5 μs Function** | 5 μs | 100,000 | Ultra-fast API (comparable to uprobe overhead) |
-| **50 μs Function** | 50 μs | 50,000 | Fast API (e.g., `hipGetDevice`) |
-| **100 μs Function** | 100 μs | 10,000 | Typical API (e.g., `hipMalloc` small) |
-| **500 μs Function** | 500 μs | 5,000 | Medium API (e.g., `hipMemcpy` medium) |
-| **1000 μs Function** | 1 ms | 2,000 | Slow API (e.g., large allocations) |
+| Index | Scenario | Duration | Iterations | Represents |
+|-------|----------|----------|------------|------------|
+| **0** | Empty Function | 0 μs | 1,000,000 | Worst case: minimal work |
+| **1** | 5 μs Function | 5 μs | 100,000 | Ultra-fast API |
+| **2** | 50 μs Function | 50 μs | 50,000 | Fast API (e.g., `hipGetDevice`) |
+| **3** | 100 μs Function | 100 μs | 10,000 | Typical API (e.g., `hipMalloc`) |
+| **4** | 500 μs Function | 500 μs | 5,000 | Medium API (e.g., `hipMemcpy`) |
+| **5** | 1000 μs Function | 1 ms | 2,000 | Slow API (large allocations) |
+
+**List scenarios:**
+```bash
+python3 scripts/benchmark.py --list-scenarios
+```
+
+**Select scenarios:**
+```bash
+# GPU-relevant scenarios only (100μs and above)
+python3 scripts/benchmark.py ./build --scenarios 3 4 5
+
+# Test extreme cases (empty function and 1ms)
+python3 scripts/benchmark.py ./build -s 0 5
+```
+
+---
+
+## Chart Visualizations
+
+The HTML report includes three interactive charts with consistent color coding:
+
+### 📊 Chart 1: Overhead by Function Duration
+**Type:** Line chart with markers
+- 🟠 **Orange**: LTTng overhead percentage
+- 🔵 **Blue**: eBPF overhead percentage
+
+**Purpose:** Shows how tracing overhead scales with function execution time
+
+**Key Insights:**
+- Demonstrates constant absolute overhead
+- Shows relative overhead decreases as function duration increases
+- Identifies crossover point where overhead becomes acceptable
+
+---
+
+### 📊 Chart 2: Absolute Timing Comparison
+**Type:** Grouped bar chart (side-by-side bars)
+- ⬜ **Gray**: Baseline (no tracing)
+- 🟠 **Orange**: LTTng overhead
+- 🔵 **Blue**: eBPF overhead
+
+**Purpose:** Direct comparison of absolute time per function call
+
+**Key Insights:**
+- Easy side-by-side comparison of methods
+- Logarithmic scale shows wide range of timings
+- Shows absolute cost in nanoseconds
+
+**Note:** Changed from stacked to grouped bars for easier comparison
+
+---
+
+### 📊 Chart 3: Resource Usage Comparison
+**Type:** Grouped bar chart (side-by-side bars)
+- ⬜ **Gray**: Baseline memory
+- 🟠 **Orange**: LTTng memory (~330 MB)
+- 🔵 **Blue**: eBPF memory (~2 MB)
+
+**Purpose:** Compare memory consumption across methods
+
+**Key Insights:**
+- LTTng uses significant memory for in-process buffers
+- eBPF has minimal memory footprint
+- Helps understand resource constraints
+
+---
+
+### Interactive Chart Features
+
+All charts support:
+- **Hover**: View exact values
+- **Zoom**: Click and drag to zoom
+- **Pan**: Shift+drag to navigate
+- **Legend**: Click to show/hide series
+- **Download**: Save as PNG
+
+---
+
+### Color Scheme Rationale
+
+**Why these colors?**
+- **Gray for Baseline**: Neutral color for reference measurement
+- **Orange for LTTng**: Warm color suggesting active userspace tracing
+- **Blue for eBPF**: Cool color representing kernel-level efficiency
+
+**Benefits:**
+- Consistent across ALL charts for easy correlation
+- Distinguishable by people with color vision deficiencies
+- Professional and publication-ready
+
+**Customization:**
+Edit `scripts/benchmark.py` around line 818:
+```javascript
+const colors = {
+    baseline: '#7f8c8d',  // Gray
+    lttng: '#e67e22',     // Orange
+    ebpf: '#3498db'       // Blue
+};
+```
 
 ---
 
@@ -71,10 +229,10 @@ The benchmark tests 6 scenarios representing different function durations:
 
 ### Multiple Runs for Trustworthy Results
 
-Each scenario runs **multiple times** to ensure statistical reliability. The number of repetitions is configurable via the `--runs` option:
+Each scenario runs **multiple times** to ensure statistical reliability:
 
 - **Mean**: Average value across all runs
-- **Standard Deviation**: Measure of variability/spread
+- **Standard Deviation**: Measure of variability
 - **Min/Max**: Range of observed values
 - **95% Confidence Interval**: ±margin of error (1.96 × std_err)
 
@@ -82,40 +240,28 @@ Each scenario runs **multiple times** to ensure statistical reliability. The num
 
 | Runs | Total Tests | Duration | Use Case |
 |------|-------------|----------|----------|
-| **5** | 90 (6×3×5) | ~2-4 min | Quick development test, smoke tests |
-| **10** *(default)* | 180 (6×3×10) | ~4-6 min | Daily development, fast iteration |
-| **20** | 360 (6×3×20) | ~8-12 min | **CI/CD, automated testing, GitHub Actions** |
-| **50** | 900 (6×3×50) | ~20-30 min | Production analysis, detailed reports |
-| **100** | 1,800 (6×3×100) | ~40-60 min | Research, publication-quality statistics |
-| **200** | 3,600 (6×3×200) | ~80-120 min | Maximum precision, long-term benchmarks |
+| **5** | 90 | ~2-4 min | Quick smoke tests |
+| **10** *(default)* | 180 | ~4-6 min | Daily development |
+| **20** | 360 | ~8-12 min | **CI/CD, automated testing** |
+| **50** | 900 | ~20-30 min | Production analysis |
+| **100** | 1,800 | ~40-60 min | Research, publications |
 
-### Command-Line Usage
+### Example Command
 
 ```bash
 # Quick test (5 runs)
-sudo ../scripts/benchmark.py ./build --runs 5
-
-# Default (10 runs)
-sudo ../scripts/benchmark.py ./build
+python3 scripts/benchmark.py ./build --runs 5
 
 # CI/CD (20 runs) - recommended for automated testing
-sudo ../scripts/benchmark.py ./build --runs 20
+python3 scripts/benchmark.py ./build --runs 20
 
-# Production analysis (50 runs)
-sudo ../scripts/benchmark.py ./build --runs 50
-
-# Full statistical analysis (100 runs)
-sudo ../scripts/benchmark.py ./build --runs 100
-
-# Maximum precision (200 runs)
-sudo ../scripts/benchmark.py ./build --runs 200
+# Full analysis (100 runs)
+python3 scripts/benchmark.py ./build --runs 100
 ```
-
-The script will show a warning and ask for confirmation if you specify more than 200 runs.
 
 ### Statistical Output
 
-The benchmark calculates comprehensive statistics:
+Results include comprehensive statistics:
 
 ```json
 {
@@ -130,13 +276,110 @@ The benchmark calculates comprehensive statistics:
 }
 ```
 
-The HTML report displays confidence intervals in the results table:
+HTML report shows confidence intervals:
 
 | Scenario | Method | Avg Time (ns) | ±95% CI | Overhead % |
-|----------|--------|--------------|---------|------------|
+|----------|--------|---------------|---------|------------|
 | 100 μs   | Baseline | 108,234.56 | ±12.34 | 0% |
 | 100 μs   | LTTng | 143,567.89 | ±23.45 | 32.6% |
 | 100 μs   | eBPF | 122,345.67 | ±18.92 | 13.0% |
+
+---
+
+## Understanding the Results
+
+### Key Finding: Absolute vs Relative Overhead
+
+**Uprobe overhead is CONSTANT (~5 μs per call), not relative to function duration.**
+
+This means:
+- **Empty 6ns function**: 5,000/6 = **83,000% overhead** ❌ (worst case, unrealistic)
+- **100 μs HIP API**: 5,000/100,000 = **5% overhead** ✅ (typical case)
+- **1 ms GPU kernel**: 5,000/1,000,000 = **0.5% overhead** ✅ (realistic workload)
+
+### Expected Overhead Pattern
+
+```
+Function Duration vs Overhead %
+
+Empty (0μs):      █████████████████████ 83,000% ❌
+5 μs:             ████████████ 100% ⚠️
+50 μs:            ████ 10% ⚠️
+100 μs:           ██ 5% ✅
+500 μs:           █ 1% ✅
+1000 μs:          █ 0.5% ✅
+```
+
+### Key Insights
+
+1. **Crossover point: ~100 μs**
+   - Below 100 μs: Overhead is noticeable (>5%)
+   - Above 100 μs: Overhead is acceptable (<5%)
+   - Above 1 ms: Overhead is negligible (<1%)
+
+2. **Production GPU workloads**
+   - HIP API calls: 10-1000 μs → 0.5-5% overhead ✅
+   - GPU kernels: 1-1000 ms → <0.1% overhead ✅
+   - **Total application overhead: <1%** ✅
+
+3. **Why 83% and 0.3% are both correct**
+   - 83% is for empty 6ns functions (stress test, not realistic)
+   - 0.3% is for real GPU applications with ms-scale kernels (realistic)
+   - Both measure the same ~5 μs constant overhead!
+
+---
+
+## Reading the Charts Together
+
+### For Ultra-Fast Functions (0-5 μs):
+1. **Chart 1**: Very high relative overhead (>100%)
+2. **Chart 2**: Absolute overhead is ~5 μs regardless
+3. **Chart 3**: Memory usage comparison
+
+### For Typical Functions (50-500 μs):
+1. **Chart 1**: Moderate overhead (5-20%)
+2. **Chart 2**: Overhead small compared to baseline
+3. **Chart 3**: Memory overhead becomes relevant
+
+### For Slow Functions (1+ ms):
+1. **Chart 1**: Minimal overhead (<1%)
+2. **Chart 2**: Overhead barely visible
+3. **Chart 3**: Memory is primary consideration
+
+---
+
+## GPU/HIP Tracing Implications
+
+The charts demonstrate why **eBPF is ideal for GPU tracing**:
+
+1. **Chart 1** shows overhead decreases as function duration increases
+2. Most HIP API calls take 10-1000 μs
+3. **Chart 2** shows ~5 μs absolute eBPF overhead
+4. For 100 μs HIP call: only ~5% overhead
+5. For 1 ms GPU kernel: only ~0.5% overhead
+
+**Conclusion:** eBPF's constant ~5 μs overhead is negligible for GPU workloads
+
+---
+
+## Recommendations
+
+### When to Use Each Tracing Method
+
+| Method | Best For | Avoid When |
+|--------|----------|------------|
+| **LTTng** | • Functions > 100ns<br>• Can modify app or use LD_PRELOAD<br>• Need rich userspace context<br>• High call frequency (>10K/sec) | • Cannot modify application<br>• Need kernel-level tracing<br>• Want dynamic attach/detach |
+| **eBPF** | • Functions > 10μs<br>• Cannot modify application<br>• Need kernel visibility<br>• Want dynamic attach/detach<br>• **GPU/HIP API tracing** | • Ultra-fast functions (<1μs)<br>• Very high frequency (>1M calls/sec)<br>• Need real-time streaming |
+
+### GPU/HIP Tracing Recommendation
+
+For GPU and HIP API tracing, **eBPF is highly recommended** because:
+
+1. **HIP API calls typically take 10-1000 μs** (much slower than uprobe overhead)
+2. **GPU kernel execution takes milliseconds** (making tracer overhead negligible)
+3. **No application modification required** (zero code changes)
+4. **Can trace at kernel/driver boundary** for complete visibility
+5. **Expected total application overhead: <1%** ✅
 
 ---
 
@@ -181,7 +424,7 @@ This ensures:
 
 ### Metrics Captured
 
-For each scenario and method, we capture:
+For each scenario and method:
 
 **Application Metrics:**
 - Wall time (total elapsed time)
@@ -195,138 +438,6 @@ For each scenario and method, we capture:
 - Tracer memory consumption
 - Trace file size
 - Events captured/dropped
-
----
-
-## Understanding the Results
-
-### Key Finding: Absolute vs Relative Overhead
-
-**Uprobe overhead is CONSTANT (~5 μs per call), not relative to function duration.**
-
-This means:
-- **Empty 6ns function**: 5,000/6 = **83,000% overhead** ❌ (worst case, unrealistic)
-- **100 μs HIP API**: 5,000/100,000 = **5% overhead** ✅ (typical case)
-- **1 ms GPU kernel**: 5,000/1,000,000 = **0.5% overhead** ✅ (realistic workload)
-
-### Expected Overhead Pattern
-
-```
-Function Duration (log scale) vs Overhead %
-
-Empty (0μs):      █████████████████████ 83,000% overhead ❌
-5 μs:             ████████████ 100% overhead ⚠️
-50 μs:            ████ 10% overhead ⚠️
-100 μs:           ██ 5% overhead ✅
-500 μs:           █ 1% overhead ✅
-1000 μs:          █ 0.5% overhead ✅
-```
-
-### Key Insights
-
-1. **Crossover point: ~100 μs**
-   - Below 100 μs: Overhead is noticeable (>5%)
-   - Above 100 μs: Overhead is acceptable (<5%)
-   - Above 1 ms: Overhead is negligible (<1%)
-
-2. **Production GPU workloads**
-   - HIP API calls: 10-1000 μs → 0.5-5% overhead ✅
-   - GPU kernels: 1-1000 ms → <0.1% overhead ✅
-   - **Total application overhead: <1%** ✅
-
-3. **Why 83% and 0.3% are both correct**
-   - 83% is for empty 6ns functions (stress test, not realistic)
-   - 0.3% is for real GPU applications with ms-scale kernels (realistic)
-   - Both measure the same ~5 μs constant overhead!
-
----
-
-## HTML Report Features
-
-The generated HTML report includes:
-
-### 📈 Interactive Charts (Plotly.js)
-
-1. **Relative Overhead vs Function Duration (Log-Log Plot)**
-   - Shows how overhead percentage decreases as function duration increases
-   - Demonstrates the constant absolute overhead principle
-
-2. **Absolute Time Per Call (Stacked Bar Chart)**
-   - Shows baseline time + tracer overhead
-   - Visualizes how overhead becomes insignificant for longer functions
-
-3. **Memory Usage Comparison (Grouped Bar Chart)**
-   - Compares application and tracer memory consumption
-   - Highlights LTTng's in-process buffering (~330 MB) vs eBPF's separate process (~2 MB)
-
-### 📊 Detailed Tables
-
-- Complete results for all scenarios and methods
-- Color-coded overhead percentages:
-  - 🟢 Green: <10% overhead (good)
-  - 🟡 Yellow: 10-50% overhead (warning)
-  - 🔴 Red: >50% overhead (bad)
-- CPU and memory breakdowns
-- Statistical confidence intervals (±95% CI)
-
-### 📝 Analysis and Recommendations
-
-The report includes:
-- When to use LTTng vs eBPF
-- GPU/HIP tracing recommendations
-- Interpretation guidelines
-
----
-
-## Methodology
-
-### Benchmark Design
-
-Each benchmark run follows this sequence:
-
-1. **Setup Phase**
-   - Create trace session (LTTng) or start tracer (eBPF)
-   - Configure simulated work duration via `SIMULATED_WORK_US`
-
-2. **Measurement Phase**
-   - Run application with `/usr/bin/time` for resource metrics
-   - Capture stdout for per-call timing
-   - Monitor tracer resource usage (eBPF only)
-
-3. **Collection Phase**
-   - Stop trace session
-   - Calculate trace file size
-   - Clean up trace files immediately to save disk space
-   - Parse timing and resource data
-
-4. **Aggregation Phase** (multiple runs)
-   - Collect individual measurements
-   - Calculate mean, stddev, min, max
-   - Compute 95% confidence interval
-
-### Statistical Validity
-
-- **Sample size**: Configurable (default n=10, CI uses n=20, research n=100)
-- **Confidence level**: 95% (1.96 × std_err)
-- **Why multiple runs?**
-  - Good statistical power (can detect 10-20% differences with n≥20)
-  - Narrow confidence intervals (±1-5% of mean with n≥20)
-  - Configurable tradeoff between speed and precision
-  - Industry standard for performance benchmarks
-
-### Interpreting Confidence Intervals
-
-**Overlapping intervals** → No significant difference:
-```
-Method A: 100 ± 10 ns  (90-110 ns range)
-Method B: 105 ± 8 ns   (97-113 ns range)
-```
-
-**Non-overlapping intervals** → Significantly different:
-```
-Method A: 100 ± 5 ns   (95-105 ns range)
-Method B: 120 ± 5 ns   (115-125 ns range)
-```
 
 ---
 
@@ -354,25 +465,14 @@ SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
 sudo pkill -INT mylib_tracer
 ```
 
-### Custom Scenarios
-
-Modify `benchmark.py`:
-
-```python
-self.scenarios = [
-    BenchmarkScenario(
-        name="Custom Test",
-        simulated_work_us=250,  # 250 μs
-        iterations=20000,
-        description="My custom scenario"
-    ),
-    # Add more...
-]
-```
-
 ---
 
 ## Troubleshooting
+
+### Charts Not Showing?
+1. Ensure JavaScript is enabled in browser
+2. Check Plotly CDN is accessible (requires internet)
+3. Regenerate report: `python3 scripts/regenerate_report.py <results_dir>`
 
 ### Python Dependencies
 
@@ -385,7 +485,7 @@ The benchmark uses only standard library modules (no external dependencies):
 eBPF tracing requires root:
 
 ```bash
-sudo ../scripts/benchmark.py ./build
+sudo python3 scripts/benchmark.py ./build
 ```
 
 ### LTTng Session Errors
@@ -411,229 +511,13 @@ If confidence intervals are wide (>10% of mean):
 - Close unnecessary applications
 - Disable CPU frequency scaling: `sudo cpupower frequency-set -g performance`
 - Run during low system load
-- Increase number of runs: `sudo ../scripts/benchmark.py ./build --runs 100` or `--runs 200`
-
----
-
-## Example Output
-
-### Console Output
-
-```
-======================================================================
-COMPREHENSIVE eBPF vs LTTng BENCHMARK SUITE
-======================================================================
-
-======================================================================
-Scenario: 100 μs Function
-  Work Duration: 100 μs
-  Iterations: 10,000
-  Description: Typical API: ~100μs (e.g., hipMalloc small, hipMemcpy small)
-======================================================================
-
-  [BASELINE] 100 μs Function - Running 10 times for statistical reliability
-    Run 1/10...
-    Completed 10 runs
-
-  [LTTNG] 100 μs Function - Running 10 times for statistical reliability
-    Run 1/10...
-    Completed 10 runs
-
-  [EBPF] 100 μs Function - Running 10 times for statistical reliability
-    Run 1/10...
-    Completed 10 runs
-
-======================================================================
-✅ BENCHMARK COMPLETE!
-======================================================================
-
-HTML Report: benchmark_results_20251009_143022/benchmark_report.html
-View in browser: file:///home/.../benchmark_report.html
-```
-
-### JSON Results
-
-```json
-{
-  "scenario": "100 μs Function",
-  "method": "lttng",
-  "iterations": 10000,
-  "simulated_work_us": 100,
-  "wall_time_s": 1.436,
-  "user_cpu_s": 1.234,
-  "system_cpu_s": 0.189,
-  "max_rss_kb": 332416,
-  "avg_time_per_call_ns": 143567.89,
-  "trace_size_mb": 145.67,
-  "num_runs": 10,
-  "avg_time_stddev": 1234.56,
-  "avg_time_min": 140123.45,
-  "avg_time_max": 147890.12,
-  "wall_time_stddev": 0.012,
-  "confidence_95_margin": 23.45
-}
-```
-
----
-
-## Recommendations
-
-### When to Use Each Tracing Method
-
-| Method | Best For | Avoid When |
-|--------|----------|------------|
-| **LTTng** | • Functions > 100ns<br>• Can modify app or use LD_PRELOAD<br>• Need rich userspace context<br>• High call frequency (>10K/sec) | • Cannot modify application<br>• Need kernel-level tracing<br>• Want dynamic attach/detach |
-| **eBPF** | • Functions > 10μs<br>• Cannot modify application<br>• Need kernel visibility<br>• Want dynamic attach/detach<br>• **GPU/HIP API tracing** | • Ultra-fast functions (<1μs)<br>• Very high frequency (>1M calls/sec)<br>• Need real-time streaming |
-
-### GPU/HIP Tracing Recommendation
-
-For GPU and HIP API tracing, **eBPF is highly recommended** because:
-
-1. **HIP API calls typically take 10-1000 μs** (much slower than uprobe overhead)
-2. **GPU kernel execution takes milliseconds** (making tracer overhead negligible)
-3. **No application modification required** (zero code changes)
-4. **Can trace at kernel/driver boundary** for complete visibility
-5. **Expected total application overhead: <1%** ✅
-
-### For Different Use Cases
-
-**Daily Development:**
-- Use quick manual tests with specific `SIMULATED_WORK_US` values
-- Fast iteration without full benchmark suite
-
-**Performance Analysis:**
-- Run comprehensive benchmark with default 100 runs
-- Generate HTML report for detailed insights
-
-**Presentations & Reports:**
-- Use the interactive HTML report
-- Demonstrates overhead scaling visually
-- Includes statistical confidence intervals
-
-**Production Decisions:**
-- Run benchmark on target hardware
-- Share HTML report with stakeholders
-- Use statistical data to justify eBPF for GPU tracing
-
----
-
-## Integration with CI/CD
-
-### GitHub Actions Configuration
-
-This project includes a GitHub Actions workflow (`.github/workflows/benchmark-ci.yml`) that:
-
-1. **Builds the project** with both LTTng and eBPF support
-2. **Runs validation tests** to ensure tracers work correctly
-3. **Executes benchmark with 20 repetitions** for CI statistical analysis
-4. **Publishes HTML report** to GitHub Pages
-5. **Archives results** as workflow artifacts
-
-**Key features:**
-- Runs on: push to main/master, pull requests, manual trigger
-- Duration: ~8-12 minutes for 20 repetitions
-- Publishes interactive benchmark report at `https://<username>.github.io/<repo>/`
-- Stores raw results as artifacts for 30 days
-
-**Workflow snippet:**
-```yaml
-- name: Run benchmark with 20 repetitions
-  run: |
-    sudo python3 scripts/benchmark.py ./build --runs 20
-  timeout-minutes: 30
-```
-
-### Local CI Testing
-
-Test the CI configuration locally:
-
-```bash
-# Build like CI does
-./build.sh -c
-
-# Run validation like CI does
-sudo ./scripts/validate_output.sh
-
-# Run benchmark with CI settings (20 runs)
-sudo ./scripts/benchmark.py ./build --runs 20
-```
-
-### Automated Regression Testing
-
-Create a custom CI script with regression checks:
-
-```bash
-#!/bin/bash
-# ci_benchmark_with_checks.sh
-
-# Build
-./build.sh -c
-
-# Run benchmark (adjust repetitions based on CI time budget)
-sudo python3 scripts/benchmark.py ./build --runs 20
-
-# Check for regressions
-python3 << 'PYTHON'
-import json
-from pathlib import Path
-import sys
-
-# Load results
-results_dir = max(Path('.').glob('benchmark_results_*'), key=lambda p: p.stat().st_mtime)
-with open(results_dir / 'results.json') as f:
-    results = json.load(f)
-
-# Find baseline for each scenario
-baselines = {r['scenario']: r['avg_time_per_call_ns']
-             for r in results if r['method'] == 'baseline'}
-
-# Check eBPF overhead for realistic workloads
-failed = False
-for r in results:
-    if r['method'] == 'ebpf' and r['simulated_work_us'] >= 100:
-        baseline_ns = baselines[r['scenario']]
-        overhead_pct = ((r['avg_time_per_call_ns'] / baseline_ns) - 1) * 100
-
-        # Threshold: 10% for realistic workloads (≥100μs)
-        if overhead_pct > 10:
-            print(f"❌ REGRESSION: {r['scenario']} has {overhead_pct:.1f}% overhead (threshold: 10%)")
-            failed = True
-        else:
-            print(f"✅ PASS: {r['scenario']} has {overhead_pct:.1f}% overhead")
-
-if failed:
-    print("\n❌ Benchmark regression detected!")
-    sys.exit(1)
-else:
-    print("\n✅ All benchmarks passed!")
-PYTHON
-```
-
-### Export Results to CSV
-
-```python
-import csv
-from pathlib import Path
-import json
-
-# Load results
-with open('benchmark_results_*/results.json') as f:
-    results = json.load(f)
-
-# Export to CSV
-with open('benchmark_results.csv', 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-    writer.writeheader()
-    writer.writerows(results)
-```
+- Increase number of runs: `--runs 100` or `--runs 200`
 
 ---
 
 ## Performance Impact
 
 ### Benchmark Duration
-
-Time depends on number of repetitions:
 
 | Runs | Total Tests | Estimated Duration |
 |------|-------------|-------------------|
@@ -642,48 +526,111 @@ Time depends on number of repetitions:
 | **20** *(CI)* | 360 (6×3×20) | ~8-12 minutes |
 | 50 | 900 (6×3×50) | ~20-30 minutes |
 | 100 | 1,800 (6×3×100) | ~40-60 minutes |
-| 200 | 3,600 (6×3×200) | ~80-120 minutes |
 
 **Formula**: `duration_minutes ≈ num_runs × 0.4 to 0.6`
 
+**With scenario selection:**
+```bash
+# 1 scenario × 10 runs: ~40-60 seconds
+python3 scripts/benchmark.py ./build -s 5 -r 10
+
+# 3 scenarios × 5 runs: ~1-2 minutes
+python3 scripts/benchmark.py ./build -s 2 3 4 -r 5
+```
+
 ### Disk Usage
 
-**Automatic Cleanup:** The benchmark automatically deletes individual trace files immediately after extracting their data. This minimizes peak disk usage significantly.
+**Automatic Cleanup:** Trace files are deleted immediately after data extraction.
 
-**Peak disk usage during benchmark run:**
-- **LTTng**: ~150 MB (only one trace at a time)
-- **eBPF**: ~1-5 MB (only one trace at a time)
+**Peak disk usage during run:**
+- **LTTng**: ~150 MB (one trace at a time)
+- **eBPF**: ~1-5 MB (one trace at a time)
 
-**Final results directory size (all runs):**
-- **HTML report + JSON**: ~1-5 MB (regardless of number of runs)
+**Final results directory:**
+- **HTML report + JSON**: ~1-5 MB
 
-This is a dramatic improvement over the old behavior where trace files accumulated:
-
-**Old behavior (without cleanup):**
-- 10 runs: ~9 GB LTTng + ~300 MB eBPF
-- 20 runs: ~18 GB LTTng + ~600 MB eBPF
-- 50 runs: ~45 GB LTTng + ~1.5 GB eBPF
-- 100 runs: ~90 GB LTTng + ~3 GB eBPF
-
-**New behavior (with automatic cleanup):**
-- Peak: ~150 MB (during LTTng trace collection)
-- Final: ~1-5 MB (only HTML report and JSON)
-
-Clean up old benchmark results directories when done:
-
+Clean up old results:
 ```bash
-# Clean up old benchmark results
 rm -rf benchmark_results_*/
 ```
 
 ---
 
+## Integration with CI/CD
+
+### GitHub Actions Configuration
+
+See `.github/workflows/benchmark-ci.yml` for:
+- Build project with LTTng and eBPF support
+- Run validation tests
+- Execute benchmark with 20 repetitions
+- Publish HTML report to GitHub Pages
+- Archive results as artifacts
+
+**Local CI testing:**
+```bash
+./build.sh -c
+sudo ./scripts/validate_output.sh
+sudo python3 scripts/benchmark.py ./build --runs 20
+```
+
+---
+
+## Command Reference
+
+```bash
+# Full benchmark (all scenarios, 10 runs)
+python3 scripts/benchmark.py ./build
+
+# List available scenarios
+python3 scripts/benchmark.py --list-scenarios
+
+# Quick test (1 scenario, 2 runs)
+python3 scripts/benchmark.py ./build -s 5 -r 2
+
+# GPU-relevant scenarios only
+python3 scripts/benchmark.py ./build -s 2 3 4 5
+
+# CI/CD testing (20 runs)
+python3 scripts/benchmark.py ./build --runs 20
+
+# Regenerate old report
+python3 scripts/regenerate_report.py benchmark_results_<timestamp>
+
+# View help
+python3 scripts/benchmark.py --help
+```
+
+---
+
+## Files Modified (Recent Updates)
+
+1. **scripts/benchmark.py**
+   - Fixed f-string issue (line 736) - charts now render
+   - Added consistent color scheme (gray/orange/blue)
+   - Changed timing chart from stacked to grouped bars
+   - Added scenario selection support (`--scenarios`)
+   - Updated CLI with `--list-scenarios` flag
+
+2. **scripts/regenerate_report.py** (NEW)
+   - Standalone report regeneration utility
+   - Apply fixes to old results without re-running
+
+3. **docs/BENCHMARK.md** (THIS FILE)
+   - Comprehensive merged documentation
+   - Includes all recent updates and features
+
+---
+
 ## Credits
 
-This comprehensive benchmark suite was created to address the discrepancy between:
-- **Empty function stress test**: 83% overhead (worst case, unrealistic)
-- **Real-world GPU tracing**: 0.3% overhead (realistic workload)
+This comprehensive benchmark suite demonstrates that **uprobe overhead is absolute (~5 μs), not relative**, making eBPF perfect for GPU tracing! 🚀
 
-It demonstrates that **uprobe overhead is absolute (~5 μs), not relative**, making eBPF perfect for GPU tracing! 🚀
+The latest updates (2025) add:
+- ✅ Fixed chart rendering
+- ✅ Consistent color coding across all visualizations
+- ✅ Scenario selection for faster testing
+- ✅ Report regeneration tool
+- ✅ Improved documentation
 
-The statistical enhancements ensure results are trustworthy and can be used confidently for production decisions.
+All changes are **backward compatible** - existing workflows continue to work!
