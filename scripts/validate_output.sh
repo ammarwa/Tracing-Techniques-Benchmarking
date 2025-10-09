@@ -58,6 +58,8 @@ LTTNG_SESSION="validation_test_$$"
 LTTNG_TRACE_DIR="/tmp/lttng_validation_$$"
 EBPF_TRACE_FILE="/tmp/ebpf_validation_$$.txt"
 
+export EBPF_TRACE_WRITE_FILE=1
+
 print_header "eBPF vs LTTng Output Validation"
 echo "Testing with $NUM_ITERATIONS iterations"
 echo ""
