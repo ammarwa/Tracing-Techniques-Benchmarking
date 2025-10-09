@@ -539,8 +539,11 @@ class BenchmarkSuite:
         js_ebpf_overhead_pct = json.dumps([d.get('ebpf_overhead_pct', 0) for d in overhead_data])
         js_scenario_names = json.dumps([d['scenario'] for d in overhead_data])
         js_baseline_ns = json.dumps([d['baseline_ns'] for d in overhead_data])
-        js_lttng_overhead_ns = json.dumps([d.get('lttng_overhead_ns', 0) for d in overhead_data])
-        js_ebpf_overhead_ns = json.dumps([d.get('ebpf_overhead_ns', 0) for d in overhead_data])
+
+        # For absolute timing chart: show TOTAL time for each method (not just overhead)
+        js_lttng_total_ns = json.dumps([d['baseline_ns'] + d.get('lttng_overhead_ns', 0) for d in overhead_data])
+        js_ebpf_total_ns = json.dumps([d['baseline_ns'] + d.get('ebpf_overhead_ns', 0) for d in overhead_data])
+
         js_memory_baseline = json.dumps([scenarios_data[d['scenario']]['baseline'].max_rss_kb for d in overhead_data if 'baseline' in scenarios_data[d['scenario']]])
         js_memory_lttng = json.dumps([scenarios_data[d['scenario']]['lttng'].max_rss_kb if 'lttng' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
         js_memory_ebpf = json.dumps([scenarios_data[d['scenario']]['ebpf'].max_rss_kb if 'ebpf' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
@@ -811,8 +814,8 @@ class BenchmarkSuite:
 
         const scenario_names = {js_scenario_names};
         const baseline_ns_data = {js_baseline_ns};
-        const lttng_overhead_ns = {js_lttng_overhead_ns};
-        const ebpf_overhead_ns = {js_ebpf_overhead_ns};
+        const lttng_total_ns = {js_lttng_total_ns};
+        const ebpf_total_ns = {js_ebpf_total_ns};
 
         const memory_baseline = {js_memory_baseline};
         const memory_lttng = {js_memory_lttng};
@@ -863,7 +866,7 @@ class BenchmarkSuite:
 
         Plotly.newPlot('overhead-chart', overheadData, overheadLayout);
 
-        // Absolute timing chart - grouped bars (not stacked)
+        // Absolute timing chart - grouped bars showing total time per method
         const timingData = [
             {{
                 x: scenario_names,
@@ -874,15 +877,15 @@ class BenchmarkSuite:
             }},
             {{
                 x: scenario_names,
-                y: lttng_overhead_ns,
-                name: 'LTTng Overhead',
+                y: lttng_total_ns,
+                name: 'LTTng',
                 type: 'bar',
                 marker: {{ color: colors.lttng }}
             }},
             {{
                 x: scenario_names,
-                y: ebpf_overhead_ns,
-                name: 'eBPF Overhead',
+                y: ebpf_total_ns,
+                name: 'eBPF',
                 type: 'bar',
                 marker: {{ color: colors.ebpf }}
             }}
