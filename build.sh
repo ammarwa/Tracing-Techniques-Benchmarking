@@ -257,7 +257,7 @@ if [ -f "$BUILD_DIR/bin/mylib_tracer" ]; then
 fi
 
 echo "Run complete benchmark:"
-echo "  python3 ./scripts/benchmark.py"
+echo "  python3 ./scripts/benchmark.py ./build"
 echo ""
 
 print_header "Build Complete!"
