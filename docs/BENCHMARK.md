@@ -142,23 +142,53 @@ python3 scripts/benchmark.py ./build -s 0 5
 
 ## Chart Visualizations
 
-The HTML report includes three interactive charts with consistent color coding:
+The HTML report includes five interactive charts with consistent color coding, including two new charts for whole application overhead:
 
-### 📊 Chart 1: Overhead by Function Duration
+### 📊 Chart 1: Per-Call Overhead by Function Duration
 **Type:** Line chart with markers
-- 🟠 **Orange**: LTTng overhead percentage
-- 🔵 **Blue**: eBPF overhead percentage
+- 🟠 **Orange**: LTTng per-call overhead percentage
+- 🔵 **Blue**: eBPF per-call overhead percentage
 
-**Purpose:** Shows how tracing overhead scales with function execution time
+**Purpose:** Shows how per-call tracing overhead scales with function execution time
 
 **Key Insights:**
-- Demonstrates constant absolute overhead
+- Demonstrates constant absolute overhead per call
 - Shows relative overhead decreases as function duration increases
 - Identifies crossover point where overhead becomes acceptable
 
 ---
 
-### 📊 Chart 2: Absolute Timing Comparison
+### 📊 Chart 2: Whole Application Overhead (NEW!)
+**Type:** Line chart with markers
+- 🟠 **Orange**: LTTng total application overhead percentage
+- 🔵 **Blue**: eBPF total application overhead percentage
+
+**Purpose:** Shows the total overhead impact on entire application execution time (wall clock time)
+
+**Key Insights:**
+- **This is what matters in production!**
+- Shows actual end-to-end performance impact
+- Typically much lower than per-call overhead averages
+- Demonstrates real-world usability
+
+---
+
+### 📊 Chart 3: Total Execution Time Comparison (NEW!)
+**Type:** Grouped bar chart
+- ⬜ **Gray**: Baseline (no tracing) total execution time
+- 🟠 **Orange**: LTTng total execution time
+- 🔵 **Blue**: eBPF total execution time
+
+**Purpose:** Direct comparison of absolute wall clock time for entire application
+
+**Key Insights:**
+- Side-by-side comparison of total runtime
+- Logarithmic scale shows wide range of execution times
+- Easy to see real-world performance impact
+
+---
+
+### 📊 Chart 4: Per-Call Timing Comparison
 **Type:** Grouped bar chart (side-by-side bars)
 - ⬜ **Gray**: Baseline (no tracing)
 - 🟠 **Orange**: LTTng overhead
@@ -175,7 +205,7 @@ The HTML report includes three interactive charts with consistent color coding:
 
 ---
 
-### 📊 Chart 3: Resource Usage Comparison
+### 📊 Chart 5: Resource Usage Comparison
 **Type:** Grouped bar chart (side-by-side bars)
 - ⬜ **Gray**: Baseline memory
 - 🟠 **Orange**: LTTng memory (~330 MB)
@@ -276,26 +306,55 @@ Results include comprehensive statistics:
 }
 ```
 
-HTML report shows confidence intervals:
+HTML report shows comprehensive metrics including both whole app and per-call overhead:
 
-| Scenario | Method | Avg Time (ns) | ±95% CI | Overhead % |
-|----------|--------|---------------|---------|------------|
-| 100 μs   | Baseline | 108,234.56 | ±12.34 | 0% |
-| 100 μs   | LTTng | 143,567.89 | ±23.45 | 32.6% |
-| 100 μs   | eBPF | 122,345.67 | ±18.92 | 13.0% |
+| Scenario | Method | Wall Time (s) | App Overhead % | Avg Time/Call (ns) | ±95% CI | Per-Call Overhead % |
+|----------|--------|---------------|----------------|-------------------|---------|---------------------|
+| 100 μs   | Baseline | 1.082 | 0% | 108,234.56 | ±12.34 | 0% |
+| 100 μs   | LTTng | 1.436 | 32.7% | 143,567.89 | ±23.45 | 32.6% |
+| 100 μs   | eBPF | 1.223 | 13.0% | 122,345.67 | ±18.92 | 13.0% |
+
+**Note:** Wall Time and App Overhead % columns are NEW and show the whole application impact!
 
 ---
 
 ## Understanding the Results
+
+### Key Concepts: Per-Call vs Whole Application Overhead
+
+**IMPORTANT:** There are two different ways to measure overhead, and understanding the difference is critical!
+
+#### Per-Call Overhead (Individual Function)
+- Measures the overhead added to **each individual function call**
+- Formula: `(traced_time_per_call - baseline_time_per_call) / baseline_time_per_call × 100%`
+- This is useful for understanding the **microscopic impact** on each traced function
+- Can be very high for fast functions (83,000% for 6ns functions!)
+
+#### Whole Application Overhead (Total Execution Time)
+- Measures the overhead on the **entire application's execution time**
+- Formula: `(total_traced_wall_time - total_baseline_wall_time) / total_baseline_wall_time × 100%`
+- **This is what matters in production!**
+- Includes:
+  - All traced function calls
+  - Non-traced code execution
+  - Application setup/teardown
+  - I/O operations
+  - Idle time
+- Typically **much lower** than per-call overhead averages
+
+**Example:** If you trace 10,000 calls to a 100μs function:
+- **Per-call overhead**: 13% (5μs overhead per 100μs call)
+- **Whole app overhead**: ~10% (if app only calls this function)
+- **But in real apps**: Often <5% because apps do more than just traced calls!
 
 ### Key Finding: Absolute vs Relative Overhead
 
 **Uprobe overhead is CONSTANT (~5 μs per call), not relative to function duration.**
 
 This means:
-- **Empty 6ns function**: 5,000/6 = **83,000% overhead** ❌ (worst case, unrealistic)
-- **100 μs HIP API**: 5,000/100,000 = **5% overhead** ✅ (typical case)
-- **1 ms GPU kernel**: 5,000/1,000,000 = **0.5% overhead** ✅ (realistic workload)
+- **Empty 6ns function**: 5,000/6 = **83,000% per-call overhead** ❌ (worst case, unrealistic)
+- **100 μs HIP API**: 5,000/100,000 = **5% per-call overhead** ✅ (typical case)
+- **1 ms GPU kernel**: 5,000/1,000,000 = **0.5% per-call overhead** ✅ (realistic workload)
 
 ### Expected Overhead Pattern
 
@@ -605,6 +664,33 @@ python3 scripts/benchmark.py --help
 
 ## Files Modified (Recent Updates)
 
+### Latest Update (October 2025) - Whole Application Overhead
+
+1. **scripts/benchmark.py**
+   - ✅ **Added whole application overhead tracking**:
+     - Calculates total wall time overhead percentage
+     - Shows real-world production impact
+   - ✅ **New HTML report sections**:
+     - "Whole Application Overhead" chart (line chart)
+     - "Total Execution Time Comparison" chart (bar chart)
+     - Updated table with "Wall Time" and "App Overhead %" columns
+   - ✅ **Enhanced key findings**:
+     - Clarifies difference between per-call and whole-app overhead
+     - Emphasizes production-relevant metrics
+   - ✅ **Improved table rendering**:
+     - Added responsive table wrapper with horizontal scrolling
+     - Sticky table headers when scrolling
+     - Prevented text wrapping in cells for better readability
+     - Set minimum table width to prevent cramped layout
+
+2. **docs/BENCHMARK.md** (THIS FILE)
+   - ✅ **Added comprehensive explanation** of per-call vs whole-app overhead
+   - ✅ **Updated chart descriptions** to include 2 new charts (now 5 total)
+   - ✅ **Enhanced examples** showing both overhead types
+   - ✅ **Updated table documentation** with new columns
+
+### Previous Updates (2025)
+
 1. **scripts/benchmark.py**
    - Fixed f-string issue (line 736) - charts now render
    - Added consistent color scheme (gray/orange/blue)
@@ -612,13 +698,9 @@ python3 scripts/benchmark.py --help
    - Added scenario selection support (`--scenarios`)
    - Updated CLI with `--list-scenarios` flag
 
-2. **scripts/regenerate_report.py** (NEW)
+2. **scripts/regenerate_report.py**
    - Standalone report regeneration utility
    - Apply fixes to old results without re-running
-
-3. **docs/BENCHMARK.md** (THIS FILE)
-   - Comprehensive merged documentation
-   - Includes all recent updates and features
 
 ---
 

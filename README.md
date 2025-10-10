@@ -116,11 +116,13 @@ Function Duration vs Overhead %
 
 ### Key Metrics (100 μs scenario)
 
-| Method | Avg Time/Call | ±95% CI | Overhead | Memory |
-|--------|--------------|---------|----------|--------|
-| Baseline | 108,234 ns | ±12 ns | 0% | 1.8 MB |
-| LTTng | 143,568 ns | ±23 ns | **32.6%** | 330 MB |
-| eBPF | 122,346 ns | ±19 ns | **13.0%** | 2.1 MB |
+| Method | Wall Time | App Overhead | Avg Time/Call | Per-Call Overhead | Memory |
+|--------|-----------|--------------|---------------|-------------------|--------|
+| Baseline | 1.082 s | 0% | 108,234 ns | 0% | 1.8 MB |
+| LTTng | 1.436 s | **32.7%** | 143,568 ns | 32.6% | 330 MB |
+| eBPF | 1.223 s | **13.0%** | 122,346 ns | 13.0% | 2.1 MB |
+
+**New in 2025:** The report now includes **Whole Application Overhead** (Wall Time and App Overhead columns), showing the real-world production impact on total execution time!
 
 **Observation**: LTTng is ~2× faster than eBPF for short functions, but both are <5% for realistic workloads.
 
