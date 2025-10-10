@@ -275,9 +275,11 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    // Process events
+    // Process events - CRITICAL: Use short timeout for low-latency benchmarks
+    // With BPF_RB_FORCE_WAKEUP, events wake us immediately, but we still need
+    // a short timeout to check for termination signal frequently
     while (!exiting) {
-        err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+        err = ring_buffer__poll(rb, 1 /* timeout, ms - reduced from 100ms for low latency */);
         if (err == -EINTR) {
             err = 0;
             break;

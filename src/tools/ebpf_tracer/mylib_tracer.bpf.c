@@ -49,6 +49,18 @@ struct pt_regs {
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #endif
 
+// Ring buffer flags - CRITICAL for low-latency tracing
+// BPF_RB_FORCE_WAKEUP ensures immediate wakeup of userspace consumer
+// Without this, events can sit in the ring buffer for up to the poll timeout (was 100ms!)
+// This was causing ~40x worse performance than expected in benchmarks
+#ifndef BPF_RB_NO_WAKEUP
+#define BPF_RB_NO_WAKEUP (1ULL << 0)
+#endif
+
+#ifndef BPF_RB_FORCE_WAKEUP
+#define BPF_RB_FORCE_WAKEUP (1ULL << 1)
+#endif
+
 #define MAX_STRING_LEN 64
 
 // Optimized: Smaller event structures to reduce memory allocation overhead
@@ -130,8 +142,8 @@ int my_traced_function_entry(struct pt_regs *ctx) {
     event->arg3 = 0.0;  // Placeholder - will be populated properly later
     event->arg4 = PT_REGS_PARM4(ctx);
 
-    // Submit with BPF_RB_FORCE_WAKEUP for lower latency (optional)
-    bpf_ringbuf_submit(event, 0);
+    // Submit with BPF_RB_FORCE_WAKEUP for immediate wakeup (critical for low-latency benchmarks)
+    bpf_ringbuf_submit(event, BPF_RB_FORCE_WAKEUP);
     update_stat_events_sent();  // STATS: Track successful events
     return 0;
 }
@@ -151,7 +163,8 @@ int my_traced_function_exit(struct pt_regs *ctx) {
     event->timestamp = bpf_ktime_get_ns();
     event->event_type = 1;
 
-    bpf_ringbuf_submit(event, 0);
+    // Submit with BPF_RB_FORCE_WAKEUP for immediate wakeup (critical for low-latency benchmarks)
+    bpf_ringbuf_submit(event, BPF_RB_FORCE_WAKEUP);
     update_stat_events_sent();  // STATS: Track successful events
     return 0;
 }
