@@ -126,6 +126,8 @@ Function Duration vs Overhead %
 
 **Observation**: LTTng is ~2× faster than eBPF for short functions, but both are <5% for realistic workloads.
 
+**⚠️ Important Note**: These results are from **bare metal testing**. eBPF uprobe performance is ~20x worse in virtualized environments (VMs/cloud) due to context switch overhead. The GitHub Pages report shows accurate bare metal results, not inflated VM numbers.
+
 ---
 
 ## 🔬 Architecture

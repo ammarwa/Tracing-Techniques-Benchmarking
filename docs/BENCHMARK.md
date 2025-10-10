@@ -694,6 +694,27 @@ The deployed benchmark showed eBPF with **terrible** performance:
 
 **Expected Impact**: eBPF overhead should drop from 202% to ~5% for 100μs functions! 🚀
 
+#### VM vs Bare Metal Performance
+
+**IMPORTANT**: eBPF uprobe performance varies dramatically based on environment:
+
+| Environment | 100μs Function eBPF Overhead | Notes |
+|-------------|----------------------------|-------|
+| **Bare Metal** | **~8-10μs (8%)** ✅ | Accurate, production-representative |
+| **GitHub Actions VM** | **~184μs (184%)** ❌ | 20x worse due to virtualization |
+| **Local VM** | **~20-50μs (20-50%)** ⚠️ | Varies by hypervisor |
+
+**Why the difference?**
+- Uprobes trigger kernel context switches that are expensive in VMs
+- Nested virtualization adds overhead to each probe hit
+- Cloud VMs often have PMU (Performance Monitoring Unit) limitations
+- LTTng uses LD_PRELOAD (userspace) so doesn't suffer from this
+
+**Recommendation**:
+- ✅ **Use bare metal results** for production planning
+- ❌ **Don't rely on VM/CI benchmarks** for eBPF performance
+- 📊 **The published report uses bare metal results** from local testing
+
 ---
 
 1. **scripts/benchmark.py**

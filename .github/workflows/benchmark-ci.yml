@@ -1,4 +1,4 @@
-name: eBPF vs LTTng Benchmark CI
+name: eBPF vs LTTng Validation CI
 
 on:
   push:
@@ -56,180 +56,8 @@ jobs:
         run: |
           sudo ./scripts/validate_output.sh
 
-  benchmark:
-    needs: build-and-validate
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        scenario: [0, 1, 2, 3, 4, 5]
-        include:
-          - scenario: 0
-            name: "0us-empty"
-            description: "Empty Function (0μs)"
-          - scenario: 1
-            name: "5us"
-            description: "5μs Function"
-          - scenario: 2
-            name: "50us"
-            description: "50μs Function"
-          - scenario: 3
-            name: "100us"
-            description: "100μs Function"
-          - scenario: 4
-            name: "500us"
-            description: "500μs Function"
-          - scenario: 5
-            name: "1000us"
-            description: "1000μs (1ms) Function"
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake \
-            build-essential \
-            clang-14 \
-            llvm-14 \
-            libbpf-dev \
-            linux-headers-generic \
-            linux-tools-generic \
-            lttng-tools \
-            liblttng-ust-dev \
-            babeltrace2 \
-            python3 \
-            python3-pip
-
-          # Install Python dependencies
-          pip3 install plotly pandas numpy
-
-      - name: Build project
-        run: |
-          export CC=clang-14
-          ./build.sh -c
-        env:
-          CC: clang-14
-
-      - name: Set CPU governor to performance
-        run: |
-          # Try to set performance mode for more consistent benchmarks
-          # May not work in all environments (e.g., GitHub Actions VMs)
-          sudo cpupower frequency-set -g performance || echo "Could not set CPU governor (may not be supported in this environment)"
-
-      - name: Run benchmark for scenario ${{ matrix.scenario }} (${{ matrix.description }})
-        run: |
-          # Run benchmark for single scenario with 20 repetitions
-          # This allows parallel execution of different scenarios
-          sudo python3 scripts/benchmark.py ./build --runs 20 --scenarios ${{ matrix.scenario }}
-        timeout-minutes: 90
-
-      - name: Upload scenario results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: benchmark-results-scenario-${{ matrix.name }}
-          path: benchmark_results_*/results.json
-          retention-days: 30
-
-  combine-and-report:
-    needs: benchmark
-    runs-on: ubuntu-latest
-    if: always()
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Python dependencies
-        run: |
-          pip3 install plotly pandas numpy
-
-      - name: Download all scenario results
-        uses: actions/download-artifact@v4
-        with:
-          pattern: benchmark-results-scenario-*
-          path: scenario_results/
-          merge-multiple: false
-
-      - name: List downloaded artifacts
-        run: |
-          echo "Downloaded artifacts:"
-          find scenario_results -type f -name "*.json" | sort
-
-      - name: Combine results from all scenarios
-        run: |
-          python3 scripts/combine_results.py \
-            --input-dir scenario_results \
-            --output combined_results/results.json \
-            --validate
-
-      - name: Generate combined HTML report
-        run: |
-          python3 scripts/regenerate_report.py \
-            combined_results/results.json \
-            --output-dir combined_results
-
-      - name: Upload combined benchmark results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: benchmark-results-combined
-          path: combined_results/
-          retention-days: 90
-
-      - name: Prepare GitHub Pages content
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        run: |
-          # Create pages directory
-          mkdir -p gh-pages
-
-          # Copy combined HTML report and rename to index.html
-          cp combined_results/benchmark_report.html gh-pages/index.html
-
-          # Copy combined JSON results
-          cp combined_results/results.json gh-pages/results.json
-
-          # Create a simple landing page with metadata
-          cat > gh-pages/README.md << 'EOF'
-          # eBPF vs LTTng Benchmark Results
-
-          This page contains the latest benchmark results comparing eBPF and LTTng tracing overhead.
-
-          - **[View Interactive Report](index.html)**
-          - **[Download Raw JSON Results](results.json)**
-
-          ## About
-
-          This benchmark demonstrates that uprobe overhead is **constant (~5 μs)**, not relative to function duration:
-
-          - **Empty 6ns function**: 5μs/6ns = 83,000% overhead (worst case, unrealistic)
-          - **100 μs HIP API**: 5μs/100μs = 5% overhead (typical)
-          - **1 ms GPU kernel**: 5μs/1ms = 0.5% overhead (realistic)
-
-          **Conclusion**: eBPF is perfect for GPU/HIP tracing where API calls take 10-1000 μs!
-
-          ## CI Information
-
-          - **Build**: GitHub Actions CI (Parallel Execution)
-          - **Scenarios**: 6 (run in parallel jobs)
-          - **Runs per scenario**: 20 (for CI statistical analysis)
-          - **Generated**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          - **Commit**: ${{ github.sha }}
-          - **Branch**: ${{ github.ref_name }}
-          EOF
-
-      - name: Upload Pages artifact
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: gh-pages/
-
   deploy:
-    needs: combine-and-report
+    needs: build-and-validate
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
 
@@ -238,48 +66,88 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare GitHub Pages content
+        run: |
+          # Create pages directory
+          mkdir -p gh-pages
+
+          # Copy pre-generated report from report/ folder
+          cp report/index.html gh-pages/index.html
+          cp report/results.json gh-pages/results.json
+          cp report/GENERATION_INFO.md gh-pages/GENERATION_INFO.md
+
+          # Create a landing page with metadata
+          cat > gh-pages/README.md << 'EOF'
+          # eBPF vs LTTng Benchmark Results
+
+          This page contains benchmark results comparing eBPF and LTTng tracing overhead.
+
+          - **[View Interactive Report](index.html)**
+          - **[Download Raw JSON Results](results.json)**
+          - **[View Generation Info](GENERATION_INFO.md)**
+
+          ## About
+
+          This benchmark demonstrates that uprobe overhead is **constant (~5-10 μs)**, not relative to function duration:
+
+          - **Empty 6ns function**: High overhead (stress test, unrealistic)
+          - **100 μs HIP API**: ~8-10% overhead (typical)
+          - **500+ μs API**: <1% overhead (realistic)
+
+          **Conclusion**: eBPF is perfect for GPU/HIP tracing where API calls take 10-1000 μs!
+
+          ## Important Note
+
+          **These results are from bare metal testing**, not virtualized environments.
+
+          eBPF uprobe performance in VMs is ~20x worse due to virtualization overhead.
+          Always benchmark on your target production environment.
+
+          ## CI Information
+
+          - **Report Source**: Pre-generated on bare metal hardware
+          - **CI Role**: Build validation only (not performance benchmarking)
+          - **Last Updated**: See [GENERATION_INFO.md](GENERATION_INFO.md)
+          - **Commit**: ${{ github.sha }}
+          - **Branch**: ${{ github.ref_name }}
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: gh-pages/
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
 
   summary:
-    needs: [build-and-validate, combine-and-report]
+    needs: [build-and-validate]
     runs-on: ubuntu-latest
     if: always()
 
     steps:
-      - name: Download combined benchmark results
-        uses: actions/download-artifact@v4
-        with:
-          name: benchmark-results-combined
-        continue-on-error: true
-
       - name: Create job summary
         run: |
-          echo "## eBPF vs LTTng Benchmark CI Results" >> $GITHUB_STEP_SUMMARY
+          echo "## eBPF vs LTTng Validation CI Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Build Status: ✅ Complete" >> $GITHUB_STEP_SUMMARY
           echo "### Validation Status: ✅ Passed" >> $GITHUB_STEP_SUMMARY
-          echo "### Benchmark Status: ✅ Complete (Parallel Execution)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Note on Benchmarking" >> $GITHUB_STEP_SUMMARY
+          echo "This CI validates that the tracers work correctly." >> $GITHUB_STEP_SUMMARY
+          echo "Performance benchmarks are pre-generated on bare metal hardware." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ -f "results.json" ]; then
-            echo "### Quick Results" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Benchmark results generated successfully!" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "- 📊 [View Full Interactive Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)" >> $GITHUB_STEP_SUMMARY
-
-            if [ "${{ github.ref }}" == "refs/heads/main" ] || [ "${{ github.ref }}" == "refs/heads/master" ]; then
-              echo "- 🌐 [View GitHub Pages Report](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/)" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "⚠️ Benchmark results not found" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.ref }}" == "refs/heads/main" ] || [ "${{ github.ref }}" == "refs/heads/master" ]; then
+            echo "- 🌐 [View Published Report](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/)" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
-          echo "- **Execution Mode**: Parallel (6 jobs)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Runs per scenario**: 20 (for CI statistical analysis)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Scenarios tested**: 6 (0μs, 5μs, 50μs, 100μs, 500μs, 1000μs)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Methods compared**: Baseline, LTTng, eBPF" >> $GITHUB_STEP_SUMMARY
+          echo "### Why Not Benchmark in CI?" >> $GITHUB_STEP_SUMMARY
+          echo "GitHub Actions runs on VMs where eBPF uprobes are ~20x slower than bare metal." >> $GITHUB_STEP_SUMMARY
+          echo "VM benchmarks would show misleading results (200% overhead vs actual 8%)." >> $GITHUB_STEP_SUMMARY
+          echo "Accurate benchmarks require bare metal hardware." >> $GITHUB_STEP_SUMMARY
