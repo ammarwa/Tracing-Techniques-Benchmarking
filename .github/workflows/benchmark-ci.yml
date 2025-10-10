@@ -97,13 +97,13 @@ jobs:
           # May not work in all environments (e.g., GitHub Actions VMs)
           sudo cpupower frequency-set -g performance || echo "Could not set CPU governor (may not be supported in this environment)"
 
-      - name: Run benchmark with 50 repetitions
+      - name: Run benchmark with 20 repetitions
         run: |
-          # Run benchmark with 50 repetitions for CI statistical analysis
+          # Run benchmark with 20 repetitions for CI statistical analysis
           # Default: 10 runs per scenario (~4-6 minutes)
-          # CI: 50 runs per scenario (~8-12 minutes) for reasonable statistics
-          sudo python3 scripts/benchmark.py ./build --runs 50
-        timeout-minutes: 30
+          # CI: 20 runs per scenario (~8-12 minutes) for reasonable statistics
+          sudo python3 scripts/benchmark.py ./build --runs 20
+        timeout-minutes: 60
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -150,7 +150,7 @@ jobs:
           ## CI Information
 
           - **Build**: GitHub Actions CI
-          - **Runs per scenario**: 50 (for CI statistical analysis)
+          - **Runs per scenario**: 20 (for CI statistical analysis)
           - **Generated**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           - **Commit**: ${{ github.sha }}
           - **Branch**: ${{ github.ref_name }}
@@ -213,6 +213,6 @@ jobs:
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Configuration" >> $GITHUB_STEP_SUMMARY
-          echo "- **Runs per scenario**: 50 (for CI statistical analysis)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runs per scenario**: 20 (for CI statistical analysis)" >> $GITHUB_STEP_SUMMARY
           echo "- **Scenarios tested**: 6 (0μs, 5μs, 50μs, 100μs, 500μs, 1000μs)" >> $GITHUB_STEP_SUMMARY
           echo "- **Methods compared**: Baseline, LTTng, eBPF" >> $GITHUB_STEP_SUMMARY
