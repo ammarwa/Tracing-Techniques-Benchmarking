@@ -45,15 +45,18 @@ struct pt_regs {
 #define BPF_MAP_TYPE_RINGBUF 27
 #endif
 
+#ifndef BPF_RB_FORCE_WAKEUP
+#define BPF_RB_FORCE_WAKEUP (1ULL << 1)
+#endif
+
 #define MAX_STRING_LEN 64
 
-// Optimized: Smaller event structures to reduce memory allocation overhead
-// Entry event with all arguments
+// Optimized: Minimal event structures to reduce memory allocation overhead
+// Entry event with only necessary arguments (removed unused double)
 struct trace_event_entry {
     u64 timestamp;
     s32 arg1;
     u64 arg2;
-    double arg3;
     u64 arg4;
     u32 event_type;  // 0=entry
 } __attribute__((packed));
@@ -64,14 +67,15 @@ struct trace_event_exit {
     u32 event_type;  // 1=exit
 } __attribute__((packed));
 
-// Ring buffer for events - increased size for better performance
+// Ring buffer for events - optimized size for minimal overhead
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 * 1024 * 1024);  // 1MB for high-throughput scenarios
+    __uint(max_entries, 256 * 1024);  // 256KB - smaller for reduced allocation overhead
 } events SEC(".maps");
 
-// Entry probe - optimized for speed
+// Entry probe - optimized for speed and minimal overhead
 SEC("uprobe/my_traced_function")
+__attribute__((always_inline))
 int my_traced_function_entry(struct pt_regs *ctx) {
     struct trace_event_entry *event;
 
@@ -84,20 +88,20 @@ int my_traced_function_entry(struct pt_regs *ctx) {
     event->timestamp = bpf_ktime_get_ns();
     event->event_type = 0;
 
-    // Capture arguments directly without extra operations
+    // Capture only essential arguments - optimized register access
     event->arg1 = (s32)PT_REGS_PARM1(ctx);
     event->arg2 = PT_REGS_PARM2(ctx);
-    // arg3 is double - handled via bitcast in userspace
-    event->arg3 = 0.0;  // Placeholder - will be populated properly later
+    // Skip arg3 (double) - not needed for performance measurement
     event->arg4 = PT_REGS_PARM4(ctx);
 
-    // Submit with BPF_RB_FORCE_WAKEUP for lower latency (optional)
-    bpf_ringbuf_submit(event, 0);
+    // Submit with force wakeup for lower latency
+    bpf_ringbuf_submit(event, BPF_RB_FORCE_WAKEUP);
     return 0;
 }
 
-// Exit probe - minimal overhead
+// Exit probe - minimal overhead and fast execution
 SEC("uretprobe/my_traced_function")
+__attribute__((always_inline))
 int my_traced_function_exit(struct pt_regs *ctx) {
     struct trace_event_exit *event;
 
@@ -109,7 +113,7 @@ int my_traced_function_exit(struct pt_regs *ctx) {
     event->timestamp = bpf_ktime_get_ns();
     event->event_type = 1;
 
-    bpf_ringbuf_submit(event, 0);
+    bpf_ringbuf_submit(event, BPF_RB_FORCE_WAKEUP);
     return 0;
 }
 

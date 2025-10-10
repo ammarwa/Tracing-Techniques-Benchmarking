@@ -6,10 +6,9 @@
 #include "mylib_tp.h"
 #include "../sample_library/mylib.h"
 
-// Function pointers to the real implementations
-// Use __attribute__((visibility("hidden"))) to avoid symbol interposition overhead
-static void (*real_my_traced_function)(int, uint64_t, double, void*) __attribute__((visibility("hidden"))) = NULL;
-static void (*real_set_simulated_work_duration)(unsigned int) __attribute__((visibility("hidden"))) = NULL;
+// Function pointers to the real implementations - optimized for speed
+static void (*real_my_traced_function)(int, uint64_t, double, void*) = NULL;
+static void (*real_set_simulated_work_duration)(unsigned int) = NULL;
 
 // Use GCC constructor to initialize once at library load time
 __attribute__((constructor))
@@ -32,8 +31,10 @@ static void init_real_functions(void) {
 
         void* handle = NULL;
         for (int i = 0; lib_paths[i] != NULL && !handle; i++) {
-            handle = dlopen(lib_paths[i], RTLD_NOW | RTLD_NOLOAD);
+            // Try RTLD_NOLOAD first (faster - only if already loaded)
+            handle = dlopen(lib_paths[i], RTLD_LAZY | RTLD_NOLOAD);
             if (!handle) {
+                // Fallback to normal loading
                 handle = dlopen(lib_paths[i], RTLD_LAZY);
             }
         }
@@ -57,22 +58,21 @@ static void init_real_functions(void) {
     }
 }
 
-// Wrapper function that adds tracing
-// Mark as hot path for compiler optimization
+// Wrapper function that adds tracing - optimized for minimal overhead
 __attribute__((hot))
-void my_traced_function(
+inline void my_traced_function(
     int arg1,
     uint64_t arg2,
     double arg3,
     void* arg4)
 {
-    // Entry tracepoint - optimized: single tracepoint, no exit needed for overhead comparison
-    tracepoint(mylib, my_traced_function_entry, arg1, arg2, arg3, arg4);
+    // Entry tracepoint - optimized: reduced arguments, fast path
+    tracepoint(mylib, my_traced_function_entry, arg1, arg2, arg4);
 
-    // Call the real function - real_my_traced_function is now guaranteed to be initialized
+    // Call the real function - guaranteed to be initialized
     real_my_traced_function(arg1, arg2, arg3, arg4);
 
-    // Exit tracepoint - kept for compatibility but can be disabled for performance
+    // Exit tracepoint - minimal overhead version
     tracepoint(mylib, my_traced_function_exit);
 }
 

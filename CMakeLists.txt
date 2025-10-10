@@ -98,7 +98,7 @@ if(BUILD_LTTNG)
             dl
         )
 
-        target_compile_options(mylib_lttng PRIVATE -O2 -fPIC)
+        target_compile_options(mylib_lttng PRIVATE -O3 -fPIC -ffast-math -march=native)
 
         message("${Green}  ✓ libmylib_lttng.so${ColorReset}")
     else()
@@ -201,7 +201,7 @@ if(BUILD_EBPF)
             ${ZLIB_LIBRARY}
         )
 
-        target_compile_options(mylib_tracer PRIVATE -O2)
+        target_compile_options(mylib_tracer PRIVATE -O3 -ffast-math -march=native)
 
         message("${Green}  ✓ mylib_tracer.bpf.o${ColorReset}")
         message("${Green}  ✓ mylib_tracer.skel.h${ColorReset}")

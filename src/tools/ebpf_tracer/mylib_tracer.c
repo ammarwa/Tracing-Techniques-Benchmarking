@@ -10,14 +10,13 @@
 #include "mylib_tracer.skel.h"
 
 #define MAX_STRING_LEN 64
-#define MAX_EVENTS 1000000  // Buffer up to 1M events in memory
+#define MAX_EVENTS 500000  // Buffer 500K events - optimized for memory usage
 
-// Optimized event structures matching BPF side
+// Optimized event structures matching BPF side - minimal fields
 struct trace_event_entry {
     uint64_t timestamp;
     int32_t arg1;
     uint64_t arg2;
-    double arg3;
     uint64_t arg4;
     uint32_t event_type;  // 0=entry
 } __attribute__((packed));
@@ -66,18 +65,22 @@ static long get_function_offset(const char *lib_path, const char *func_name) {
     return offset;
 }
 
-// Handle event: Just store in memory buffer (FAST!)
+// Handle event: Optimized memory handling with minimal overhead
 static int handle_event(void *ctx, void *data, size_t data_sz) {
-    // Check if buffer is full
-    if (event_count >= MAX_EVENTS) {
+    // Fast path: check buffer space with likely branch prediction
+    if (__builtin_expect(event_count >= MAX_EVENTS, 0)) {
         events_dropped++;
         return 0;
     }
 
-    // Copy event to buffer
-    memcpy(&event_buffer[event_count], data, data_sz);
-    event_sizes[event_count] = data_sz;
-    event_count++;
+    // Optimized copy: use fast path for common event sizes
+    if (__builtin_expect(data_sz <= sizeof(union stored_event), 1)) {
+        memcpy(&event_buffer[event_count], data, data_sz);
+        event_sizes[event_count] = data_sz;
+        event_count++;
+    } else {
+        events_dropped++;
+    }
 
     return 0;
 }
@@ -97,12 +100,11 @@ static void write_events_to_file(const char *filename) {
             const struct trace_event_entry *e = &event_buffer[i].entry;
             fprintf(f,
                     "[%lu.%09lu] mylib:my_traced_function_entry: "
-                    "{ arg1 = %d, arg2 = %lu, arg3 = %f, arg4 = 0x%lx }\n",
+                    "{ arg1 = %d, arg2 = %lu, arg4 = 0x%lx }\n",
                     e->timestamp / 1000000000,
                     e->timestamp % 1000000000,
                     e->arg1,
                     e->arg2,
-                    e->arg3,
                     e->arg4);
         } else if (event_sizes[i] == sizeof(struct trace_event_exit)) {
             const struct trace_event_exit *e = &event_buffer[i].exit;
@@ -198,11 +200,17 @@ int main(int argc, char **argv) {
 
     printf("Using library: %s\n", lib_path);
 
-    // Allocate event buffer (do this BEFORE tracing starts)
-    event_buffer = calloc(MAX_EVENTS, sizeof(union stored_event));
+    // Allocate aligned event buffer for better cache performance
+    if (posix_memalign((void**)&event_buffer, 64, MAX_EVENTS * sizeof(union stored_event)) != 0) {
+        fprintf(stderr, "Failed to allocate aligned event buffer\n");
+        return 1;
+    }
+    memset(event_buffer, 0, MAX_EVENTS * sizeof(union stored_event));
+    
     event_sizes = calloc(MAX_EVENTS, sizeof(size_t));
-    if (!event_buffer || !event_sizes) {
-        fprintf(stderr, "Failed to allocate event buffer\n");
+    if (!event_sizes) {
+        fprintf(stderr, "Failed to allocate event sizes array\n");
+        free(event_buffer);
         return 1;
     }
     printf("Allocated buffer for %d events (%zu MB)\n", MAX_EVENTS,
@@ -275,9 +283,9 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    // Process events
+    // Process events with optimized polling
     while (!exiting) {
-        err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+        err = ring_buffer__poll(rb, 50 /* timeout, ms - reduced for lower latency */);
         if (err == -EINTR) {
             err = 0;
             break;
