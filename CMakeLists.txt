@@ -118,7 +118,22 @@ if(BUILD_EBPF)
     # Check for required tools
     find_program(CLANG clang)
     find_program(BPFTOOL bpftool)
-    find_library(LIBBPF_LIBRARY bpf)
+
+    # Use pkg-config for libbpf to get proper paths (OPTIMIZED for libbpf 1.7.0)
+    find_package(PkgConfig)
+    if(PKG_CONFIG_FOUND)
+        # Set PKG_CONFIG_PATH to find custom libbpf
+        set(ENV{PKG_CONFIG_PATH} "/usr/lib64/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+        pkg_check_modules(LIBBPF libbpf)
+    endif()
+
+    # Fallback to find_library if pkg-config didn't work
+    if(NOT LIBBPF_FOUND)
+        find_library(LIBBPF_LIBRARY bpf PATHS /usr/lib64 /usr/lib /usr/local/lib)
+    else()
+        set(LIBBPF_LIBRARY ${LIBBPF_LIBRARIES})
+    endif()
+
     find_library(LIBELF_LIBRARY elf)
     find_library(ZLIB_LIBRARY z)
 
@@ -196,6 +211,7 @@ if(BUILD_EBPF)
         )
 
         target_link_libraries(mylib_tracer PRIVATE
+            ${LIBBPF_LDFLAGS}  # OPTIMIZED: Use LDFLAGS for proper library paths
             ${LIBBPF_LIBRARY}
             ${LIBELF_LIBRARY}
             ${ZLIB_LIBRARY}

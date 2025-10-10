@@ -45,6 +45,10 @@ struct pt_regs {
 #define BPF_MAP_TYPE_RINGBUF 27
 #endif
 
+#ifndef BPF_MAP_TYPE_PERCPU_ARRAY
+#define BPF_MAP_TYPE_PERCPU_ARRAY 6
+#endif
+
 #define MAX_STRING_LEN 64
 
 // Optimized: Smaller event structures to reduce memory allocation overhead
@@ -64,21 +68,56 @@ struct trace_event_exit {
     u32 event_type;  // 1=exit
 } __attribute__((packed));
 
-// Ring buffer for events - increased size for better performance
+// Ring buffer for events - OPTIMIZED: 2MB for very high-throughput scenarios
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 * 1024 * 1024);  // 1MB for high-throughput scenarios
+    __uint(max_entries, 2 * 1024 * 1024);  // OPTIMIZED: 2MB for benchmarking high loads
 } events SEC(".maps");
 
-// Entry probe - optimized for speed
+// Statistics map for performance monitoring (OPTIMIZED with libbpf 1.7.0)
+struct stats {
+    u64 events_sent;
+    u64 events_dropped;
+    u64 reserve_failures;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);  // Per-CPU for zero contention
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct stats);
+} statistics SEC(".maps");
+
+// Statistics helper functions
+static __always_inline void update_stat_events_sent(void) {
+    u32 zero = 0;
+    struct stats *s = bpf_map_lookup_elem(&statistics, &zero);
+    if (s) __sync_fetch_and_add(&s->events_sent, 1);
+}
+
+static __always_inline void update_stat_events_dropped(void) {
+    u32 zero = 0;
+    struct stats *s = bpf_map_lookup_elem(&statistics, &zero);
+    if (s) __sync_fetch_and_add(&s->events_dropped, 1);
+}
+
+static __always_inline void update_stat_reserve_failures(void) {
+    u32 zero = 0;
+    struct stats *s = bpf_map_lookup_elem(&statistics, &zero);
+    if (s) __sync_fetch_and_add(&s->reserve_failures, 1);
+}
+
+// Entry probe - OPTIMIZED for maximum speed
 SEC("uprobe/my_traced_function")
 int my_traced_function_entry(struct pt_regs *ctx) {
     struct trace_event_entry *event;
 
     // Reserve smaller event structure
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-    if (!event)
+    if (!event) {
+        update_stat_reserve_failures();  // STATS: Track reserve failures
         return 0;
+    }
 
     // Minimal work - just capture the essentials
     event->timestamp = bpf_ktime_get_ns();
@@ -93,23 +132,27 @@ int my_traced_function_entry(struct pt_regs *ctx) {
 
     // Submit with BPF_RB_FORCE_WAKEUP for lower latency (optional)
     bpf_ringbuf_submit(event, 0);
+    update_stat_events_sent();  // STATS: Track successful events
     return 0;
 }
 
-// Exit probe - minimal overhead
+// Exit probe - OPTIMIZED for minimal overhead
 SEC("uretprobe/my_traced_function")
 int my_traced_function_exit(struct pt_regs *ctx) {
     struct trace_event_exit *event;
 
     // Reserve minimal event structure
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-    if (!event)
+    if (!event) {
+        update_stat_reserve_failures();  // STATS: Track reserve failures
         return 0;
+    }
 
     event->timestamp = bpf_ktime_get_ns();
     event->event_type = 1;
 
     bpf_ringbuf_submit(event, 0);
+    update_stat_events_sent();  // STATS: Track successful events
     return 0;
 }
 
