@@ -88,7 +88,7 @@ The benchmark suite tests 6 scenarios representing different function durations:
 
 | Scenario | Duration | Iterations | Represents |
 |----------|----------|------------|------------|
-| Empty Function | 0 μs | 1,000,000 | Worst case (stress test) |
+| Empty Function | 0 μs | 100,000 | Worst case (stress test) |
 | 5 μs Function | 5 μs | 100,000 | Ultra-fast API |
 | 50 μs Function | 50 μs | 50,000 | Fast API (e.g., `hipGetDevice`) |
 | **100 μs Function** | **100 μs** | **10,000** | **Typical HIP API** |

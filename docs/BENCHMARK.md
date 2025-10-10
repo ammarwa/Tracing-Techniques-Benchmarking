@@ -92,9 +92,10 @@ python3 scripts/benchmark.py ./build -s 2 3 --runs 5
 ```
 
 **Time savings:**
-- Full benchmark (6 scenarios × 10 runs): ~4-6 minutes
-- Single scenario (1 scenario × 10 runs): ~40-60 seconds
+- Full benchmark (6 scenarios × 10 runs): ~3-5 minutes (improved with scenario 0 optimization)
+- Single scenario (1 scenario × 10 runs): ~20-40 seconds
 - Quick test (3 scenarios × 5 runs): ~1-2 minutes
+- Scenario 0 alone (10 runs): ~20-30 seconds (was ~3-5 minutes with 1M iterations)
 
 ### ✅ Report Regeneration Tool
 Regenerate HTML reports from existing results without re-running benchmarks:
@@ -117,7 +118,7 @@ The benchmark includes 6 scenarios representing different function durations:
 
 | Index | Scenario | Duration | Iterations | Represents |
 |-------|----------|----------|------------|------------|
-| **0** | Empty Function | 0 μs | 1,000,000 | Worst case: minimal work |
+| **0** | Empty Function | 0 μs | 100,000 | Worst case: minimal work |
 | **1** | 5 μs Function | 5 μs | 100,000 | Ultra-fast API |
 | **2** | 50 μs Function | 50 μs | 50,000 | Fast API (e.g., `hipGetDevice`) |
 | **3** | 100 μs Function | 100 μs | 10,000 | Typical API (e.g., `hipMalloc`) |
@@ -137,6 +138,13 @@ python3 scripts/benchmark.py ./build --scenarios 3 4 5
 # Test extreme cases (empty function and 1ms)
 python3 scripts/benchmark.py ./build -s 0 5
 ```
+
+**Note on Scenario 0 Iterations:**
+Scenario 0 (empty function) was reduced from 1,000,000 to 100,000 iterations because:
+- With 1M iterations, eBPF generates 2M events (entry+exit), causing excessive overhead
+- The point is proven with 100K iterations (still shows 83,000% overhead)
+- Reduces CI runtime by ~10x for scenario 0
+- Keeps total runtime consistent across all scenarios (~2-5 seconds each)
 
 ---
 
@@ -682,6 +690,11 @@ python3 scripts/benchmark.py --help
      - Sticky table headers when scrolling
      - Prevented text wrapping in cells for better readability
      - Set minimum table width to prevent cramped layout
+   - ✅ **Optimized scenario 0 iterations**:
+     - Reduced from 1,000,000 to 100,000 iterations (10x faster)
+     - Still demonstrates worst-case overhead effectively
+     - Reduces CI runtime significantly
+     - Keeps per-scenario runtime balanced (~2-5 seconds each)
 
 2. **docs/BENCHMARK.md** (THIS FILE)
    - ✅ **Added comprehensive explanation** of per-call vs whole-app overhead

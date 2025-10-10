@@ -67,7 +67,7 @@ class BenchmarkSuite:
         BenchmarkScenario(
             name="Empty Function",
             simulated_work_us=0,
-            iterations=1000000,
+            iterations=100000,  # Reduced from 1M to 100K - still proves the point but 10x faster
             description="Worst case: ~6ns function (just arithmetic)"
         ),
         BenchmarkScenario(
@@ -1092,7 +1092,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Available Scenarios:
-  0: Empty Function (0 μs, 1,000,000 iterations)
+  0: Empty Function (0 μs, 100,000 iterations)
   1: 5 μs Function (100,000 iterations)
   2: 50 μs Function (50,000 iterations)
   3: 100 μs Function (10,000 iterations)
