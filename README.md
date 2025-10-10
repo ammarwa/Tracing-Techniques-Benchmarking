@@ -20,6 +20,7 @@ This means:
 | Document | Description |
 |----------|-------------|
 | **[BENCHMARK.md](docs/BENCHMARK.md)** | Complete benchmark suite documentation (methodology, usage, statistical analysis) |
+| **[CI_PIPELINE.md](docs/CI_PIPELINE.md)** | CI/CD pipeline with parallel execution architecture |
 | **[EBPF_DESIGN.md](docs/EBPF_DESIGN.md)** | eBPF tracer architecture and implementation |
 | **[LTTNG_DESIGN.md](docs/LTTNG_DESIGN.md)** | LTTng tracer architecture and implementation |
 | **[SAMPLE_APP.md](docs/SAMPLE_APP.md)** | Sample library and application documentation |
@@ -373,6 +374,7 @@ This makes eBPF ideal for GPU tracing, where function durations far exceed the t
 
 **Quick Links**:
 - 📖 [Complete Benchmark Guide](docs/BENCHMARK.md)
+- 🔄 [CI/CD Pipeline Guide](docs/CI_PIPELINE.md)
 - 🔬 [eBPF Design](docs/EBPF_DESIGN.md)
 - 🔬 [LTTng Design](docs/LTTNG_DESIGN.md)
 - 🏗️ [Build Guide](BUILD.md)
