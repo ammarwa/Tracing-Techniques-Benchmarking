@@ -79,9 +79,9 @@ __attribute__((always_inline))
 int my_traced_function_entry(struct pt_regs *ctx) {
     struct trace_event_entry *event;
 
-    // Reserve smaller event structure
+    // Reserve event with no flags for fastest allocation
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-    if (!event)
+    if (__builtin_expect(!event, 0))
         return 0;
 
     // Minimal work - just capture the essentials
@@ -105,9 +105,9 @@ __attribute__((always_inline))
 int my_traced_function_exit(struct pt_regs *ctx) {
     struct trace_event_exit *event;
 
-    // Reserve minimal event structure
+    // Reserve minimal event with fast path
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-    if (!event)
+    if (__builtin_expect(!event, 0))
         return 0;
 
     event->timestamp = bpf_ktime_get_ns();
