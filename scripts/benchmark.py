@@ -524,7 +524,7 @@ class BenchmarkSuite:
     def run_all_scenarios(self):
         """Execute all benchmark scenarios"""
         print("\n" + "="*70)
-        print("COMPREHENSIVE eBPF vs LTTng (LD_PRELOAD + Ptrace) BENCHMARK SUITE")
+        print("COMPREHENSIVE TRACING BENCHMARK SUITE: eBPF vs LTTng LD_PRELOAD vs LTTng Ptrace")
         print("="*70)
 
         for scenario in self.scenarios:

@@ -344,16 +344,16 @@ babeltrace2 /tmp/trace | grep my_traced_function_entry | wc -l
 ## Future Enhancements
 
 ### Immediate Improvements
-- **Complete breakpoint handling** for function entry/exit
-- **Multi-architecture support** (ARM, RISC-V)
-- **Floating-point argument extraction** from XMM registers
-- **Multi-threaded process support**
+- **Complete breakpoint handling** for function entry/exit.
+- **Multi-architecture support** (ARM, RISC-V).
+- **Floating-point argument extraction** from XMM registers.
+- **Multi-threaded process support**.
 
 ### Advanced Features
-- **Hot-attach/detach** without stopping target process
-- **Conditional tracing** based on argument values
-- **Stack trace capture** at function entry
-- **Dynamic symbol resolution** for runtime-loaded libraries
+- **Hot-attach/detach** without stopping target process.
+- **Conditional tracing** based on argument values.
+- **Stack trace capture** at function entry.
+- **Dynamic symbol resolution** for runtime-loaded libraries.
 
 ## Testing
 
