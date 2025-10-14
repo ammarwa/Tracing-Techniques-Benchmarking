@@ -33,19 +33,26 @@ lttng start
 PTRACE_TRACER=""
 SAMPLE_APP=""
 
-# Try CMake build first, fall back to Makefile build
-if [ -f "../build/bin/lttng_ptrace_tracer" ] && [ -f "../build/bin/sample_app" ]; then
+# Try different relative paths based on where script is run from
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+if [ -f "$PROJECT_ROOT/build/bin/lttng_ptrace_tracer" ] && [ -f "$PROJECT_ROOT/build/bin/sample_app" ]; then
+    PTRACE_TRACER="$PROJECT_ROOT/build/bin/lttng_ptrace_tracer"
+    SAMPLE_APP="$PROJECT_ROOT/build/bin/sample_app"
+elif [ -f "../build/bin/lttng_ptrace_tracer" ] && [ -f "../build/bin/sample_app" ]; then
     PTRACE_TRACER="../build/bin/lttng_ptrace_tracer"
     SAMPLE_APP="../build/bin/sample_app"
-elif [ -f "./lttng_ptrace_tracer" ] && [ -f "../sample_app/sample_app" ]; then
-    PTRACE_TRACER="./lttng_ptrace_tracer"
-    SAMPLE_APP="../sample_app/sample_app"
-elif [ -f "../../build/bin/lttng_ptrace_tracer" ] && [ -f "../../build/bin/sample_app" ]; then
-    PTRACE_TRACER="../../build/bin/lttng_ptrace_tracer"
-    SAMPLE_APP="../../build/bin/sample_app"
+elif [ -f "./build/bin/lttng_ptrace_tracer" ] && [ -f "./build/bin/sample_app" ]; then
+    PTRACE_TRACER="./build/bin/lttng_ptrace_tracer"
+    SAMPLE_APP="./build/bin/sample_app"
 else
     echo "ERROR: Could not find lttng_ptrace_tracer or sample_app"
     echo "Please build the project first with: ./build.sh"
+    echo "Searched in:"
+    echo "  $PROJECT_ROOT/build/bin/"
+    echo "  ../build/bin/"
+    echo "  ./build/bin/"
     lttng destroy
     exit 1
 fi

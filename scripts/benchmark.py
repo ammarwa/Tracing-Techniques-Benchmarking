@@ -38,7 +38,7 @@ class BenchmarkScenario:
 class BenchmarkResult:
     """Results from a single benchmark run with statistical measures"""
     scenario: str
-    method: str  # 'baseline', 'lttng', or 'ebpf'
+    method: str  # 'baseline', 'lttng', 'lttng_ptrace', or 'ebpf'
     iterations: int
     simulated_work_us: int
     wall_time_s: float
@@ -322,6 +322,83 @@ class BenchmarkSuite:
         print(f"    Completed {self.num_runs} runs                    ")
         return self.aggregate_multiple_runs(results)
 
+    def run_lttng_ptrace_single(self, scenario: BenchmarkScenario, run_num: int = 0) -> BenchmarkResult:
+        """Run a single LTTng Ptrace tracing test"""
+        session_name = f"mylib_ptrace_bench_{scenario.simulated_work_us}us_r{run_num}"
+
+        # Check if ptrace tracer exists
+        ptrace_tracer = self.build_dir / 'bin' / 'lttng_ptrace_tracer'
+        if not ptrace_tracer.exists():
+            raise FileNotFoundError(f"LTTng Ptrace tracer not found at {ptrace_tracer}")
+
+        # Clean up any existing session
+        self.run_command(f"lttng destroy {session_name} 2>/dev/null || true", capture_output=False)
+
+        # Create and configure session
+        self.run_command(f"lttng create {session_name} --output={self.output_dir}/lttng_ptrace_{scenario.simulated_work_us}us_r{run_num}")
+        self.run_command(f"lttng enable-event -u mylib:*")
+        self.run_command(f"lttng start")
+
+        # Prepare environment for target application
+        env = {}
+        if scenario.simulated_work_us > 0:
+            env['SIMULATED_WORK_US'] = str(scenario.simulated_work_us)
+
+        # Run with ptrace tracer - time the entire tracing process
+        target_cmd = f'{self.build_dir}/bin/sample_app {scenario.iterations}'
+        cmd = f'/usr/bin/time -f "wall_time=%e user_time=%U sys_time=%S max_rss=%M" ' \
+              f'{ptrace_tracer} {target_cmd}'
+
+        result = self.run_command(cmd, env=env)
+        time_data = self.parse_time_output(result.stderr)
+        
+        # Parse app output from ptrace tracer output
+        app_data = {'avg_time_ns': 0}  # Ptrace tracer doesn't report app timing
+        if "Target application completed" in result.stdout:
+            # Try to extract timing from the ptrace output if available
+            pass
+
+        # Stop and get trace size
+        self.run_command(f"lttng stop")
+        self.run_command(f"lttng destroy {session_name}")
+
+        # Get trace size
+        trace_path = self.output_dir / f"lttng_ptrace_{scenario.simulated_work_us}us_r{run_num}"
+        trace_size = 0
+        if trace_path.exists():
+            trace_size = sum(f.stat().st_size for f in trace_path.rglob('*') if f.is_file())
+            # Clean up trace directory immediately to save disk space
+            try:
+                shutil.rmtree(trace_path)
+            except Exception as e:
+                print(f"    Warning: Could not remove trace directory {trace_path}: {e}")
+
+        return BenchmarkResult(
+            scenario=scenario.name,
+            method='lttng_ptrace',
+            iterations=scenario.iterations,
+            simulated_work_us=scenario.simulated_work_us,
+            wall_time_s=time_data.get('wall_time', 0),
+            user_cpu_s=time_data.get('user_time', 0),
+            system_cpu_s=time_data.get('sys_time', 0),
+            max_rss_kb=int(time_data.get('max_rss', 0)),
+            avg_time_per_call_ns=app_data.get('avg_time_ns', 0),
+            trace_size_mb=trace_size / (1024 * 1024)
+        )
+
+    def run_lttng_ptrace(self, scenario: BenchmarkScenario) -> BenchmarkResult:
+        """Run LTTng Ptrace tracing test multiple times for statistical reliability"""
+        print(f"\n  [LTTNG-PTRACE] {scenario.name} - Running {self.num_runs} times for statistical reliability")
+
+        results = []
+        for run_num in range(self.num_runs):
+            if run_num % 10 == 0:  # Progress indicator every 10 runs
+                print(f"    Run {run_num + 1}/{self.num_runs}...", end='\r')
+            results.append(self.run_lttng_ptrace_single(scenario, run_num))
+
+        print(f"    Completed {self.num_runs} runs                    ")
+        return self.aggregate_multiple_runs(results)
+
     def run_ebpf_single(self, scenario: BenchmarkScenario, run_num: int = 0) -> BenchmarkResult:
         """Run a single eBPF tracing test"""
         # Run tracer without file output for minimal overhead (benchmark mode)
@@ -447,7 +524,7 @@ class BenchmarkSuite:
     def run_all_scenarios(self):
         """Execute all benchmark scenarios"""
         print("\n" + "="*70)
-        print("COMPREHENSIVE eBPF vs LTTng BENCHMARK SUITE")
+        print("COMPREHENSIVE eBPF vs LTTng (LD_PRELOAD + Ptrace) BENCHMARK SUITE")
         print("="*70)
 
         for scenario in self.scenarios:
@@ -470,6 +547,12 @@ class BenchmarkSuite:
                 self.results.append(lttng)
             except Exception as e:
                 print(f"  ERROR in LTTng: {e}")
+
+            try:
+                lttng_ptrace = self.run_lttng_ptrace(scenario)
+                self.results.append(lttng_ptrace)
+            except Exception as e:
+                print(f"  ERROR in LTTng Ptrace: {e}")
 
             try:
                 ebpf = self.run_ebpf(scenario)
@@ -531,6 +614,14 @@ class BenchmarkSuite:
                     row['lttng_wall_s'] = lttng_wall_s
                     row['lttng_app_overhead_pct'] = ((lttng_wall_s / baseline_wall_s) - 1) * 100 if baseline_wall_s > 0 else 0
 
+                if 'lttng_ptrace' in methods:
+                    lttng_ptrace_ns = methods['lttng_ptrace'].avg_time_per_call_ns
+                    lttng_ptrace_wall_s = methods['lttng_ptrace'].wall_time_s
+                    row['lttng_ptrace_overhead_ns'] = lttng_ptrace_ns - baseline_ns
+                    row['lttng_ptrace_overhead_pct'] = ((lttng_ptrace_ns / baseline_ns) - 1) * 100 if baseline_ns > 0 else 0
+                    row['lttng_ptrace_wall_s'] = lttng_ptrace_wall_s
+                    row['lttng_ptrace_app_overhead_pct'] = ((lttng_ptrace_wall_s / baseline_wall_s) - 1) * 100 if baseline_wall_s > 0 else 0
+
                 if 'ebpf' in methods:
                     ebpf_ns = methods['ebpf'].avg_time_per_call_ns
                     ebpf_wall_s = methods['ebpf'].wall_time_s
@@ -544,23 +635,28 @@ class BenchmarkSuite:
         # Prepare chart data as JSON strings (to be embedded in JavaScript)
         js_work_us = json.dumps([d['work_us'] for d in overhead_data])
         js_lttng_overhead_pct = json.dumps([d.get('lttng_overhead_pct', 0) for d in overhead_data])
+        js_lttng_ptrace_overhead_pct = json.dumps([d.get('lttng_ptrace_overhead_pct', 0) for d in overhead_data])
         js_ebpf_overhead_pct = json.dumps([d.get('ebpf_overhead_pct', 0) for d in overhead_data])
         js_scenario_names = json.dumps([d['scenario'] for d in overhead_data])
         js_baseline_ns = json.dumps([d['baseline_ns'] for d in overhead_data])
 
         # For absolute timing chart: show TOTAL time for each method (not just overhead)
         js_lttng_total_ns = json.dumps([d['baseline_ns'] + d.get('lttng_overhead_ns', 0) for d in overhead_data])
+        js_lttng_ptrace_total_ns = json.dumps([d['baseline_ns'] + d.get('lttng_ptrace_overhead_ns', 0) for d in overhead_data])
         js_ebpf_total_ns = json.dumps([d['baseline_ns'] + d.get('ebpf_overhead_ns', 0) for d in overhead_data])
 
         js_memory_baseline = json.dumps([scenarios_data[d['scenario']]['baseline'].max_rss_kb for d in overhead_data if 'baseline' in scenarios_data[d['scenario']]])
         js_memory_lttng = json.dumps([scenarios_data[d['scenario']]['lttng'].max_rss_kb if 'lttng' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
+        js_memory_lttng_ptrace = json.dumps([scenarios_data[d['scenario']]['lttng_ptrace'].max_rss_kb if 'lttng_ptrace' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
         js_memory_ebpf = json.dumps([scenarios_data[d['scenario']]['ebpf'].max_rss_kb if 'ebpf' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
 
         # For whole application overhead chart
         js_baseline_wall_s = json.dumps([d['baseline_wall_s'] for d in overhead_data])
         js_lttng_wall_s = json.dumps([d.get('lttng_wall_s', 0) for d in overhead_data])
+        js_lttng_ptrace_wall_s = json.dumps([d.get('lttng_ptrace_wall_s', 0) for d in overhead_data])
         js_ebpf_wall_s = json.dumps([d.get('ebpf_wall_s', 0) for d in overhead_data])
         js_lttng_app_overhead_pct = json.dumps([d.get('lttng_app_overhead_pct', 0) for d in overhead_data])
+        js_lttng_ptrace_app_overhead_pct = json.dumps([d.get('lttng_ptrace_app_overhead_pct', 0) for d in overhead_data])
         js_ebpf_app_overhead_pct = json.dumps([d.get('ebpf_app_overhead_pct', 0) for d in overhead_data])
 
         # Generate HTML
@@ -886,10 +982,11 @@ class BenchmarkSuite:
         const lttng_app_overhead_pct = {js_lttng_app_overhead_pct};
         const ebpf_app_overhead_pct = {js_ebpf_app_overhead_pct};
 
-        // Color scheme: LTTng = orange, eBPF = blue, Baseline = gray
+        // Color scheme: LTTng = orange, LTTng Ptrace = purple, eBPF = blue, Baseline = gray
         const colors = {{
             baseline: '#7f8c8d',
             lttng: '#e67e22',
+            lttng_ptrace: '#9b59b6',
             ebpf: '#3498db'
         }};
 
