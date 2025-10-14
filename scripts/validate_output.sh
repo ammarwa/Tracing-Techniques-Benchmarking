@@ -42,10 +42,12 @@ if [ -d "bin" ] && [ -d "lib" ]; then
     SAMPLE_APP="./bin/sample_app"
     MYLIB_LTTNG="./lib/libmylib_lttng.so"
     MYLIB_TRACER="./bin/mylib_tracer"
+    LTTNG_PTRACE_TRACER="./bin/lttng_ptrace_tracer"
 elif [ -d "build/bin" ] && [ -d "build/lib" ]; then
     SAMPLE_APP="./build/bin/sample_app"
     MYLIB_LTTNG="./build/lib/libmylib_lttng.so"
     MYLIB_TRACER="./build/bin/mylib_tracer"
+    LTTNG_PTRACE_TRACER="./build/bin/lttng_ptrace_tracer"
 else
     print_error "Could not find build artifacts"
     print_error "Please build first with: ./build.sh"
@@ -102,6 +104,55 @@ LTTNG_EXIT_COUNT=$(grep "my_traced_function_exit" $LTTNG_TEXT | wc -l)
 
 echo "  Entry events: $LTTNG_ENTRY_COUNT"
 echo "  Exit events:  $LTTNG_EXIT_COUNT"
+echo ""
+
+#############################################
+# Run LTTng Ptrace Trace
+#############################################
+print_header "Running LTTng Ptrace Trace"
+
+# Check if ptrace tracer exists
+if [ ! -f "$LTTNG_PTRACE_TRACER" ]; then
+    print_warning "LTTng Ptrace tracer not found, skipping..."
+    LTTNG_PTRACE_ENTRY_COUNT=0
+    LTTNG_PTRACE_EXIT_COUNT=0
+else
+    # Clean up any existing session
+    LTTNG_PTRACE_SESSION="ptrace_validation_test_$$"
+    LTTNG_PTRACE_TRACE_DIR="/tmp/lttng_ptrace_validation_$$"
+    lttng destroy $LTTNG_PTRACE_SESSION 2>/dev/null || true
+
+    # Create session
+    mkdir -p $LTTNG_PTRACE_TRACE_DIR
+    lttng create $LTTNG_PTRACE_SESSION --output=$LTTNG_PTRACE_TRACE_DIR >/dev/null 2>&1
+
+    # Enable events
+    lttng enable-event -u mylib:* >/dev/null 2>&1
+
+    # Start tracing
+    lttng start >/dev/null 2>&1
+
+    # Run application with ptrace tracer
+    echo "Running application with LTTng Ptrace tracer..."
+    $LTTNG_PTRACE_TRACER $SAMPLE_APP $NUM_ITERATIONS >/dev/null 2>&1
+
+    # Stop and destroy
+    lttng stop >/dev/null 2>&1
+    lttng destroy >/dev/null 2>&1
+
+    # Convert to text format
+    LTTNG_PTRACE_TEXT="/tmp/lttng_ptrace_text_$$.txt"
+    babeltrace2 $LTTNG_PTRACE_TRACE_DIR 2>/dev/null > $LTTNG_PTRACE_TEXT
+
+    print_success "LTTng Ptrace trace captured"
+
+    # Count events
+    LTTNG_PTRACE_ENTRY_COUNT=$(grep "my_traced_function_entry" $LTTNG_PTRACE_TEXT | wc -l)
+    LTTNG_PTRACE_EXIT_COUNT=$(grep "my_traced_function_exit" $LTTNG_PTRACE_TEXT | wc -l)
+
+    echo "  Entry events: $LTTNG_PTRACE_ENTRY_COUNT"
+    echo "  Exit events:  $LTTNG_PTRACE_EXIT_COUNT"
+fi
 echo ""
 
 #############################################
@@ -220,6 +271,23 @@ if [ "$EBPF_EXIT_COUNT" -eq "$NUM_ITERATIONS" ]; then
 else
     print_error "eBPF exit count mismatch: expected $NUM_ITERATIONS, got $EBPF_EXIT_COUNT"
     VALIDATION_PASSED=false
+fi
+
+# Check ptrace tracer if available
+if [ -f "$LTTNG_PTRACE_TRACER" ]; then
+    if [ "$LTTNG_PTRACE_ENTRY_COUNT" -eq "$NUM_ITERATIONS" ]; then
+        print_success "LTTng Ptrace captured all $NUM_ITERATIONS entry events"
+    else
+        print_error "LTTng Ptrace entry count mismatch: expected $NUM_ITERATIONS, got $LTTNG_PTRACE_ENTRY_COUNT"
+        VALIDATION_PASSED=false
+    fi
+
+    if [ "$LTTNG_PTRACE_EXIT_COUNT" -eq "$NUM_ITERATIONS" ]; then
+        print_success "LTTng Ptrace captured all $NUM_ITERATIONS exit events"
+    else
+        print_error "LTTng Ptrace exit count mismatch: expected $NUM_ITERATIONS, got $LTTNG_PTRACE_EXIT_COUNT"
+        VALIDATION_PASSED=false
+    fi
 fi
 
 # Check if both match
@@ -343,6 +411,14 @@ rm -rf $LTTNG_TRACE_DIR
 rm -f $LTTNG_TEXT
 rm -f $EBPF_TRACE_FILE
 rm -f $TRACER_LOG
+
+# Clean up ptrace tracer files if they exist
+if [ -n "${LTTNG_PTRACE_TRACE_DIR:-}" ]; then
+    rm -rf $LTTNG_PTRACE_TRACE_DIR
+fi
+if [ -n "${LTTNG_PTRACE_TEXT:-}" ]; then
+    rm -f $LTTNG_PTRACE_TEXT
+fi
 
 print_success "Temporary files cleaned up"
 echo ""

@@ -101,6 +101,28 @@ if(BUILD_LTTNG)
         target_compile_options(mylib_lttng PRIVATE -O2 -fPIC)
 
         message("${Green}  ✓ libmylib_lttng.so${ColorReset}")
+        
+        # Build LTTng Ptrace Tracer
+        add_executable(lttng_ptrace_tracer
+            src/tools/lttng_ptrace_tracer/lttng_ptrace_tracer.c
+            src/tools/lttng_ptrace_tracer/mylib_tp.c
+        )
+
+        target_include_directories(lttng_ptrace_tracer PRIVATE
+            ${LTTNG_UST_INCLUDE_DIR}
+            src/sample/sample_library
+            src/tools/lttng_ptrace_tracer
+        )
+
+        target_link_libraries(lttng_ptrace_tracer PRIVATE
+            ${LTTNG_UST_LIBRARY}
+            dl
+        )
+
+        target_compile_options(lttng_ptrace_tracer PRIVATE -O2)
+
+        message("${Green}  ✓ lttng_ptrace_tracer${ColorReset}")
+        
     else()
         message("${Yellow}  ⚠ LTTng not found. Install with: sudo apt install liblttng-ust-dev${ColorReset}")
         message("${Yellow}  ⚠ Skipping LTTng tracer build${ColorReset}")
@@ -273,6 +295,12 @@ if(TARGET mylib_tracer)
     )
 endif()
 
+if(TARGET lttng_ptrace_tracer)
+    install(TARGETS lttng_ptrace_tracer
+        RUNTIME DESTINATION bin
+    )
+endif()
+
 # Install scripts
 install(PROGRAMS benchmark.sh
     DESTINATION bin
@@ -290,6 +318,13 @@ if(TARGET mylib_tracer)
     install(PROGRAMS src/tools/ebpf_tracer/run_ebpf_trace.sh
         DESTINATION bin
         RENAME run_ebpf_trace
+    )
+endif()
+
+if(TARGET lttng_ptrace_tracer)
+    install(PROGRAMS src/tools/lttng_ptrace_tracer/run_lttng_ptrace_trace.sh
+        DESTINATION bin
+        RENAME run_lttng_ptrace_trace
     )
 endif()
 
@@ -320,6 +355,12 @@ if(TARGET mylib_lttng)
     message("  ✓ LTTng Tracer")
 else()
     message("  ${Yellow}⊘ LTTng Tracer (not built)${ColorReset}")
+endif()
+
+if(TARGET lttng_ptrace_tracer)
+    message("  ✓ LTTng Ptrace Tracer")
+else()
+    message("  ${Yellow}⊘ LTTng Ptrace Tracer (not built)${ColorReset}")
 endif()
 
 if(TARGET mylib_tracer)
