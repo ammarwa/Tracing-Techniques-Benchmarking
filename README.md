@@ -367,14 +367,6 @@ __uint(max_entries, 4 * 1024 * 1024);  # Increase to 4MB
 
 SPDX-License-Identifier: GPL-2.0
 
-## 🙏 Acknowledgments
-
-This project demonstrates the key principle:
-
-> **Uprobe overhead is absolute (~5 μs), not relative.**
-
-This makes eBPF ideal for GPU tracing, where function durations far exceed the tracing overhead!
-
 ---
 
 **Quick Links**:
