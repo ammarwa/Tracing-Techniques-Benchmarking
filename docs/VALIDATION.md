@@ -111,14 +111,15 @@ Validating Event Counts
 Validating Argument Values
 ========================================
 Sample LTTng entry event:
-[12:34:56.123456789] (+0.000000000) hostname mylib:my_traced_function_entry: { arg1 = 42, arg2 = 3735928559, arg3 = "test_string", arg4 = 3.14159, arg5 = 0x12345678 }
+[12:34:56.123456789] (+0.000000000) hostname mylib:my_traced_function_entry: { arg1 = 42, arg2 = 3735928559, arg3 = 3.14159, arg4 = 0x12345678 }
 
 Sample eBPF entry event:
-[1728567890.123456789] mylib:my_traced_function_entry: { arg1 = 42, arg2 = 3735928559, arg3_ptr = 0x7ffd12345678, arg5 = 0x12345678 }
+[1728567890.123456789] mylib:my_traced_function_entry: { arg1 = 42, arg2 = 3735928559, arg3 = 3.14159, arg4 = 0x12345678 }
 
 ✓ arg1 correct in both traces (42)
 ✓ arg2 correct in both traces (3735928559 = 0xDEADBEEF)
-✓ arg3 correct in both traces ("test_string")
+✓ arg3 correct in both traces (3.14159)
+✓ arg4 correct in both traces (0x12345678)
 
 ========================================
 Validation Summary
@@ -217,7 +218,8 @@ fi
 **What it checks:**
 - `arg1 = 42` (int)
 - `arg2 = 3735928559` (uint64_t, hex: 0xDEADBEEF)
-- `arg3 = "test_string"` (const char*)
+- `arg3 = 3.14159` (double)
+- `arg4 = 0x12345678` (void*)
 
 **Implementation:**
 ```bash

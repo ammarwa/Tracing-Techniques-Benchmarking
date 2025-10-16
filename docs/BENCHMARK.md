@@ -53,9 +53,23 @@ benchmark_results_YYYYMMDD_HHMMSS/
 └── results.json                # Raw benchmark data
 ```
 
+**GitHub Pages Deployment:**
+The benchmark script automatically updates the `report/` directory for GitHub Pages deployment:
+- `report/index.html` - Main report (automatically updated with link banner if full HIP trace benchmark exists)
+- `report/full_app_benchmark_results.html` - Complete tracing tools comparison (manually provided)
+
 Open the HTML report in your browser:
 ```bash
 firefox benchmark_results_*/benchmark_report.html
+```
+
+**View on GitHub Pages:**
+```bash
+# View main benchmark report
+https://ammarwa.github.io/Tracing-Techniques-Benchmarking/
+
+# View full HIP trace benchmark
+https://ammarwa.github.io/Tracing-Techniques-Benchmarking/full-hip-trace-benchmark/
 ```
 
 **Note:** Individual trace files are automatically cleaned up after data extraction to minimize disk usage.
@@ -252,7 +266,7 @@ All charts support:
 - Professional and publication-ready
 
 **Customization:**
-Edit `scripts/benchmark.py` around line 818:
+Edit `scripts/benchmark.py` around lines 890-894:
 ```javascript
 const colors = {
     baseline: '#7f8c8d',  // Gray
@@ -362,7 +376,7 @@ HTML report shows comprehensive metrics including both whole app and per-call ov
 This means:
 - **Empty 6ns function**: 5,000/6 = **83,000% per-call overhead** ❌ (worst case, unrealistic)
 - **100 μs HIP API**: 5,000/100,000 = **5% per-call overhead** ✅ (typical case)
-- **1 ms GPU kernel**: 5,000/1,000,000 = **0.5% per-call overhead** ✅ (realistic workload)
+- **1 ms slow API call**: 5,000/1,000,000 = **0.5% per-call overhead** ✅ (realistic workload)
 
 ### Expected Overhead Pattern
 
@@ -386,7 +400,7 @@ Empty (0μs):      ████████████████████�
 
 2. **Production GPU workloads**
    - HIP API calls: 10-1000 μs → 0.5-5% overhead ✅
-   - GPU kernels: 1-1000 ms → <0.1% overhead ✅
+   - Slow API calls: 1-1000 ms → <0.1% overhead ✅
    - **Total application overhead: <1%** ✅
 
 3. **Why 83% and 0.3% are both correct**
@@ -423,7 +437,7 @@ The charts demonstrate why **eBPF is ideal for GPU tracing**:
 2. Most HIP API calls take 10-1000 μs
 3. **Chart 2** shows ~5 μs absolute eBPF overhead
 4. For 100 μs HIP call: only ~5% overhead
-5. For 1 ms GPU kernel: only ~0.5% overhead
+5. For 1 ms slow API calls: only ~0.5% overhead
 
 **Conclusion:** eBPF's constant ~5 μs overhead is negligible for GPU workloads
 
@@ -443,7 +457,7 @@ The charts demonstrate why **eBPF is ideal for GPU tracing**:
 For GPU and HIP API tracing, **eBPF is highly recommended** because:
 
 1. **HIP API calls typically take 10-1000 μs** (much slower than uprobe overhead)
-2. **GPU kernel execution takes milliseconds** (making tracer overhead negligible)
+2. **Slow API calls can take milliseconds** (making tracer overhead negligible)
 3. **No application modification required** (zero code changes)
 4. **Can trace at kernel/driver boundary** for complete visibility
 5. **Expected total application overhead: <1%** ✅

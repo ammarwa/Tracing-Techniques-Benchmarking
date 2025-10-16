@@ -71,13 +71,17 @@ jobs:
 
       - name: Prepare GitHub Pages content
         run: |
-          # Create pages directory
+          # Create pages directory structure
           mkdir -p gh-pages
+          mkdir -p gh-pages/full-hip-trace-benchmark
 
-          # Copy pre-generated report from report/ folder
+          # Copy pre-generated reports from report/ folder
           cp report/index.html gh-pages/index.html
           cp report/results.json gh-pages/results.json
           cp report/GENERATION_INFO.md gh-pages/GENERATION_INFO.md
+          
+          # Copy full HIP trace benchmark to subdirectory
+          cp report/full_app_benchmark_results.html gh-pages/full-hip-trace-benchmark/index.html
 
           # Create a landing page with metadata
           cat > gh-pages/README.md << 'EOF'
@@ -85,7 +89,8 @@ jobs:
 
           This page contains benchmark results comparing eBPF and LTTng tracing overhead.
 
-          - **[View Interactive Report](index.html)**
+          - **[View Interactive Report](index.html)** - Standard eBPF vs LTTng comparison
+          - **[Full HIP Trace Benchmark](full-hip-trace-benchmark/)** - Complete tracing tools comparison including eBPF, LTTng/Exatracer, and ROCProfV3
           - **[Download Raw JSON Results](results.json)**
           - **[View Generation Info](GENERATION_INFO.md)**
 

@@ -499,7 +499,75 @@ class BenchmarkSuite:
         print(f"HTML report generated: {report_file}")
         print(f"Open in browser: file://{report_file.absolute()}")
 
+        # Also copy to report/ directory if it exists (for GitHub Pages deployment)
+        self._copy_to_report_directory(html)
+
         return report_file
+
+    def _copy_to_report_directory(self, html_content: str):
+        """Copy generated report to report/ directory for GitHub Pages deployment"""
+        try:
+            # Look for report/ directory in parent directories
+            current_dir = Path.cwd()
+            report_dir = None
+            
+            # Check current directory and up to 3 parent directories
+            for i in range(4):
+                potential_report_dir = current_dir / "report"
+                if potential_report_dir.exists() and potential_report_dir.is_dir():
+                    report_dir = potential_report_dir
+                    break
+                current_dir = current_dir.parent
+            
+            if report_dir:
+                # Check if full_app_benchmark_results.html exists (manually provided)
+                full_trace_file = report_dir / "full_app_benchmark_results.html"
+                has_full_benchmark = full_trace_file.exists()
+                
+                if has_full_benchmark:
+                    # Update the HTML content to include the link to full HIP trace benchmark
+                    html_with_link = self._add_full_hip_trace_link(html_content)
+                    print(f"Found existing full HIP trace benchmark - adding link banner")
+                else:
+                    # No full benchmark file, use original content
+                    html_with_link = html_content
+                    print(f"No full HIP trace benchmark found - using main report without link banner")
+                
+                # Write the updated main report
+                main_report_file = report_dir / "index.html"
+                with open(main_report_file, 'w') as f:
+                    f.write(html_with_link)
+                print(f"Updated main report for GitHub Pages: {main_report_file}")
+                
+            else:
+                print("Note: report/ directory not found - skipping GitHub Pages copy")
+                
+        except Exception as e:
+            print(f"Warning: Failed to copy to report/ directory: {e}")
+
+    def _add_full_hip_trace_link(self, html_content: str) -> str:
+        """Add link to full HIP trace benchmark at the top of the main report"""
+        link_html = '''        
+        <div style="background: #e8f4fd; border: 1px solid #bee5eb; border-radius: 5px; padding: 15px; margin: 20px 0;">
+            <p style="margin: 0;"><strong>🔗 Additional Resources:</strong> 
+            <a href="full-hip-trace-benchmark/" style="color: #0066cc; text-decoration: none;">
+                <strong>Full HIP Trace Benchmark Results</strong>
+            </a> - Complete tracing tools comparison including eBPF, LTTng/Exatracer, and ROCProfV3, measuring wall-time overhead added to application processes in real-world HIP tracing scenarios.</p>
+        </div>
+'''
+        
+        # Insert the link after the h1 title
+        insertion_point = html_content.find('<div class="metadata">')
+        if insertion_point != -1:
+            return html_content[:insertion_point] + link_html + '\n        ' + html_content[insertion_point:]
+        else:
+            # Fallback: insert after the h1 tag
+            h1_end = html_content.find('</h1>')
+            if h1_end != -1:
+                insertion_point = h1_end + 5  # After </h1>
+                return html_content[:insertion_point] + '\n' + link_html + html_content[insertion_point:]
+        
+        return html_content
 
     def _generate_html(self) -> str:
         """Generate the HTML content for the report"""
@@ -853,7 +921,7 @@ class BenchmarkSuite:
         <p>For GPU and HIP API tracing, <strong>eBPF is highly recommended</strong> because:</p>
         <ul>
             <li>HIP API calls typically take 10-1000 μs (much slower than uprobe overhead)</li>
-            <li>GPU kernel execution takes milliseconds (making tracer overhead negligible)</li>
+            <li>Slow API calls can take milliseconds (making tracer overhead negligible)</li>
             <li>No application modification required (zero code changes)</li>
             <li>Can trace at kernel/driver boundary for complete visibility</li>
             <li>Expected total application overhead: <strong>&lt;1%</strong></li>

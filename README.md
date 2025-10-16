@@ -9,7 +9,7 @@ A comprehensive comparison of **eBPF (uprobes)** and **LTTng (userspace tracing)
 This means:
 - **Empty 6ns function**: 5μs/6ns = **83,000% overhead** (worst case, unrealistic)
 - **100 μs HIP API**: 5μs/100μs = **5% overhead** (typical)
-- **1 ms GPU kernel**: 5μs/1ms = **0.5% overhead** (realistic)
+- **1 ms function**: 5μs/1ms = **0.5% overhead** (realistic)
 
 **Conclusion**: eBPF is **perfect for GPU/HIP tracing** where API calls take 10-1000 μs! 🚀
 
@@ -75,10 +75,12 @@ Expected output:
 sudo ./scripts/benchmark.py ./build
 ```
 
-This runs **1,800 tests** (6 scenarios × 3 methods × 100 runs) and generates an HTML report with interactive charts.
+This runs **180 tests** (6 scenarios × 3 methods × 10 runs) and generates an HTML report with interactive charts.
 
-**Estimated time**: ~40-60 minutes
-**Output**: `benchmark_results_<timestamp>/benchmark_report.html`
+**Estimated time**: ~4-6 minutes
+**Output**: 
+- `benchmark_results_<timestamp>/benchmark_report.html` - Local report
+- `report/index.html` - Updated for GitHub Pages deployment (with link banner if full HIP trace benchmark exists)
 
 ---
 
@@ -93,9 +95,9 @@ The benchmark suite tests 6 scenarios representing different function durations:
 | 50 μs Function | 50 μs | 50,000 | Fast API (e.g., `hipGetDevice`) |
 | **100 μs Function** | **100 μs** | **10,000** | **Typical HIP API** |
 | 500 μs Function | 500 μs | 5,000 | Medium API (e.g., `hipMemcpy`) |
-| 1000 μs Function | 1 ms | 2,000 | Slow API (e.g., kernel launch) |
+| 1000 μs Function | 1 ms | 2,000 | Slow API |
 
-Each scenario runs **100 times** with statistical aggregation (mean, stddev, 95% CI).
+Each scenario runs **10 times** with statistical aggregation (mean, stddev, 95% CI).
 
 ---
 
@@ -250,12 +252,11 @@ sudo ./scripts/validate_output.sh  # Verify both tracers work correctly
 ### Benchmarking
 
 ```bash
-# Full benchmark (100 runs per scenario, ~40-60 min)
+# Full benchmark (10 runs per scenario, ~4-6 min)
 sudo ./scripts/benchmark.py ./build
 
-# Quick test (10 runs, ~5-10 min)
-# Edit line 59 in scripts/benchmark.py: num_runs=10
-sudo ./scripts/benchmark.py ./build
+# Extended analysis (50 runs per scenario, ~20-30 min)
+sudo ./scripts/benchmark.py ./build --runs 50
 ```
 
 ### View Results
@@ -281,7 +282,7 @@ cat benchmark_results_*/results.json | jq '.'
 |-------------------|-------------------|-------------------|
 | 6 ns (empty) | 5 μs | 83,000% |
 | 100 μs (typical) | 5 μs | 5% |
-| 1 ms (GPU kernel) | 5 μs | 0.5% |
+| 1 ms (slow) | 5 μs | 0.5% |
 
 ### 2. LTTng vs eBPF Trade-offs
 
@@ -298,7 +299,7 @@ cat benchmark_results_*/results.json | jq '.'
 
 For ROCm/HIP API tracing:
 - ✅ **HIP API calls**: 10-1000 μs → eBPF overhead <5%
-- ✅ **GPU kernel execution**: 1-1000 ms → eBPF overhead <0.1%
+- ✅ **Slow API calls**: 1-1000 ms → eBPF overhead <0.1%
 - ✅ **No app modification**: Uprobe attaches to running process
 - ✅ **Total overhead**: <1% for realistic workloads
 

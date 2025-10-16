@@ -36,7 +36,7 @@ The eBPF tracer (`mylib_tracer`) is a high-performance userspace function tracer
 │  │  └──────────────────┘    └──────────────────────┘   │  │
 │  │                                                        │  │
 │  │  ┌──────────────────────────────────────────────┐   │  │
-│  │  │          Ring Buffer (1 MB)                  │   │  │
+│  │  │          Ring Buffer (2 MB)                  │   │  │
 │  │  │  • High-throughput event queue               │   │  │
 │  │  │  • Lock-free kernel→user data transfer       │   │  │
 │  │  └──────────────────────────────────────────────┘   │  │
@@ -58,7 +58,7 @@ The BPF program contains kernel-side instrumentation code that will run when fun
 ```c
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1024 * 1024);  // 1 MB ring buffer
+    __uint(max_entries, 2 * 1024 * 1024);  // 2 MB ring buffer
 } events SEC(".maps");
 ```
 
@@ -534,8 +534,8 @@ if (!event) return 0;  // Ring buffer full, skip event
 // 3. Extract function arguments from saved registers
 event->arg1 = (s32)PT_REGS_PARM1(ctx);  // ctx->rdi
 event->arg2 = PT_REGS_PARM2(ctx);       // ctx->rsi
-event->arg3_ptr = PT_REGS_PARM3(ctx);   // ctx->rdx (pointer)
-event->arg5 = PT_REGS_PARM5(ctx);       // ctx->r8
+event->arg3 = PT_REGS_PARM3(ctx);       // ctx->rdx (double as u64)
+event->arg4 = PT_REGS_PARM4(ctx);       // ctx->rcx
 ```
 
 **How PT_REGS_PARM macros work (x86-64 calling convention):**
@@ -856,8 +856,8 @@ struct trace_event_entry {
     u64 timestamp;      // Nanosecond timestamp
     s32 arg1;          // int argument
     u64 arg2;          // uint64_t argument
-    u64 arg3_ptr;      // Pointer (not dereferenced for speed)
-    u64 arg5;          // void* argument
+    u64 arg3;          // double argument (as u64)
+    u64 arg4;          // void* argument
     u32 event_type;    // 0 = entry
 } __attribute__((packed));
 ```
@@ -873,7 +873,7 @@ struct trace_event_exit {
 #### Ring Buffer
 
 - **Type**: `BPF_MAP_TYPE_RINGBUF`
-- **Size**: 1 MB
+- **Size**: 2 MB (optimized for benchmarking high loads)
 - **Purpose**: Lock-free, high-throughput event queue from kernel to userspace
 - **Behavior**: FIFO queue with overwrite on full (configurable)
 
@@ -888,15 +888,15 @@ int my_traced_function_entry(struct pt_regs *ctx)
 1. Reserve space in ring buffer (`bpf_ringbuf_reserve()`)
 2. Capture timestamp (`bpf_ktime_get_ns()`)
 3. Extract function arguments from CPU registers:
-   - `arg1`: RDI (first argument)
-   - `arg2`: RSI (second argument)
-   - `arg3_ptr`: RDX (third argument, pointer only)
-   - `arg5`: R8 (fifth argument)
+   - `arg1`: RDI (first argument, int)
+   - `arg2`: RSI (second argument, uint64_t)
+   - `arg3`: RDX (third argument, double as u64)
+   - `arg4`: RCX (fourth argument, void*)
 4. Submit event to ring buffer (`bpf_ringbuf_submit()`)
 
 **Optimizations**:
 - Packed struct (32 bytes total)
-- No string dereferencing (store pointer only)
+- No string dereferencing (double stored as raw u64)
 - Minimal operations in hot path
 - Direct register access via `PT_REGS_PARM` macros
 
@@ -1126,7 +1126,7 @@ write_events_to_file(filename);
 
 ### 3. Ring Buffer Size Tuning
 
-- **1 MB ring buffer**: Handles bursts of up to ~30K events
+- **2 MB ring buffer**: Handles bursts of up to ~60K events
 - **1M event memory buffer**: Can store entire trace in RAM
 - **Overflow handling**: Drop events if buffer full (counted in `events_dropped`)
 
@@ -1219,7 +1219,7 @@ The overhead comes from:
 
 For GPU/HIP tracing:
 - **HIP API calls**: 10-1000 μs → 0.5-5% overhead
-- **GPU kernels**: 1-1000 ms → <0.1% overhead
+- **Slow API calls**: 1-1000 ms → <0.1% overhead
 - **Total application**: <1% overhead ✅
 
 ## Advantages

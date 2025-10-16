@@ -344,19 +344,25 @@ tracecompass /tmp/lttng_traces/my_session-*
 
 ### Overhead
 
-LTTng overhead is **~30-50 nanoseconds per tracepoint**:
+LTTng overhead varies significantly with function duration and system conditions:
 
-| Component | Time |
-|-----------|------|
-| Tracepoint macro overhead | ~10 ns |
-| Argument serialization | ~10-20 ns |
-| Ring buffer write | ~10-20 ns |
-| **Total per event** | **~30-50 ns** |
+| Scenario | Benchmark Results | Overhead Analysis |
+|----------|------------------|-------------------|
+| **Empty function** | ~563 ns per call | Measurable overhead for fast functions |
+| **100 μs function** | ~-1,295 ns per call | Within measurement noise (appears faster!) |
+| **Longer functions** | Near-zero overhead | Statistical noise dominates |
 
-**For our wrapper** (2 tracepoints: entry + exit):
-- Total overhead: ~60-100 ns per function call
+**Key Insights from Actual Benchmarks:**
+- **For fast functions**: LTTng shows measurable overhead (~500-600 ns)
+- **For typical functions**: Overhead is within measurement variation
+- **For slow functions**: LTTng overhead is negligible
 
-**Note**: This is **much faster than eBPF uprobes (~5 μs)** for simple functions!
+**Theoretical vs Actual Performance:**
+- **Theory**: ~30-50 ns per tracepoint (microbenchmarks)
+- **Reality**: Varies widely based on function duration and system state
+- **Practical**: Use benchmark results, not theoretical estimates
+
+**Note**: LTTng is significantly faster than eBPF uprobes (~5 μs) for all function durations.
 
 ### Memory Usage
 

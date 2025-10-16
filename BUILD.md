@@ -24,14 +24,18 @@ This will:
 build/
 ├── bin/
 │   ├── sample_app           # Sample application
-│   └── mylib_tracer        # eBPF tracer
-└── lib/
-    ├── libmylib.so*        # Sample library (symlinks)
-    ├── libmylib.so.1*
-    ├── libmylib.so.1.0
-    ├── libmylib_lttng.so*  # LTTng wrapper (symlinks)
-    ├── libmylib_lttng.so.1*
-    └── libmylib_lttng.so.1.0
+│   ├── mylib_tracer        # eBPF tracer
+│   └── lttng_ptrace_tracer # Additional LTTng tracer
+├── lib/
+│   ├── libmylib.so*        # Sample library (symlinks)
+│   ├── libmylib.so.1*
+│   ├── libmylib.so.1.0
+│   ├── libmylib_lttng.so*  # LTTng wrapper (symlinks)
+│   ├── libmylib_lttng.so.1*
+│   ├── libmylib_lttng.so.1.0
+│   └── libtp_inject.so     # Additional injection library
+├── mylib_tracer.bpf.o      # BPF object file
+└── mylib_tracer.skel.h     # BPF skeleton header
 ```
 
 ## Build Script Options
@@ -95,7 +99,7 @@ Options:
 
 ### Required
 
-- **CMake** >= 3.10
+- **CMake** >= 3.16
 - **GCC** or **Clang** (C compiler)
 - **GNU Make** or **Ninja**
 
@@ -197,12 +201,30 @@ The CMake project defines the following targets:
    - Depends on: `libbpf`, BPF skeleton generation
    - Requires: Clang, bpftool
 
+5. **`lttng_ptrace_tracer`**: Additional LTTng tracer
+   - Alternative LTTng-based tracer implementation
+   - Links to: LTTng UST libraries
+
+6. **`tpinject`**: Tracepoint injection library (`libtp_inject.so`)
+   - Dynamic tracepoint injection support
+   - Links to: LTTng UST libraries
+
 ### Custom Targets
 
-5. **`clean_all`**: Remove build directory
+7. **`clean-all`**: Remove build directory
    ```bash
-   cmake --build build --target clean_all
+   cmake --build build --target clean-all
    # Equivalent to: rm -rf build
+   ```
+
+8. **`test-baseline`**: Run baseline performance test
+   ```bash
+   cmake --build build --target test-baseline
+   ```
+
+9. **`help-build`**: Show available build targets
+   ```bash
+   cmake --build build --target help-build
    ```
 
 ## Build Process Details
@@ -431,8 +453,11 @@ cmake --build build-arm
 # Installs to /usr/local by default:
 # /usr/local/lib/libmylib.so*
 # /usr/local/lib/libmylib_lttng.so*
+# /usr/local/lib/libtp_inject.so
 # /usr/local/bin/sample_app
 # /usr/local/bin/mylib_tracer
+# /usr/local/bin/lttng_ptrace_tracer
+# /usr/local/share/doc/ (documentation files)
 ```
 
 ### Custom Install Prefix
@@ -453,8 +478,11 @@ CMake doesn't have built-in uninstall, but you can:
 # Option 1: Remove manually
 sudo rm /usr/local/lib/libmylib*
 sudo rm /usr/local/lib/libmylib_lttng*
+sudo rm /usr/local/lib/libtp_inject.so
 sudo rm /usr/local/bin/sample_app
 sudo rm /usr/local/bin/mylib_tracer
+sudo rm /usr/local/bin/lttng_ptrace_tracer
+sudo rm -rf /usr/local/share/doc/ebpf_vs_lttng/
 sudo ldconfig
 
 # Option 2: Use install manifest

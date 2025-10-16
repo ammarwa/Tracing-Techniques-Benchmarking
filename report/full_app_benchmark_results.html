@@ -1,0 +1,81 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Tracing Performance Analysis - hip-in-libraries 8 8 100000 100 Benchmark</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        h1 { color: #333; text-align: center; margin-bottom: 30px; }
+        h2 { color: #555; border-bottom: 2px solid #ddd; padding-bottom: 10px; }
+        .positive { color: #d32f2f; }
+        .negative { color: #388e3c; }
+        .zero { font-weight: bold; color: #333; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>API Tracing Performance Analysis</h1>
+        <h2>hip-in-libraries 8 8 100000 100 Benchmark Results (5 iterations)</h2>
+        <div id="executionTimes" style="width:100%;height:500px;"></div>
+        <div style="margin: 40px 0;"></div>
+        <div id="overheadChart" style="width:100%;height:500px;"></div>
+    </div>
+    <div class="container">
+        <h2>Performance Summary</h2>
+        <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+            <tr style="background-color: #f2f2f2; font-weight: bold;">
+                <th style="padding: 12px; text-align: left; border-bottom: 1px solid #ddd;">Method</th>
+                <th style="padding: 12px; text-align: left; border-bottom: 1px solid #ddd;">Time (s)</th>
+                <th style="padding: 12px; text-align: left; border-bottom: 1px solid #ddd;">Overhead %</th>
+            </tr>
+            <tr class="zero">
+                <td style="padding: 12px; border-bottom: 1px solid #ddd;">Baseline</td>
+                <td style="padding: 12px; border-bottom: 1px solid #ddd;">47.101245</td>
+                <td style="padding: 12px; border-bottom: 1px solid #ddd;">0.00</td>
+            </tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">eBPF-console</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">48.817780</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+3.64</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">rocprofv3-disabled-sdk-contexts</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">49.197027</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+4.45</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">rocprofv3-sdk-callback-overhead</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">49.201670</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+4.46</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">eBPF</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">49.330161</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+4.73</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">rocprofv3-execution-profile</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">49.707997</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+5.53</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">rocprofv3-sdk-buffer-overhead</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">50.501517</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+7.22</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">rocprofv3-tool-runtime-overhead</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">50.770031</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+7.79</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">Exatracer</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">51.955519</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+10.31</td></tr><tr class="positive"><td style="padding: 12px; border-bottom: 1px solid #ddd;">rocprofv3-normal</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">66.328320</td><td style="padding: 12px; border-bottom: 1px solid #ddd;">+40.82</td></tr>
+        </table>
+        <div style="margin: 20px 0; padding: 15px; background-color: #e8f5e8; border-radius: 5px;">
+            <strong>Best Performance:</strong> eBPF-console (48.817780s, +3.64% overhead)<br>
+            <strong>Worst Performance:</strong> rocprofv3-normal (66.328320s, +40.82% overhead)
+        </div>
+    </div>
+    <script>
+        var methods = ['rocprofv3-disabled-sdk-contexts', 'rocprofv3-sdk-buffer-overhead', 'rocprofv3-sdk-callback-overhead', 'rocprofv3-tool-runtime-overhead', 'rocprofv3-execution-profile', 'rocprofv3-normal', 'eBPF', 'eBPF-console', 'Exatracer'];
+        var times = [49.197027, 50.501517, 49.20167, 50.770031, 49.707997, 66.32832, 49.330161, 48.81778, 51.955519];
+        var overheads = [4.449525697250677, 7.2190703239373, 4.459383186155698, 7.789148673246332, 5.534359017473955, 40.820736267162374, 4.732180646180368, 3.644351651426624, 10.306041804202849];
+        var colors = [];
+        methods.forEach(function(method) {
+            if (method.startsWith('rocprofv3')) { colors.push('#2E8B57'); }
+            else if (method === 'eBPF' || method === 'eBPF-console') { colors.push('#4169E1'); }
+            else if (method === 'Exatracer') { colors.push('#DC143C'); }
+            else { colors.push('#999999'); }
+        });
+
+        Plotly.newPlot('executionTimes', [{
+            x: methods, y: times, type: 'bar',
+            marker: { color: colors, opacity: 0.8 },
+            text: times.map(t => t.toFixed(3) + 's'), textposition: 'outside'
+        }], {
+            title: 'Execution Times: hip-in-libraries 8 8 100000 100 Benchmark (5 iterations)',
+            yaxis: { title: 'Execution Time (seconds)' }, showlegend: false,
+            shapes: [{ type: 'line', x0: -0.5, x1: methods.length - 0.5, y0: 47.101245, y1: 47.101245,
+                     line: { color: 'red', width: 3, dash: 'dash' } }]
+        });
+
+        Plotly.newPlot('overheadChart', [{
+            x: methods, y: overheads, type: 'bar',
+            marker: { color: overheads.map(o => o >= 0 ? '#d32f2f' : '#388e3c'), opacity: 0.8 },
+            text: overheads.map(o => (o >= 0 ? '+' : '') + o.toFixed(2) + '%'), textposition: 'outside'
+        }], {
+            title: 'Overhead vs Baseline: hip-in-libraries 8 8 100000 100 Benchmark (5 iterations)',
+            yaxis: { title: 'Overhead Percentage (%)' }, showlegend: false,
+            shapes: [{ type: 'line', x0: -0.5, x1: methods.length - 0.5, y0: 0, y1: 0,
+                     line: { color: 'red', width: 3, dash: 'dash' } }]
+        });
+    </script>
+</body>
+</html>
