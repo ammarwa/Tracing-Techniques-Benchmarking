@@ -489,6 +489,9 @@ class BenchmarkSuite:
 
     def run_bpftime_single(self, scenario: BenchmarkScenario, run_num: int = 0) -> BenchmarkResult:
         """Run a single bpftime (userspace eBPF) tracing test"""
+        # Clean stale bpftime shared memory from previous runs
+        self.run_command("sudo rm -f /dev/shm/bpftime* 2>/dev/null || true")
+
         lib_path = str(self.build_dir / 'lib' / 'libmylib.so')
 
         # Start bpftime tracer with LD_PRELOAD for the syscall server

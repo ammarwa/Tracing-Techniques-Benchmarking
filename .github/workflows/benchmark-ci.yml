@@ -60,8 +60,14 @@ jobs:
           git submodule update --init --recursive
           cmake -Bbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBPFTIME_LLVM_JIT=OFF \
-            -DBUILD_BPFTIME_DAEMON=1
-          cmake --build build --config RelWithDebInfo --target install -j$(nproc)
+            -DBUILD_BPFTIME_DAEMON=0
+          # Build only the runtime libraries we need (full build has unrelated linker issues)
+          cmake --build build --target bpftime-agent -j$(nproc)
+          cmake --build build --target bpftime-syscall-server -j$(nproc)
+          # Install manually
+          mkdir -p "$HOME/.bpftime"
+          cp build/runtime/agent/libbpftime-agent.so "$HOME/.bpftime/"
+          cp build/runtime/syscall-server/libbpftime-syscall-server.so "$HOME/.bpftime/"
           echo "bpftime installed to $HOME/.bpftime"
           ls -la "$HOME/.bpftime/"
 
