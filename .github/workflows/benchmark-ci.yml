@@ -39,22 +39,36 @@ jobs:
             liblttng-ust-dev \
             babeltrace2 \
             python3 \
-            python3-pip
+            python3-pip \
+            libboost-dev \
+            libyaml-cpp-dev
 
-          # Install bpftool - try kernel-specific package first, fall back to generic
+          # Install bpftool - Azure runners use custom kernels, need matching tools
           KERN_VER=$(uname -r)
           sudo apt-get install -y "linux-tools-${KERN_VER}" 2>/dev/null || \
+            sudo apt-get install -y linux-tools-azure 2>/dev/null || \
             sudo apt-get install -y linux-tools-generic 2>/dev/null || \
-            echo "Warning: bpftool not available for kernel ${KERN_VER} - eBPF tracer will be skipped"
+            echo "Warning: bpftool not available for kernel ${KERN_VER}"
 
           # Install Python dependencies
           pip3 install plotly pandas numpy
+
+      - name: Install bpftime
+        run: |
+          git clone --depth 1 https://github.com/eunomia-bpf/bpftime.git /tmp/bpftime
+          cd /tmp/bpftime
+          git submodule update --init --recursive
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBPFTIME_LLVM_JIT=OFF \
+            -DBUILD_BPFTIME_DAEMON=1
+          cmake --build build --config RelWithDebInfo --target install -j$(nproc)
+          echo "bpftime installed to $HOME/.bpftime"
+          ls -la "$HOME/.bpftime/"
 
       - name: Build project
         run: |
           export CC=clang-14
           # Skip eBPF if bpftool is not functional for this kernel
-          # On Azure runners, bpftool exists but fails for mismatched kernel versions
           if ! bpftool version &> /dev/null; then
             echo "bpftool not functional - building without eBPF and bpftime tracers"
             ./build.sh -c --no-ebpf --no-bpftime
