@@ -6,7 +6,7 @@ Tests multiple scenarios with different function durations to demonstrate
 how uprobe overhead scales with realistic function execution times.
 
 Generates an HTML report with detailed analysis and visualizations:
-- Interactive charts with consistent color coding (Gray=Baseline, Orange=LTTng, Blue=eBPF)
+- Interactive charts with consistent color coding (Gray=Baseline, Orange=LTTng, Blue=eBPF, Green=bpftime)
 - Overhead percentage comparison
 - Absolute timing comparison (grouped bars)
 - Memory usage comparison
@@ -38,7 +38,7 @@ class BenchmarkScenario:
 class BenchmarkResult:
     """Results from a single benchmark run with statistical measures"""
     scenario: str
-    method: str  # 'baseline', 'lttng', or 'ebpf'
+    method: str  # 'baseline', 'lttng', 'ebpf', or 'bpftime'
     iterations: int
     simulated_work_us: int
     wall_time_s: float
@@ -117,6 +117,42 @@ class BenchmarkSuite:
                 raise ValueError("No valid scenarios selected")
         else:
             self.scenarios = self.ALL_SCENARIOS.copy()
+
+        # Detect bpftime availability
+        self.bpftime_available = False
+        self.bpftime_agent_lib = None
+        self.bpftime_server_lib = None
+
+        bpftime_tracer = self.build_dir / 'bin' / 'bpftime_tracer'
+        if bpftime_tracer.exists():
+            # Search for bpftime shared libraries
+            search_dirs = [
+                Path.home() / '.bpftime',
+                Path('/usr/local/lib'),
+                Path('/usr/lib'),
+            ]
+            for search_dir in search_dirs:
+                if not search_dir.exists():
+                    continue
+                for lib_file in search_dir.glob('libbpftime-agent*.so'):
+                    if self.bpftime_agent_lib is None:
+                        self.bpftime_agent_lib = str(lib_file)
+                for lib_file in search_dir.glob('libbpftime-syscall-server*.so'):
+                    if self.bpftime_server_lib is None:
+                        self.bpftime_server_lib = str(lib_file)
+
+            if self.bpftime_agent_lib and self.bpftime_server_lib:
+                self.bpftime_available = True
+                print(f"  bpftime detected:")
+                print(f"    Tracer: {bpftime_tracer}")
+                print(f"    Agent lib: {self.bpftime_agent_lib}")
+                print(f"    Server lib: {self.bpftime_server_lib}")
+            else:
+                print(f"  bpftime tracer found but libraries missing:")
+                print(f"    Agent lib: {self.bpftime_agent_lib or 'NOT FOUND'}")
+                print(f"    Server lib: {self.bpftime_server_lib or 'NOT FOUND'}")
+        else:
+            print(f"  bpftime tracer not found at {bpftime_tracer} - skipping bpftime benchmarks")
 
     def run_command(self, cmd: str, env: Optional[Dict[str, str]] = None,
                     capture_output: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -444,6 +480,129 @@ class BenchmarkSuite:
         print(f"    Completed {self.num_runs} runs                    ")
         return self.aggregate_multiple_runs(results)
 
+    def run_bpftime_single(self, scenario: BenchmarkScenario, run_num: int = 0) -> BenchmarkResult:
+        """Run a single bpftime (userspace eBPF) tracing test"""
+        lib_path = str(self.build_dir / 'lib' / 'libmylib.so')
+
+        # Start bpftime tracer with LD_PRELOAD for the syscall server
+        tracer_env = os.environ.copy()
+        tracer_env['LD_PRELOAD'] = self.bpftime_server_lib
+        tracer_cmd = f"{self.build_dir}/bin/bpftime_tracer -l {lib_path}"
+        tracer_proc = subprocess.Popen(
+            tracer_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=tracer_env
+        )
+
+        # Wait for tracer to initialize
+        time.sleep(2)
+
+        # Get tracer PID
+        tracer_pid = None
+        try:
+            result = self.run_command("pgrep -f bpftime_tracer | tail -1")
+            if result.stdout.strip():
+                tracer_pid = int(result.stdout.strip())
+        except:
+            pass
+
+        # Monitor tracer resources before
+        tracer_mem_before = 0
+        tracer_cpu_before = (0, 0)
+        if tracer_pid:
+            try:
+                mem_result = self.run_command(f"grep VmRSS /proc/{tracer_pid}/status")
+                mem_match = re.search(r'VmRSS:\s+(\d+)', mem_result.stdout)
+                if mem_match:
+                    tracer_mem_before = int(mem_match.group(1))
+
+                cpu_result = self.run_command(f"awk '{{print $14\" \"$15}}' /proc/{tracer_pid}/stat")
+                cpu_vals = cpu_result.stdout.strip().split()
+                if len(cpu_vals) == 2:
+                    tracer_cpu_before = (int(cpu_vals[0]), int(cpu_vals[1]))
+            except:
+                pass
+
+        # Run application with bpftime agent LD_PRELOAD
+        env = {'LD_PRELOAD': self.bpftime_agent_lib}
+        if scenario.simulated_work_us > 0:
+            env['SIMULATED_WORK_US'] = str(scenario.simulated_work_us)
+
+        cmd = f'/usr/bin/time -f "wall_time=%e user_time=%U sys_time=%S max_rss=%M" ' \
+              f'{self.build_dir}/bin/sample_app {scenario.iterations}'
+
+        app_start = time.time()
+        result = self.run_command(cmd, env=env)
+        app_elapsed = time.time() - app_start
+
+        time_data = self.parse_time_output(result.stderr)
+        app_data = self.parse_app_output(result.stdout)
+
+        # Monitor tracer resources after
+        tracer_mem_after = tracer_mem_before
+        tracer_cpu_percent = 0
+        if tracer_pid:
+            try:
+                mem_result = self.run_command(f"grep VmRSS /proc/{tracer_pid}/status")
+                mem_match = re.search(r'VmRSS:\s+(\d+)', mem_result.stdout)
+                if mem_match:
+                    tracer_mem_after = int(mem_match.group(1))
+
+                cpu_result = self.run_command(f"awk '{{print $14\" \"$15}}' /proc/{tracer_pid}/stat")
+                cpu_vals = cpu_result.stdout.strip().split()
+                if len(cpu_vals) == 2:
+                    tracer_cpu_after = (int(cpu_vals[0]), int(cpu_vals[1]))
+                    cpu_ticks = (tracer_cpu_after[0] - tracer_cpu_before[0]) + \
+                                (tracer_cpu_after[1] - tracer_cpu_before[1])
+                    ticks_per_sec = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+                    cpu_time = cpu_ticks / ticks_per_sec
+                    tracer_cpu_percent = (cpu_time / app_elapsed) * 100 if app_elapsed > 0 else 0
+            except:
+                pass
+
+        # Stop tracer (no sudo needed for bpftime)
+        time.sleep(1)
+        self.run_command(f"kill -INT {tracer_pid} 2>/dev/null || true")
+        try:
+            tracer_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.run_command(f"kill -9 {tracer_pid} 2>/dev/null || true")
+
+        trace_size = 0
+        events_captured = scenario.iterations * 2  # entry + exit per call (estimated)
+
+        return BenchmarkResult(
+            scenario=scenario.name,
+            method='bpftime',
+            iterations=scenario.iterations,
+            simulated_work_us=scenario.simulated_work_us,
+            wall_time_s=time_data.get('wall_time', 0),
+            user_cpu_s=time_data.get('user_time', 0),
+            system_cpu_s=time_data.get('sys_time', 0),
+            max_rss_kb=int(time_data.get('max_rss', 0)),
+            avg_time_per_call_ns=app_data.get('avg_time_ns', 0),
+            trace_size_mb=trace_size / (1024 * 1024),
+            tracer_cpu_percent=tracer_cpu_percent,
+            tracer_memory_kb=tracer_mem_after,
+            events_captured=events_captured
+        )
+
+    def run_bpftime(self, scenario: BenchmarkScenario) -> BenchmarkResult:
+        """Run bpftime (userspace eBPF) tracing test multiple times for statistical reliability"""
+        print(f"\n  [BPFTIME] {scenario.name} - Running {self.num_runs} times for statistical reliability")
+
+        results = []
+        for run_num in range(self.num_runs):
+            if run_num % 10 == 0:
+                print(f"    Run {run_num + 1}/{self.num_runs}...", end='\r')
+            results.append(self.run_bpftime_single(scenario, run_num))
+
+        print(f"    Completed {self.num_runs} runs                    ")
+        return self.aggregate_multiple_runs(results)
+
     def run_all_scenarios(self):
         """Execute all benchmark scenarios"""
         print("\n" + "="*70)
@@ -476,6 +635,13 @@ class BenchmarkSuite:
                 self.results.append(ebpf)
             except Exception as e:
                 print(f"  ERROR in eBPF: {e}")
+
+            if self.bpftime_available:
+                try:
+                    bpftime_result = self.run_bpftime(scenario)
+                    self.results.append(bpftime_result)
+                except Exception as e:
+                    print(f"  ERROR in bpftime: {e}")
 
         # Save results to JSON
         results_file = self.output_dir / "results.json"
@@ -607,6 +773,14 @@ class BenchmarkSuite:
                     row['ebpf_wall_s'] = ebpf_wall_s
                     row['ebpf_app_overhead_pct'] = ((ebpf_wall_s / baseline_wall_s) - 1) * 100 if baseline_wall_s > 0 else 0
 
+                if 'bpftime' in methods:
+                    bpftime_ns = methods['bpftime'].avg_time_per_call_ns
+                    bpftime_wall_s = methods['bpftime'].wall_time_s
+                    row['bpftime_overhead_ns'] = bpftime_ns - baseline_ns
+                    row['bpftime_overhead_pct'] = ((bpftime_ns / baseline_ns) - 1) * 100 if baseline_ns > 0 else 0
+                    row['bpftime_wall_s'] = bpftime_wall_s
+                    row['bpftime_app_overhead_pct'] = ((bpftime_wall_s / baseline_wall_s) - 1) * 100 if baseline_wall_s > 0 else 0
+
                 overhead_data.append(row)
 
         # Prepare chart data as JSON strings (to be embedded in JavaScript)
@@ -631,12 +805,18 @@ class BenchmarkSuite:
         js_lttng_app_overhead_pct = json.dumps([d.get('lttng_app_overhead_pct', 0) for d in overhead_data])
         js_ebpf_app_overhead_pct = json.dumps([d.get('ebpf_app_overhead_pct', 0) for d in overhead_data])
 
+        js_bpftime_overhead_pct = json.dumps([d.get('bpftime_overhead_pct', 0) for d in overhead_data])
+        js_bpftime_total_ns = json.dumps([d['baseline_ns'] + d.get('bpftime_overhead_ns', 0) for d in overhead_data])
+        js_memory_bpftime = json.dumps([scenarios_data[d['scenario']]['bpftime'].max_rss_kb if 'bpftime' in scenarios_data[d['scenario']] else 0 for d in overhead_data])
+        js_bpftime_wall_s = json.dumps([d.get('bpftime_wall_s', 0) for d in overhead_data])
+        js_bpftime_app_overhead_pct = json.dumps([d.get('bpftime_app_overhead_pct', 0) for d in overhead_data])
+
         # Generate HTML
         html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>eBPF vs LTTng Comprehensive Benchmark Report</title>
+    <title>eBPF vs bpftime vs LTTng Comprehensive Benchmark Report</title>
     <script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
     <style>
         body {{
@@ -730,7 +910,7 @@ class BenchmarkSuite:
 </head>
 <body>
     <div class="container">
-        <h1>📊 eBPF vs LTTng Comprehensive Benchmark Report</h1>
+        <h1>📊 eBPF vs bpftime vs LTTng Comprehensive Benchmark Report</h1>
 
         <div class="metadata">
             <strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>
@@ -759,7 +939,9 @@ class BenchmarkSuite:
                 <li>Typically much lower than per-call overhead averages</li>
             </ul>
 
-            <p><strong>Conclusion:</strong> eBPF is perfect for GPU tracing where HIP API calls typically take 10-1000 μs! The whole application overhead is typically &lt;5% for realistic workloads.</p>
+            <p><strong>bpftime (Userspace eBPF):</strong> bpftime runs eBPF programs in userspace, avoiding kernel context switches. This can significantly reduce per-call overhead compared to kernel eBPF uprobes, especially for high-frequency function calls.</p>
+
+            <p><strong>Conclusion:</strong> eBPF and bpftime are both excellent for GPU tracing where HIP API calls typically take 10-1000 μs! The whole application overhead is typically &lt;5% for realistic workloads. bpftime may offer even lower overhead by staying in userspace.</p>
         </div>
 
         <h2>📈 Per-Call Overhead by Function Duration</h2>
@@ -806,12 +988,21 @@ class BenchmarkSuite:
 
             baseline_ns = baseline.avg_time_per_call_ns
 
+            # Calculate rowspan: baseline + available methods
+            num_methods = 1  # baseline always present
+            if 'lttng' in methods:
+                num_methods += 1
+            if 'ebpf' in methods:
+                num_methods += 1
+            if 'bpftime' in methods:
+                num_methods += 1
+
             # Baseline row
             ci_baseline = f"±{baseline.confidence_95_margin:.2f}" if baseline.confidence_95_margin else "-"
             html += f"""
                 <tr>
-                    <td rowspan="3" style="vertical-align: middle;"><strong>{scenario_name}</strong></td>
-                    <td rowspan="3" style="vertical-align: middle;">{baseline.simulated_work_us}</td>
+                    <td rowspan="{num_methods}" style="vertical-align: middle;"><strong>{scenario_name}</strong></td>
+                    <td rowspan="{num_methods}" style="vertical-align: middle;">{baseline.simulated_work_us}</td>
                     <td><strong>Baseline</strong></td>
                     <td>{baseline.wall_time_s:.3f}</td>
                     <td class="good">0%</td>
@@ -865,6 +1056,27 @@ class BenchmarkSuite:
                 </tr>
 """
 
+            # bpftime row
+            if 'bpftime' in methods:
+                bpftime = methods['bpftime']
+                ci_bpftime = f"±{bpftime.confidence_95_margin:.2f}" if bpftime.confidence_95_margin else "-"
+                overhead_pct = ((bpftime.avg_time_per_call_ns / baseline_ns) - 1) * 100 if baseline_ns > 0 else 0
+                overhead_class = 'good' if overhead_pct < 10 else ('warning' if overhead_pct < 50 else 'bad')
+                app_overhead_pct = ((bpftime.wall_time_s / baseline.wall_time_s) - 1) * 100 if baseline.wall_time_s > 0 else 0
+                app_overhead_class = 'good' if app_overhead_pct < 10 else ('warning' if app_overhead_pct < 50 else 'bad')
+                html += f"""
+                <tr>
+                    <td>bpftime</td>
+                    <td>{bpftime.wall_time_s:.3f}</td>
+                    <td class="{app_overhead_class}">{app_overhead_pct:.1f}%</td>
+                    <td>{bpftime.avg_time_per_call_ns:.2f}</td>
+                    <td><small>{ci_bpftime}</small></td>
+                    <td class="{overhead_class}">{overhead_pct:.1f}%</td>
+                    <td>{bpftime.user_cpu_s + bpftime.system_cpu_s:.3f}</td>
+                    <td>{bpftime.max_rss_kb:,} (app)</td>
+                </tr>
+"""
+
         html += f"""
                 </tbody>
             </table>
@@ -914,6 +1126,21 @@ class BenchmarkSuite:
                         • Need real-time streaming
                     </td>
                 </tr>
+                <tr>
+                    <td><strong>bpftime</strong></td>
+                    <td>
+                        • Functions > 1μs<br>
+                        • Want lower overhead than kernel eBPF<br>
+                        • No root/sudo required<br>
+                        • Userspace-only tracing sufficient<br>
+                        • High-frequency call tracing
+                    </td>
+                    <td>
+                        • Need kernel-level visibility<br>
+                        • Need to trace syscalls or kernel functions<br>
+                        • Application cannot use LD_PRELOAD
+                    </td>
+                </tr>
             </tbody>
         </table>
 
@@ -954,11 +1181,18 @@ class BenchmarkSuite:
         const lttng_app_overhead_pct = {js_lttng_app_overhead_pct};
         const ebpf_app_overhead_pct = {js_ebpf_app_overhead_pct};
 
-        // Color scheme: LTTng = orange, eBPF = blue, Baseline = gray
+        const bpftime_overhead_pct = {js_bpftime_overhead_pct};
+        const bpftime_total_ns = {js_bpftime_total_ns};
+        const memory_bpftime = {js_memory_bpftime};
+        const bpftime_wall_s = {js_bpftime_wall_s};
+        const bpftime_app_overhead_pct = {js_bpftime_app_overhead_pct};
+
+        // Color scheme: LTTng = orange, eBPF = blue, bpftime = green, Baseline = gray
         const colors = {{
             baseline: '#7f8c8d',
             lttng: '#e67e22',
-            ebpf: '#3498db'
+            ebpf: '#3498db',
+            bpftime: '#2ecc71'
         }};
 
         // Overhead percentage chart
@@ -980,6 +1214,15 @@ class BenchmarkSuite:
                 mode: 'lines+markers',
                 marker: {{ size: 10, color: colors.ebpf }},
                 line: {{ width: 3, color: colors.ebpf }}
+            }},
+            {{
+                x: work_us_data,
+                y: bpftime_overhead_pct,
+                name: 'bpftime',
+                type: 'scatter',
+                mode: 'lines+markers',
+                marker: {{ size: 10, color: colors.bpftime }},
+                line: {{ width: 3, color: colors.bpftime }}
             }}
         ];
 
@@ -1018,6 +1261,15 @@ class BenchmarkSuite:
                 mode: 'lines+markers',
                 marker: {{ size: 10, color: colors.ebpf }},
                 line: {{ width: 3, color: colors.ebpf }}
+            }},
+            {{
+                x: work_us_data,
+                y: bpftime_app_overhead_pct,
+                name: 'bpftime',
+                type: 'scatter',
+                mode: 'lines+markers',
+                marker: {{ size: 10, color: colors.bpftime }},
+                line: {{ width: 3, color: colors.bpftime }}
             }}
         ];
 
@@ -1059,6 +1311,13 @@ class BenchmarkSuite:
                 name: 'eBPF',
                 type: 'bar',
                 marker: {{ color: colors.ebpf }}
+            }},
+            {{
+                x: scenario_names,
+                y: bpftime_wall_s,
+                name: 'bpftime',
+                type: 'bar',
+                marker: {{ color: colors.bpftime }}
             }}
         ];
 
@@ -1097,6 +1356,13 @@ class BenchmarkSuite:
                 name: 'eBPF',
                 type: 'bar',
                 marker: {{ color: colors.ebpf }}
+            }},
+            {{
+                x: scenario_names,
+                y: bpftime_total_ns,
+                name: 'bpftime',
+                type: 'bar',
+                marker: {{ color: colors.bpftime }}
             }}
         ];
 
@@ -1135,6 +1401,13 @@ class BenchmarkSuite:
                 name: 'eBPF',
                 type: 'bar',
                 marker: {{ color: colors.ebpf }}
+            }},
+            {{
+                x: scenario_names,
+                y: memory_bpftime,
+                name: 'bpftime',
+                type: 'bar',
+                marker: {{ color: colors.bpftime }}
             }}
         ];
 
@@ -1248,9 +1521,7 @@ to minimize disk usage. Only the final aggregated results are kept.
     # Check for required binaries
     required_files = [
         build_dir / 'bin' / 'sample_app',
-        build_dir / 'bin' / 'mylib_tracer',
         build_dir / 'lib' / 'libmylib.so',
-        build_dir / 'lib' / 'libmylib_lttng.so'
     ]
 
     for f in required_files:
@@ -1258,6 +1529,17 @@ to minimize disk usage. Only the final aggregated results are kept.
             print(f"Error: Required file not found: {f}")
             print("Please build the project first: ./build.sh -c")
             sys.exit(1)
+
+    # Warn about optional tracer binaries
+    optional_files = [
+        (build_dir / 'bin' / 'mylib_tracer', 'eBPF tracer'),
+        (build_dir / 'lib' / 'libmylib_lttng.so', 'LTTng tracepoint library'),
+        (build_dir / 'bin' / 'bpftime_tracer', 'bpftime tracer'),
+    ]
+
+    for f, desc in optional_files:
+        if not f.exists():
+            print(f"Warning: {desc} not found: {f} - corresponding benchmarks will be skipped")
 
     # Validate scenario indices
     if args.scenarios:
@@ -1295,7 +1577,11 @@ to minimize disk usage. Only the final aggregated results are kept.
             print(f"    [{idx}] {BenchmarkSuite.ALL_SCENARIOS[idx].name} ({BenchmarkSuite.ALL_SCENARIOS[idx].simulated_work_us} μs)")
     else:
         print(f"  Scenarios: All ({num_scenarios} scenarios)")
-    print(f"  Total tests: {args.runs * num_scenarios * 3} ({num_scenarios} scenarios × 3 methods × {args.runs} runs)")
+    num_methods = 3  # baseline, lttng, ebpf
+    bpftime_tracer_path = build_dir / 'bin' / 'bpftime_tracer'
+    if bpftime_tracer_path.exists():
+        num_methods = 4  # + bpftime (approximate; actual availability checked in BenchmarkSuite.__init__)
+    print(f"  Total tests: ~{args.runs * num_scenarios * num_methods} ({num_scenarios} scenarios x ~{num_methods} methods x {args.runs} runs)")
     print(f"  Estimated time: ~{args.runs * num_scenarios * 0.07:.0f}-{args.runs * num_scenarios * 0.1:.0f} minutes")
     print(f"{'='*70}\n")
 

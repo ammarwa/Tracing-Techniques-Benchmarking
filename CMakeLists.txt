@@ -8,6 +8,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Options
 option(BUILD_LTTNG "Build LTTng tracer" ON)
 option(BUILD_EBPF "Build eBPF tracer" ON)
+option(BUILD_BPFTIME "Build bpftime userspace tracer" ON)
 
 # Output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -250,6 +251,54 @@ else()
 endif()
 
 # ============================================================================
+# 5. bpftime Userspace Tracer (Optional - requires eBPF tracer + bpftime)
+# ============================================================================
+if(BUILD_BPFTIME AND BUILD_EBPF AND TARGET mylib_tracer)
+    message("${Green}[5/5] Building bpftime Userspace Tracer...${ColorReset}")
+
+    # Find bpftime runtime libraries
+    find_library(BPFTIME_AGENT_LIB bpftime-agent
+        PATHS $ENV{HOME}/.bpftime /usr/local/lib /usr/lib
+    )
+    find_library(BPFTIME_SYSCALL_SERVER_LIB bpftime-syscall-server
+        PATHS $ENV{HOME}/.bpftime /usr/local/lib /usr/lib
+    )
+
+    if(BPFTIME_AGENT_LIB AND BPFTIME_SYSCALL_SERVER_LIB)
+        # bpftime tracer reuses the same BPF skeleton from the eBPF tracer
+        add_executable(bpftime_tracer
+            src/tools/bpftime_tracer/bpftime_tracer.c
+            ${BPF_SKEL}
+        )
+
+        target_include_directories(bpftime_tracer PRIVATE
+            ${CMAKE_BINARY_DIR}
+            /usr/include/bpf
+        )
+
+        target_link_libraries(bpftime_tracer PRIVATE
+            ${LIBBPF_LDFLAGS}
+            ${LIBBPF_LIBRARY}
+            ${LIBELF_LIBRARY}
+            ${ZLIB_LIBRARY}
+        )
+
+        target_compile_options(bpftime_tracer PRIVATE -O2)
+
+        message("${Green}  ✓ bpftime_tracer${ColorReset}")
+        message("${Green}    Agent lib: ${BPFTIME_AGENT_LIB}${ColorReset}")
+        message("${Green}    Server lib: ${BPFTIME_SYSCALL_SERVER_LIB}${ColorReset}")
+    else()
+        message("${Yellow}  ⚠ bpftime not found. Install from: https://github.com/eunomia-bpf/bpftime${ColorReset}")
+        message("${Yellow}  ⚠ Skipping bpftime tracer build${ColorReset}")
+    endif()
+elseif(BUILD_BPFTIME AND NOT BUILD_EBPF)
+    message("${Yellow}  ⚠ bpftime tracer requires eBPF tracer (needs BPF skeleton). Enable BUILD_EBPF.${ColorReset}")
+elseif(NOT BUILD_BPFTIME)
+    message("${Yellow}  ⊘ bpftime tracer build disabled${ColorReset}")
+endif()
+
+# ============================================================================
 # Installation
 # ============================================================================
 install(TARGETS mylib
@@ -269,6 +318,12 @@ endif()
 
 if(TARGET mylib_tracer)
     install(TARGETS mylib_tracer
+        RUNTIME DESTINATION bin
+    )
+endif()
+
+if(TARGET bpftime_tracer)
+    install(TARGETS bpftime_tracer
         RUNTIME DESTINATION bin
     )
 endif()
@@ -328,6 +383,12 @@ else()
     message("  ${Yellow}⊘ eBPF Tracer (not built)${ColorReset}")
 endif()
 
+if(TARGET bpftime_tracer)
+    message("  ✓ bpftime Tracer")
+else()
+    message("  ${Yellow}⊘ bpftime Tracer (not built)${ColorReset}")
+endif()
+
 message("${Cyan}========================================${ColorReset}")
 message("")
 message("${Green}Build commands:${ColorReset}")
@@ -370,6 +431,7 @@ add_custom_target(help-build
     COMMAND ${CMAKE_COMMAND} -E echo "  sample_app    - Build sample application only"
     COMMAND ${CMAKE_COMMAND} -E echo "  mylib_lttng   - Build LTTng tracer only"
     COMMAND ${CMAKE_COMMAND} -E echo "  mylib_tracer  - Build eBPF tracer only"
+    COMMAND ${CMAKE_COMMAND} -E echo "  bpftime_tracer - Build bpftime userspace tracer only"
     COMMAND ${CMAKE_COMMAND} -E echo "  clean-all     - Clean all build artifacts"
     COMMAND ${CMAKE_COMMAND} -E echo "  test-baseline - Run baseline test"
     COMMAND ${CMAKE_COMMAND} -E echo "  install       - Install all components"

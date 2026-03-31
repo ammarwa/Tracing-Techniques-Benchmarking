@@ -57,6 +57,7 @@ Options:
     --build-dir DIR     Specify build directory (default: build)
     --no-lttng          Skip LTTng tracer build
     --no-ebpf           Skip eBPF tracer build
+    --no-bpftime        Skip bpftime tracer build
 
 Examples:
     $0                  # Build in Release mode
@@ -109,6 +110,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-ebpf)
             CMAKE_OPTS="$CMAKE_OPTS -DBUILD_EBPF=OFF"
+            shift
+            ;;
+        --no-bpftime)
+            CMAKE_OPTS="$CMAKE_OPTS -DBUILD_BPFTIME=OFF"
             shift
             ;;
         *)
@@ -234,6 +239,12 @@ if [ -f "$BUILD_DIR/bin/mylib_tracer" ]; then
     print_success "mylib_tracer"
 else
     print_warning "mylib_tracer not built (eBPF tools not available or disabled)"
+fi
+
+if [ -f "$BUILD_DIR/bin/bpftime_tracer" ]; then
+    print_success "bpftime_tracer"
+else
+    print_warning "bpftime_tracer not built (bpftime not available or disabled)"
 fi
 
 echo ""
