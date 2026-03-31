@@ -1,0 +1,29 @@
+# Dockerfile for bpftime benchmark environment
+# Uses LLVM 16 (required - LLVM 17 has symbol resolution bug with bpftime JIT)
+#
+# Build:  docker build -t bpftime-bench -f Dockerfile.bpftime .
+# Run:    docker run --rm --privileged -v $(pwd):/workspace bpftime-bench
+FROM ghcr.io/eunomia-bpf/bpftime:latest
+
+# Install LLVM 16 (bpftime JIT crashes with LLVM 17 - github.com/eunomia-bpf/bpftime/issues/424)
+RUN apt-get update && apt-get install -y \
+    cmake build-essential clang llvm \
+    libbpf-dev libelf-dev zlib1g-dev \
+    llvm-16-dev \
+    time \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rebuild bpftime with LLVM 16 JIT
+WORKDIR /bpftime
+RUN rm -rf build && \
+    cmake -Bbuild \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DBPFTIME_LLVM_JIT=ON \
+      -DBUILD_BPFTIME_DAEMON=1 \
+      -DLLVM_DIR=/usr/lib/llvm-16/cmake && \
+    cmake --build build --parallel $(nproc) --target all install
+
+# Set up PATH
+ENV PATH="/root/.bpftime:${PATH}"
+
+WORKDIR /workspace
