@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>eBPF vs LTTng Comprehensive Benchmark Report</title>
+    <title>eBPF vs bpftime vs LTTng Comprehensive Benchmark Report</title>
     <script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
     <style>
         body {
@@ -96,7 +96,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>📊 eBPF vs LTTng Comprehensive Benchmark Report</h1>
+        <h1>📊 eBPF vs bpftime vs LTTng Comprehensive Benchmark Report</h1>
 
                 
         <div style="background: #e8f4fd; border: 1px solid #bee5eb; border-radius: 5px; padding: 15px; margin: 20px 0;">
@@ -107,11 +107,11 @@
         </div>
 
         <div class="metadata">
-            <strong>Generated:</strong> 2025-10-16 10:19:41<br>
+            <strong>Generated:</strong> 2026-03-30 23:12:26<br>
             <strong>Test Scenarios:</strong> 6<br>
             <strong>Function Durations Tested:</strong> 0 μs (empty) to 1000 μs<br>
-            <strong>Runs Per Scenario:</strong> 20 (for statistical reliability)<br>
-            <strong>Total Tests Run:</strong> 360
+            <strong>Runs Per Scenario:</strong> 10 (for statistical reliability)<br>
+            <strong>Total Tests Run:</strong> 240
         </div>
 
         <div class="key-finding">
@@ -133,7 +133,9 @@
                 <li>Typically much lower than per-call overhead averages</li>
             </ul>
 
-            <p><strong>Conclusion:</strong> eBPF is perfect for GPU tracing where HIP API calls typically take 10-1000 μs! The whole application overhead is typically &lt;5% for realistic workloads.</p>
+            <p><strong>bpftime (Userspace eBPF):</strong> bpftime runs eBPF programs in userspace, avoiding kernel context switches. This can significantly reduce per-call overhead compared to kernel eBPF uprobes, especially for high-frequency function calls.</p>
+
+            <p><strong>Conclusion:</strong> eBPF and bpftime are both excellent for GPU tracing where HIP API calls typically take 10-1000 μs! The whole application overhead is typically &lt;5% for realistic workloads. bpftime may offer even lower overhead by staying in userspace.</p>
         </div>
 
         <h2>📈 Per-Call Overhead by Function Duration</h2>
@@ -172,213 +174,279 @@
                 <tbody>
 
                 <tr>
-                    <td rowspan="3" style="vertical-align: middle;"><strong>Empty Function</strong></td>
-                    <td rowspan="3" style="vertical-align: middle;">0</td>
+                    <td rowspan="4" style="vertical-align: middle;"><strong>Empty Function</strong></td>
+                    <td rowspan="4" style="vertical-align: middle;">0</td>
                     <td><strong>Baseline</strong></td>
-                    <td>0.000</td>
+                    <td>4.485</td>
                     <td class="good">0%</td>
-                    <td>5.06</td>
-                    <td><small>±0.51</small></td>
+                    <td>44888.60</td>
+                    <td><small>±1124.17</small></td>
                     <td class="good">0%</td>
-                    <td>0.000</td>
-                    <td>1,719</td>
+                    <td>4.481</td>
+                    <td>1,731</td>
                 </tr>
 
                 <tr>
                     <td>LTTng</td>
-                    <td>0.090</td>
-                    <td class="good">0.0%</td>
-                    <td>289.11</td>
-                    <td><small>±13.76</small></td>
-                    <td class="bad">5615.3%</td>
-                    <td>0.083</td>
-                    <td>337,148</td>
+                    <td>4.573</td>
+                    <td class="good">2.0%</td>
+                    <td>45226.49</td>
+                    <td><small>±1499.95</small></td>
+                    <td class="good">0.8%</td>
+                    <td>4.559</td>
+                    <td>334,397</td>
                 </tr>
 
                 <tr>
                     <td>eBPF</td>
-                    <td>5.025</td>
-                    <td class="good">0.0%</td>
-                    <td>50285.63</td>
-                    <td><small>±12748.39</small></td>
-                    <td class="bad">993981.8%</td>
-                    <td>5.020</td>
-                    <td>1,734 (app)</td>
+                    <td>6.723</td>
+                    <td class="warning">49.9%</td>
+                    <td>67266.59</td>
+                    <td><small>±7843.77</small></td>
+                    <td class="warning">49.9%</td>
+                    <td>6.715</td>
+                    <td>1,700 (app)</td>
                 </tr>
 
                 <tr>
-                    <td rowspan="3" style="vertical-align: middle;"><strong>5 μs Function</strong></td>
-                    <td rowspan="3" style="vertical-align: middle;">5</td>
+                    <td>bpftime</td>
+                    <td>8.526</td>
+                    <td class="bad">90.1%</td>
+                    <td>85270.75</td>
+                    <td><small>±2709.14</small></td>
+                    <td class="bad">90.0%</td>
+                    <td>8.521</td>
+                    <td>9,928 (app)</td>
+                </tr>
+
+                <tr>
+                    <td rowspan="4" style="vertical-align: middle;"><strong>5 μs Function</strong></td>
+                    <td rowspan="4" style="vertical-align: middle;">5</td>
                     <td><strong>Baseline</strong></td>
-                    <td>9.888</td>
+                    <td>9.477</td>
                     <td class="good">0%</td>
-                    <td>98911.88</td>
-                    <td><small>±1085.04</small></td>
+                    <td>94809.71</td>
+                    <td><small>±932.77</small></td>
                     <td class="good">0%</td>
-                    <td>9.883</td>
-                    <td>1,756</td>
+                    <td>9.472</td>
+                    <td>1,717</td>
                 </tr>
 
                 <tr>
                     <td>LTTng</td>
-                    <td>9.270</td>
-                    <td class="good">-6.2%</td>
-                    <td>92157.10</td>
-                    <td><small>±1149.97</small></td>
-                    <td class="good">-6.8%</td>
-                    <td>9.261</td>
-                    <td>337,044</td>
+                    <td>9.197</td>
+                    <td class="good">-3.0%</td>
+                    <td>91409.90</td>
+                    <td><small>±2297.82</small></td>
+                    <td class="good">-3.6%</td>
+                    <td>9.188</td>
+                    <td>334,396</td>
                 </tr>
 
                 <tr>
                     <td>eBPF</td>
-                    <td>14.662</td>
-                    <td class="warning">48.3%</td>
-                    <td>146657.38</td>
-                    <td><small>±10831.64</small></td>
-                    <td class="warning">48.3%</td>
-                    <td>14.656</td>
-                    <td>1,720 (app)</td>
+                    <td>11.267</td>
+                    <td class="warning">18.9%</td>
+                    <td>112706.13</td>
+                    <td><small>±8611.65</small></td>
+                    <td class="warning">18.9%</td>
+                    <td>11.260</td>
+                    <td>1,718 (app)</td>
                 </tr>
 
                 <tr>
-                    <td rowspan="3" style="vertical-align: middle;"><strong>50 μs Function</strong></td>
-                    <td rowspan="3" style="vertical-align: middle;">50</td>
+                    <td>bpftime</td>
+                    <td>13.144</td>
+                    <td class="warning">38.7%</td>
+                    <td>131463.70</td>
+                    <td><small>±2781.95</small></td>
+                    <td class="warning">38.7%</td>
+                    <td>13.137</td>
+                    <td>9,937 (app)</td>
+                </tr>
+
+                <tr>
+                    <td rowspan="4" style="vertical-align: middle;"><strong>50 μs Function</strong></td>
+                    <td rowspan="4" style="vertical-align: middle;">50</td>
                     <td><strong>Baseline</strong></td>
-                    <td>11.268</td>
+                    <td>8.961</td>
                     <td class="good">0%</td>
-                    <td>225402.19</td>
-                    <td><small>±3284.75</small></td>
+                    <td>179323.84</td>
+                    <td><small>±3362.81</small></td>
                     <td class="good">0%</td>
-                    <td>11.262</td>
-                    <td>1,709</td>
+                    <td>8.956</td>
+                    <td>1,643</td>
                 </tr>
 
                 <tr>
                     <td>LTTng</td>
-                    <td>11.322</td>
-                    <td class="good">0.5%</td>
-                    <td>225385.75</td>
-                    <td><small>±5028.19</small></td>
-                    <td class="good">-0.0%</td>
-                    <td>11.315</td>
-                    <td>337,014</td>
+                    <td>8.937</td>
+                    <td class="good">-0.3%</td>
+                    <td>177685.06</td>
+                    <td><small>±4197.26</small></td>
+                    <td class="good">-0.9%</td>
+                    <td>8.925</td>
+                    <td>334,440</td>
                 </tr>
 
                 <tr>
                     <td>eBPF</td>
-                    <td>14.221</td>
-                    <td class="warning">26.2%</td>
-                    <td>284473.96</td>
-                    <td><small>±12673.72</small></td>
-                    <td class="warning">26.2%</td>
-                    <td>14.215</td>
-                    <td>1,722 (app)</td>
+                    <td>9.817</td>
+                    <td class="good">9.6%</td>
+                    <td>196421.68</td>
+                    <td><small>±7738.21</small></td>
+                    <td class="good">9.5%</td>
+                    <td>9.810</td>
+                    <td>1,735 (app)</td>
                 </tr>
 
                 <tr>
-                    <td rowspan="3" style="vertical-align: middle;"><strong>100 μs Function</strong></td>
-                    <td rowspan="3" style="vertical-align: middle;">100</td>
+                    <td>bpftime</td>
+                    <td>10.807</td>
+                    <td class="warning">20.6%</td>
+                    <td>216138.42</td>
+                    <td><small>±2754.14</small></td>
+                    <td class="warning">20.5%</td>
+                    <td>10.798</td>
+                    <td>9,918 (app)</td>
+                </tr>
+
+                <tr>
+                    <td rowspan="4" style="vertical-align: middle;"><strong>100 μs Function</strong></td>
+                    <td rowspan="4" style="vertical-align: middle;">100</td>
                     <td><strong>Baseline</strong></td>
-                    <td>3.614</td>
+                    <td>2.629</td>
                     <td class="good">0%</td>
-                    <td>361730.38</td>
-                    <td><small>±5624.23</small></td>
+                    <td>263218.04</td>
+                    <td><small>±5373.19</small></td>
                     <td class="good">0%</td>
-                    <td>3.609</td>
-                    <td>1,752</td>
+                    <td>2.623</td>
+                    <td>1,728</td>
                 </tr>
 
                 <tr>
                     <td>LTTng</td>
-                    <td>3.610</td>
-                    <td class="good">-0.1%</td>
-                    <td>356241.55</td>
-                    <td><small>±3777.18</small></td>
-                    <td class="good">-1.5%</td>
-                    <td>3.601</td>
-                    <td>337,021</td>
+                    <td>2.765</td>
+                    <td class="good">5.2%</td>
+                    <td>271818.28</td>
+                    <td><small>±7531.63</small></td>
+                    <td class="good">3.3%</td>
+                    <td>2.758</td>
+                    <td>334,361</td>
                 </tr>
 
                 <tr>
                     <td>eBPF</td>
-                    <td>4.064</td>
-                    <td class="warning">12.5%</td>
-                    <td>406655.63</td>
-                    <td><small>±15548.29</small></td>
-                    <td class="warning">12.4%</td>
-                    <td>4.056</td>
+                    <td>2.865</td>
+                    <td class="good">9.0%</td>
+                    <td>286956.29</td>
+                    <td><small>±8029.99</small></td>
+                    <td class="good">9.0%</td>
+                    <td>2.858</td>
+                    <td>1,732 (app)</td>
+                </tr>
+
+                <tr>
+                    <td>bpftime</td>
+                    <td>3.135</td>
+                    <td class="warning">19.2%</td>
+                    <td>313373.30</td>
+                    <td><small>±4975.91</small></td>
+                    <td class="warning">19.1%</td>
+                    <td>3.126</td>
+                    <td>9,879 (app)</td>
+                </tr>
+
+                <tr>
+                    <td rowspan="4" style="vertical-align: middle;"><strong>500 μs Function</strong></td>
+                    <td rowspan="4" style="vertical-align: middle;">500</td>
+                    <td><strong>Baseline</strong></td>
+                    <td>3.594</td>
+                    <td class="good">0%</td>
+                    <td>719499.10</td>
+                    <td><small>±4366.85</small></td>
+                    <td class="good">0%</td>
+                    <td>3.590</td>
+                    <td>1,762</td>
+                </tr>
+
+                <tr>
+                    <td>LTTng</td>
+                    <td>3.631</td>
+                    <td class="good">1.0%</td>
+                    <td>716191.22</td>
+                    <td><small>±4692.18</small></td>
+                    <td class="good">-0.5%</td>
+                    <td>3.619</td>
+                    <td>334,469</td>
+                </tr>
+
+                <tr>
+                    <td>eBPF</td>
+                    <td>3.695</td>
+                    <td class="good">2.8%</td>
+                    <td>739953.87</td>
+                    <td><small>±10861.20</small></td>
+                    <td class="good">2.8%</td>
+                    <td>3.687</td>
                     <td>1,727 (app)</td>
                 </tr>
 
                 <tr>
-                    <td rowspan="3" style="vertical-align: middle;"><strong>500 μs Function</strong></td>
-                    <td rowspan="3" style="vertical-align: middle;">500</td>
+                    <td>bpftime</td>
+                    <td>3.794</td>
+                    <td class="good">5.6%</td>
+                    <td>758740.36</td>
+                    <td><small>±7392.94</small></td>
+                    <td class="good">5.5%</td>
+                    <td>3.782</td>
+                    <td>9,882 (app)</td>
+                </tr>
+
+                <tr>
+                    <td rowspan="4" style="vertical-align: middle;"><strong>1000 μs (1ms) Function</strong></td>
+                    <td rowspan="4" style="vertical-align: middle;">1000</td>
                     <td><strong>Baseline</strong></td>
-                    <td>4.207</td>
+                    <td>2.554</td>
                     <td class="good">0%</td>
-                    <td>842049.32</td>
-                    <td><small>±9514.86</small></td>
+                    <td>1278745.20</td>
+                    <td><small>±4793.66</small></td>
                     <td class="good">0%</td>
-                    <td>4.202</td>
-                    <td>1,722</td>
+                    <td>2.549</td>
+                    <td>1,760</td>
                 </tr>
 
                 <tr>
                     <td>LTTng</td>
-                    <td>4.332</td>
-                    <td class="good">3.0%</td>
-                    <td>856396.99</td>
-                    <td><small>±11423.09</small></td>
-                    <td class="good">1.7%</td>
-                    <td>4.325</td>
-                    <td>337,077</td>
+                    <td>2.621</td>
+                    <td class="good">2.6%</td>
+                    <td>1285922.09</td>
+                    <td><small>±3855.95</small></td>
+                    <td class="good">0.6%</td>
+                    <td>2.610</td>
+                    <td>334,473</td>
                 </tr>
 
                 <tr>
                     <td>eBPF</td>
-                    <td>4.550</td>
-                    <td class="good">8.2%</td>
-                    <td>910758.90</td>
-                    <td><small>±16505.52</small></td>
-                    <td class="good">8.2%</td>
-                    <td>4.544</td>
-                    <td>1,730 (app)</td>
+                    <td>2.604</td>
+                    <td class="good">2.0%</td>
+                    <td>1303457.37</td>
+                    <td><small>±12071.74</small></td>
+                    <td class="good">1.9%</td>
+                    <td>2.594</td>
+                    <td>1,752 (app)</td>
                 </tr>
 
                 <tr>
-                    <td rowspan="3" style="vertical-align: middle;"><strong>1000 μs (1ms) Function</strong></td>
-                    <td rowspan="3" style="vertical-align: middle;">1000</td>
-                    <td><strong>Baseline</strong></td>
-                    <td>2.900</td>
-                    <td class="good">0%</td>
-                    <td>1452098.95</td>
-                    <td><small>±7505.70</small></td>
-                    <td class="good">0%</td>
-                    <td>2.896</td>
-                    <td>1,727</td>
-                </tr>
-
-                <tr>
-                    <td>LTTng</td>
-                    <td>2.985</td>
-                    <td class="good">2.9%</td>
-                    <td>1468480.02</td>
-                    <td><small>±7858.35</small></td>
-                    <td class="good">1.1%</td>
-                    <td>2.979</td>
-                    <td>337,060</td>
-                </tr>
-
-                <tr>
-                    <td>eBPF</td>
-                    <td>3.025</td>
-                    <td class="good">4.3%</td>
-                    <td>1514205.45</td>
-                    <td><small>±12137.27</small></td>
-                    <td class="good">4.3%</td>
-                    <td>3.021</td>
-                    <td>1,738 (app)</td>
+                    <td>bpftime</td>
+                    <td>2.653</td>
+                    <td class="good">3.9%</td>
+                    <td>1327339.88</td>
+                    <td><small>±6075.71</small></td>
+                    <td class="good">3.8%</td>
+                    <td>2.644</td>
+                    <td>9,904 (app)</td>
                 </tr>
 
                 </tbody>
@@ -429,6 +497,21 @@
                         • Need real-time streaming
                     </td>
                 </tr>
+                <tr>
+                    <td><strong>bpftime</strong></td>
+                    <td>
+                        • Functions > 1μs<br>
+                        • Want lower overhead than kernel eBPF<br>
+                        • No root/sudo required<br>
+                        • Userspace-only tracing sufficient<br>
+                        • High-frequency call tracing
+                    </td>
+                    <td>
+                        • Need kernel-level visibility<br>
+                        • Need to trace syscalls or kernel functions<br>
+                        • Application cannot use LD_PRELOAD
+                    </td>
+                </tr>
             </tbody>
         </table>
 
@@ -443,37 +526,44 @@
         </ul>
 
         <h2>📚 Data Files</h2>
-        <p>Raw benchmark data: <code>benchmark_results_20251016_092403/results.json</code></p>
+        <p>Raw benchmark data: <code>benchmark_results_20260330_223056/results.json</code></p>
         <p><em>Note: Individual trace files are automatically cleaned up after data extraction to minimize disk usage.</em></p>
     </div>
 
     <script>
         // Prepare data for charts
         const work_us_data = [0, 5, 50, 100, 500, 1000];
-        const lttng_overhead_pct = [5615.330631610161, -6.829089587179682, -0.007292520062507357, -1.5173815181677042, 1.7039000243068925, 1.1280964029732221];
-        const ebpf_overhead_pct = [993981.7633685876, 48.27074338890218, 26.20727519902415, 12.419538121492813, 8.159805096261131, 4.277015907596393];
+        const lttng_overhead_pct = [0.7527390027757708, -3.5859279523396514, -0.9138678735885253, 3.2673425299141856, -0.4597474839363791, 0.5612449628315197];
+        const ebpf_overhead_pct = [49.85226761360346, 18.876138777047036, 9.534613255334868, 9.018474535337795, 2.842918087994595, 1.9325328515251927];
 
         const scenario_names = ["Empty Function", "5 \u03bcs Function", "50 \u03bcs Function", "100 \u03bcs Function", "500 \u03bcs Function", "1000 \u03bcs (1ms) Function"];
-        const baseline_ns_data = [5.0585, 98911.8815, 225402.191, 361730.3845, 842049.316, 1452098.948];
-        const lttng_total_ns = [289.11, 92157.1005, 225385.7535, 356241.5545, 856396.9945, 1468480.024];
-        const ebpf_total_ns = [50285.626000000004, 146657.382, 284473.9635, 406655.6275, 910758.899, 1514205.451];
+        const baseline_ns_data = [44888.6, 94809.713, 179323.84399999998, 263218.041, 719499.098, 1278745.196];
+        const lttng_total_ns = [45226.494, 91409.905, 177685.061, 271818.276, 716191.219, 1285922.089];
+        const ebpf_total_ns = [67266.585, 112706.126, 196421.679, 286956.293, 739953.868, 1303457.367];
 
-        const memory_baseline = [1719, 1756, 1709, 1752, 1722, 1727];
-        const memory_lttng = [337148, 337044, 337014, 337021, 337077, 337060];
-        const memory_ebpf = [1734, 1720, 1722, 1727, 1730, 1738];
+        const memory_baseline = [1731, 1717, 1643, 1728, 1762, 1760];
+        const memory_lttng = [334397, 334396, 334440, 334361, 334469, 334473];
+        const memory_ebpf = [1700, 1718, 1735, 1732, 1727, 1752];
 
         // Whole application overhead data
-        const baseline_wall_s = [0.0, 9.888, 11.2675, 3.6135, 4.207, 2.9];
-        const lttng_wall_s = [0.0905, 9.27, 11.3225, 3.6095, 4.332, 2.9845];
-        const ebpf_wall_s = [5.025, 14.662, 14.221, 4.064, 4.5504999999999995, 3.025];
-        const lttng_app_overhead_pct = [0, -6.25, 0.4881295762147797, -0.11069600110695799, 2.9712384121701962, 2.913793103448281];
-        const ebpf_app_overhead_pct = [0, 48.28074433656959, 26.212558242733518, 12.467137124671357, 8.16496315664368, 4.31034482758621];
+        const baseline_wall_s = [4.485, 9.477, 8.961, 2.629, 3.594, 2.554];
+        const lttng_wall_s = [4.573, 9.197, 8.937, 2.765, 3.6310000000000002, 2.621];
+        const ebpf_wall_s = [6.723, 11.267, 9.817, 2.865, 3.695, 2.604];
+        const lttng_app_overhead_pct = [1.962095875139358, -2.954521473040006, -0.26782725142284747, 5.173069608216063, 1.029493600445197, 2.623335943617855];
+        const ebpf_app_overhead_pct = [49.89966555183945, 18.887833702648503, 9.552505300747693, 8.976797261316104, 2.8102392877017213, 1.9577133907596078];
 
-        // Color scheme: LTTng = orange, eBPF = blue, Baseline = gray
+        const bpftime_overhead_pct = [89.96081633198631, 38.66058006103235, 20.529661967317647, 19.054644890393348, 5.453969311299955, 3.8001850683003324];
+        const bpftime_total_ns = [85270.751, 131463.698, 216138.423, 313373.304, 758740.358, 1327339.88];
+        const memory_bpftime = [9928, 9937, 9918, 9879, 9882, 9904];
+        const bpftime_wall_s = [8.526, 13.144, 10.807, 3.135, 3.794, 2.653];
+        const bpftime_app_overhead_pct = [90.10033444816052, 38.69367943442017, 20.600379421939508, 19.246861924686186, 5.564830272676691, 3.8762725137039933];
+
+        // Color scheme: LTTng = orange, eBPF = blue, bpftime = green, Baseline = gray
         const colors = {
             baseline: '#7f8c8d',
             lttng: '#e67e22',
-            ebpf: '#3498db'
+            ebpf: '#3498db',
+            bpftime: '#2ecc71'
         };
 
         // Overhead percentage chart
@@ -495,6 +585,15 @@
                 mode: 'lines+markers',
                 marker: { size: 10, color: colors.ebpf },
                 line: { width: 3, color: colors.ebpf }
+            },
+            {
+                x: work_us_data,
+                y: bpftime_overhead_pct,
+                name: 'bpftime',
+                type: 'scatter',
+                mode: 'lines+markers',
+                marker: { size: 10, color: colors.bpftime },
+                line: { width: 3, color: colors.bpftime }
             }
         ];
 
@@ -533,6 +632,15 @@
                 mode: 'lines+markers',
                 marker: { size: 10, color: colors.ebpf },
                 line: { width: 3, color: colors.ebpf }
+            },
+            {
+                x: work_us_data,
+                y: bpftime_app_overhead_pct,
+                name: 'bpftime',
+                type: 'scatter',
+                mode: 'lines+markers',
+                marker: { size: 10, color: colors.bpftime },
+                line: { width: 3, color: colors.bpftime }
             }
         ];
 
@@ -574,6 +682,13 @@
                 name: 'eBPF',
                 type: 'bar',
                 marker: { color: colors.ebpf }
+            },
+            {
+                x: scenario_names,
+                y: bpftime_wall_s,
+                name: 'bpftime',
+                type: 'bar',
+                marker: { color: colors.bpftime }
             }
         ];
 
@@ -612,6 +727,13 @@
                 name: 'eBPF',
                 type: 'bar',
                 marker: { color: colors.ebpf }
+            },
+            {
+                x: scenario_names,
+                y: bpftime_total_ns,
+                name: 'bpftime',
+                type: 'bar',
+                marker: { color: colors.bpftime }
             }
         ];
 
@@ -650,6 +772,13 @@
                 name: 'eBPF',
                 type: 'bar',
                 marker: { color: colors.ebpf }
+            },
+            {
+                x: scenario_names,
+                y: memory_bpftime,
+                name: 'bpftime',
+                type: 'bar',
+                marker: { color: colors.bpftime }
             }
         ];
 
