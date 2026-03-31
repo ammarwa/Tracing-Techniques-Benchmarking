@@ -11,7 +11,7 @@ This means:
 - **100 μs HIP API**: 5μs/100μs = **5% overhead** (typical)
 - **1 ms function**: 5μs/1ms = **0.5% overhead** (realistic)
 
-**Conclusion**: eBPF is **perfect for GPU/HIP tracing** where API calls take 10-1000 μs! bpftime reduces this overhead by ~10x using userspace binary rewriting. 🚀
+**Conclusion**: eBPF is **perfect for GPU/HIP tracing** where API calls take 10-1000 μs! bpftime with LLVM JIT achieves comparable overhead (~6-15 μs/call) purely in userspace with no root needed. 🚀
 
 ---
 

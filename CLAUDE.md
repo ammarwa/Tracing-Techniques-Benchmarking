@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Benchmarking framework comparing eBPF (kernel uprobe), bpftime (userspace uprobe), and LTTng (LD_PRELOAD) tracing overhead for HIP/GPU API instrumentation. Core finding: kernel uprobe overhead is constant (~5 μs); bpftime aims to reduce this ~10× via userspace binary rewriting.
+Benchmarking framework comparing eBPF (kernel uprobe), bpftime (userspace uprobe), and LTTng (LD_PRELOAD) tracing overhead for HIP/GPU API instrumentation. Core finding: kernel uprobe overhead is ~5-26 μs/call; bpftime with LLVM 16 JIT achieves ~6-15 μs/call (comparable or faster, purely userspace, no root needed).
 
 ## Build Commands
 
