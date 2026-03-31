@@ -53,9 +53,10 @@ jobs:
       - name: Build project
         run: |
           export CC=clang-14
-          # Skip eBPF if bpftool is not available for this kernel
-          if ! command -v bpftool &> /dev/null; then
-            echo "bpftool not found - building without eBPF and bpftime tracers"
+          # Skip eBPF if bpftool is not functional for this kernel
+          # On Azure runners, bpftool exists but fails for mismatched kernel versions
+          if ! bpftool version &> /dev/null; then
+            echo "bpftool not functional - building without eBPF and bpftime tracers"
             ./build.sh -c --no-ebpf --no-bpftime
           else
             ./build.sh -c
