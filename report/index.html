@@ -99,7 +99,7 @@
         <h1>📊 eBPF vs bpftime vs LTTng Comprehensive Benchmark Report</h1>
 
         <div class="metadata">
-            <strong>Generated:</strong> 2026-03-31 12:50:06<br>
+            <strong>Generated:</strong> 2026-03-31 13:10:08<br>
             <strong>Test Scenarios:</strong> 6<br>
             <strong>Function Durations Tested:</strong> 0 μs (empty) to 1000 μs<br>
             <strong>Runs Per Scenario:</strong> 1 (for statistical reliability)<br>
@@ -202,8 +202,8 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>0.617</td>
-                    <td class="good">-75.3%</td>
+                    <td>3.092</td>
+                    <td class="warning">23.6%</td>
                     <td>30923.29</td>
                     <td><small>±184.72</small></td>
                     <td class="warning">23.4%</td>
@@ -248,8 +248,8 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>1.144</td>
-                    <td class="good">-85.4%</td>
+                    <td>8.464</td>
+                    <td class="good">7.8%</td>
                     <td>84643.91</td>
                     <td><small>±152.06</small></td>
                     <td class="good">7.7%</td>
@@ -294,8 +294,8 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>3.057</td>
-                    <td class="good">-49.9%</td>
+                    <td>6.626</td>
+                    <td class="good">8.6%</td>
                     <td>132527.79</td>
                     <td><small>±215.43</small></td>
                     <td class="good">8.5%</td>
@@ -340,8 +340,8 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>1.142</td>
-                    <td class="good">-46.1%</td>
+                    <td>2.236</td>
+                    <td class="good">5.6%</td>
                     <td>223589.47</td>
                     <td><small>±324.50</small></td>
                     <td class="good">5.3%</td>
@@ -386,8 +386,8 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>2.597</td>
-                    <td class="good">-20.0%</td>
+                    <td>3.314</td>
+                    <td class="good">2.1%</td>
                     <td>662733.01</td>
                     <td><small>±470.69</small></td>
                     <td class="good">1.9%</td>
@@ -432,8 +432,8 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>2.061</td>
-                    <td class="good">-14.2%</td>
+                    <td>2.436</td>
+                    <td class="good">1.4%</td>
                     <td>1218005.46</td>
                     <td><small>±716.86</small></td>
                     <td class="good">1.2%</td>
@@ -547,8 +547,8 @@
         const bpftime_overhead_pct = [23.38080727783085, 7.741665238811857, 8.505897057620349, 5.2772966296536605, 1.9476303833668718, 1.2440157220512393];
         const bpftime_total_ns = [30923.292, 84643.909, 132527.793, 223589.467, 662733.0109999999, 1218005.458];
         const memory_bpftime = [71841, 71782, 71890, 70532, 70156, 69728];
-        const bpftime_wall_s = [0.617, 1.144, 3.057, 1.142, 2.597, 2.061];
-        const bpftime_app_overhead_pct = [-75.33972821742606, -85.43231885903477, -49.91808650065531, -46.08120868744099, -20.018478595626732, -14.19650291423814];
+        const bpftime_wall_s = [3.0923292, 8.4643909, 6.62638965, 2.23589467, 3.3136650549999995, 2.436010916];
+        const bpftime_app_overhead_pct = [23.59429256594725, 7.785443779447343, 8.558152850589785, 5.5663205854579845, 2.053127656298104, 1.4159415487093874];
 
         // Color scheme: LTTng = orange, eBPF = blue, bpftime = green, Baseline = gray
         const colors = {
