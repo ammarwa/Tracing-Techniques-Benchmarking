@@ -126,11 +126,18 @@ class BenchmarkSuite:
         bpftime_tracer = self.build_dir / 'bin' / 'bpftime_tracer'
         if bpftime_tracer.exists():
             # Search for bpftime shared libraries
+            # When running under sudo, Path.home() returns /root, so also check
+            # the original user's home via SUDO_USER
             search_dirs = [
                 Path.home() / '.bpftime',
                 Path('/usr/local/lib'),
                 Path('/usr/lib'),
             ]
+            sudo_user = os.environ.get('SUDO_USER')
+            if sudo_user:
+                sudo_home = Path(f'/home/{sudo_user}') / '.bpftime'
+                if sudo_home not in search_dirs:
+                    search_dirs.insert(0, sudo_home)
             for search_dir in search_dirs:
                 if not search_dir.exists():
                     continue

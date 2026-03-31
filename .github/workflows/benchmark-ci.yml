@@ -55,8 +55,8 @@ jobs:
           export CC=clang-14
           # Skip eBPF if bpftool is not available for this kernel
           if ! command -v bpftool &> /dev/null; then
-            echo "bpftool not found - building without eBPF tracer"
-            ./build.sh -c --no-ebpf
+            echo "bpftool not found - building without eBPF and bpftime tracers"
+            ./build.sh -c --no-ebpf --no-bpftime
           else
             ./build.sh -c
           fi
