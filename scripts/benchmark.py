@@ -489,8 +489,10 @@ class BenchmarkSuite:
 
     def run_bpftime_single(self, scenario: BenchmarkScenario, run_num: int = 0) -> BenchmarkResult:
         """Run a single bpftime (userspace eBPF) tracing test"""
-        # Clean stale bpftime shared memory from previous runs
+        # Kill stale bpftime tracers and clean shared memory from previous runs
+        self.run_command("sudo pkill -9 -f bpftime_tracer 2>/dev/null || true")
         self.run_command("sudo rm -f /dev/shm/bpftime* 2>/dev/null || true")
+        time.sleep(0.5)
 
         lib_path = str(self.build_dir / 'lib' / 'libmylib.so')
 

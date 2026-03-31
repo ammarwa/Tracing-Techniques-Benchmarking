@@ -48,7 +48,10 @@ set_target_properties(mylib PROPERTIES
     SOVERSION 1
 )
 
-target_compile_options(mylib PRIVATE -O2 -fPIC)
+# -fno-omit-frame-pointer is required for bpftime's Frida-based binary rewriting
+# to correctly hook functions. Without it, Frida's instruction relocator may
+# produce invalid trampolines when hooking at non-standard function prologues.
+target_compile_options(mylib PRIVATE -O2 -fPIC -fno-omit-frame-pointer)
 
 message("${Green}  ✓ libmylib.so${ColorReset}")
 
