@@ -1231,12 +1231,92 @@ For GPU/HIP tracing:
 ✅ **Safe**: BPF verifier ensures no crashes
 ✅ **Flexible**: Attach to any function in any library
 
+## bpftime: Userspace eBPF Alternative
+
+[bpftime](https://github.com/eunomia-bpf/bpftime) is a userspace eBPF runtime that provides an alternative to kernel uprobes. Instead of relying on the kernel's INT3 breakpoint mechanism, bpftime uses **userspace binary rewriting** to intercept function calls entirely in user space.
+
+### How bpftime Replaces Kernel Uprobes
+
+With kernel uprobes, each traced function call triggers:
+1. INT3 breakpoint exception
+2. Trap to kernel mode (context switch)
+3. BPF program execution in kernel
+4. Return to user mode (context switch)
+
+This context switch pair accounts for most of the ~5 us overhead per call.
+
+bpftime eliminates this by:
+1. Rewriting the target function's prologue in userspace (no INT3 needed)
+2. Redirecting execution to a userspace BPF runtime
+3. Running the **same BPF program/skeleton** in a userspace VM
+4. Returning to the original function -- all without leaving user mode
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      User Space (only)                        │
+│                                                               │
+│  ┌──────────────────┐          ┌─────────────────────────┐  │
+│  │  Target App      │          │  bpftime_tracer          │  │
+│  │  (sample_app)    │          │  (with syscall server)   │  │
+│  │                  │          │                          │  │
+│  │  LD_PRELOAD:     │          │  LD_PRELOAD:             │  │
+│  │  libbpftime-     │          │  libbpftime-syscall-     │  │
+│  │  agent.so        │          │  server.so               │  │
+│  │                  │          │                          │  │
+│  │  libmylib.so     │          │  • Userspace BPF VM      │  │
+│  │  ↓ (rewritten)   │ ──────→ │  • Ring buffer polling   │  │
+│  │  my_traced_func()│          │  • Event buffering       │  │
+│  └──────────────────┘          └─────────────────────────┘  │
+│                                                               │
+│  No kernel interaction for tracing!                           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Same BPF Program, Different Runtime
+
+bpftime reuses the same BPF skeleton (`mylib_tracer.bpf.c`) that the kernel eBPF tracer uses. The `bpftime_tracer` binary loads the skeleton just like the kernel version, but the bpftime runtime intercepts the BPF syscalls and executes everything in userspace.
+
+### Running bpftime
+
+```bash
+# Terminal 1: Start the tracer with bpftime syscall server
+LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so \
+    ./build/bin/bpftime_tracer -l ./build/lib/libmylib.so
+
+# Terminal 2: Run the target app with bpftime agent
+LD_PRELOAD=~/.bpftime/libbpftime-agent.so \
+    SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
+```
+
+No root/sudo is required for bpftime -- all tracing happens in userspace.
+
+### Trade-offs vs Kernel Uprobes
+
+| Aspect | Kernel eBPF (uprobes) | bpftime (userspace) |
+|--------|----------------------|---------------------|
+| **Overhead** | ~5 us/call | ~0.5 us/call (expected ~10x reduction) |
+| **Root required** | Yes (CAP_SYS_ADMIN) | No |
+| **Kernel visibility** | Full kernel context | No kernel visibility |
+| **Attach to running process** | Yes | No (requires LD_PRELOAD at launch) |
+| **VM performance** | Same as bare metal | Same as bare metal |
+| **Target modification** | None | LD_PRELOAD on target app |
+| **BPF program** | Runs in kernel VM | Runs in userspace VM |
+
+### When to Use bpftime
+
+- When kernel uprobe overhead (~5 us) is too high for your workload
+- When root access is not available
+- When running in VMs where kernel uprobes suffer from virtualization overhead
+- When you can control how the target application is launched (to add LD_PRELOAD)
+
 ## Limitations
 
-❌ **Requires Root**: Uprobe attachment needs CAP_SYS_ADMIN
-❌ **Fixed ~5 μs Overhead**: Not suitable for sub-microsecond functions
+❌ **Requires Root**: Uprobe attachment needs CAP_SYS_ADMIN (kernel eBPF only; bpftime does not)
+❌ **Fixed ~5 μs Overhead**: Not suitable for sub-microsecond functions (kernel eBPF; bpftime reduces this ~10x)
 ❌ **BPF Complexity**: Requires BPF toolchain (clang, bpftool, libbpf)
-❌ **Kernel Dependency**: Requires kernel 5.8+ for best features
+❌ **Kernel Dependency**: Requires kernel 5.8+ for best features (kernel eBPF only)
 
 ## Troubleshooting
 
@@ -1316,3 +1396,4 @@ Potential improvements:
 - [libbpf Documentation](https://libbpf.readthedocs.io/)
 - [BPF CO-RE](https://nakryiko.com/posts/bpf-portability-and-co-re/)
 - [Uprobe Documentation](https://www.kernel.org/doc/Documentation/trace/uprobetracer.txt)
+- [bpftime - Userspace eBPF Runtime](https://github.com/eunomia-bpf/bpftime)

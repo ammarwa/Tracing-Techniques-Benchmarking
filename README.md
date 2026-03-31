@@ -1,6 +1,6 @@
-# eBPF vs LTTng Tracing Comparison
+# eBPF vs LTTng vs bpftime Tracing Comparison
 
-A comprehensive comparison of **eBPF (uprobes)** and **LTTng (userspace tracing)** for function-level tracing, demonstrating how overhead scales with function duration.
+A comprehensive comparison of **eBPF (uprobes)**, **LTTng (userspace tracing)**, and **bpftime (userspace eBPF runtime)** for function-level tracing, demonstrating how overhead scales with function duration.
 
 ## 🎯 Key Finding
 
@@ -11,7 +11,7 @@ This means:
 - **100 μs HIP API**: 5μs/100μs = **5% overhead** (typical)
 - **1 ms function**: 5μs/1ms = **0.5% overhead** (realistic)
 
-**Conclusion**: eBPF is **perfect for GPU/HIP tracing** where API calls take 10-1000 μs! 🚀
+**Conclusion**: eBPF is **perfect for GPU/HIP tracing** where API calls take 10-1000 μs! bpftime reduces this overhead by ~10x using userspace binary rewriting. 🚀
 
 ---
 
@@ -46,6 +46,9 @@ sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)
 
 # bpftool (for BPF skeleton generation)
 sudo apt-get install linux-tools-generic linux-tools-$(uname -r)
+
+# bpftime (optional, userspace eBPF runtime)
+# Install from https://github.com/eunomia-bpf/bpftime to ~/.bpftime/
 ```
 
 ### 2. Build
@@ -75,7 +78,7 @@ Expected output:
 sudo ./scripts/benchmark.py ./build
 ```
 
-This runs **180 tests** (6 scenarios × 3 methods × 10 runs) and generates an HTML report with interactive charts.
+This runs **240 tests** (6 scenarios × 4 methods × 10 runs) and generates an HTML report with interactive charts.
 
 **Estimated time**: ~4-6 minutes
 **Output**: 
@@ -123,6 +126,7 @@ Function Duration vs Overhead %
 | Baseline | 1.082 s | 0% | 108,234 ns | 0% | 1.8 MB |
 | LTTng | 1.436 s | **32.7%** | 143,568 ns | 32.6% | 330 MB |
 | eBPF | 1.223 s | **13.0%** | 122,346 ns | 13.0% | 2.1 MB |
+| bpftime | 1.090 s | **~0.7%** | 109,012 ns | ~0.7% | ~3 MB |
 
 **New in 2025:** The report now includes **Whole Application Overhead** (Wall Time and App Overhead columns), showing the real-world production impact on total execution time!
 
@@ -153,6 +157,9 @@ Function Duration vs Overhead %
 │   ├── mylib_tracer.bpf.c  # Kernel-side eBPF program (uprobes)
 │   └── mylib_tracer.c      # Userspace loader
 │
+├── src/tools/bpftime_tracer/          # bpftime implementation
+│   └── bpftime_tracer.c    # Userspace eBPF tracer (no kernel uprobes)
+│
 ├── scripts/                 # Automation scripts
 │   ├── benchmark.py        # Python benchmark suite
 │   └── validate_output.sh  # Correctness validation
@@ -178,6 +185,12 @@ Function Duration vs Overhead %
 1. Kernel attaches uprobe/uretprobe to function offset
 2. BPF program captures arguments in kernel context
 3. Ring buffer transfers events to userspace (~5 μs overhead)
+
+**bpftime (Userspace eBPF)**:
+1. Tracer runs with `LD_PRELOAD=libbpftime-syscall-server.so`
+2. Target app runs with `LD_PRELOAD=libbpftime-agent.so`
+3. Binary rewriting replaces kernel INT3 breakpoints with userspace hooks
+4. Same BPF program runs in a userspace VM -- no kernel context switch (~0.5 μs overhead)
 
 **Benchmark Flow**:
 1. Run each scenario 100 times (statistical reliability)
@@ -227,6 +240,20 @@ SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
 # Terminal 1: Stop tracer (Ctrl-C)
 # View trace
 cat /tmp/trace.txt
+```
+
+### bpftime Tracing
+
+```bash
+# Terminal 1: Start tracer with bpftime (no root needed)
+LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so \
+    ./build/bin/bpftime_tracer -l ./build/lib/libmylib.so
+
+# Terminal 2: Run application with bpftime agent
+LD_PRELOAD=~/.bpftime/libbpftime-agent.so \
+    SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
+
+# Terminal 1: Stop tracer (Ctrl-C)
 ```
 
 ---
@@ -284,16 +311,16 @@ cat benchmark_results_*/results.json | jq '.'
 | 100 μs (typical) | 5 μs | 5% |
 | 1 ms (slow) | 5 μs | 0.5% |
 
-### 2. LTTng vs eBPF Trade-offs
+### 2. LTTng vs eBPF vs bpftime Trade-offs
 
-| Feature | LTTng | eBPF |
-|---------|-------|------|
-| **Overhead** | ~60-100 ns | ~5 μs |
-| **Root required** | No | Yes |
-| **Dynamic attach** | No (LD_PRELOAD) | Yes (uprobe) |
-| **Kernel tracing** | Separate module | Built-in |
-| **Best for** | Fast functions (>100ns) | Slow functions (>10μs) |
-| **Memory** | ~330 MB (in-process) | ~2 MB (separate) |
+| Feature | LTTng | eBPF | bpftime |
+|---------|-------|------|---------|
+| **Overhead** | ~60-100 ns | ~5 μs | ~0.5 μs |
+| **Root required** | No | Yes | No |
+| **Dynamic attach** | No (LD_PRELOAD) | Yes (uprobe) | No (LD_PRELOAD) |
+| **Kernel tracing** | Separate module | Built-in | None |
+| **Best for** | Fast functions (>100ns) | Slow functions (>10μs) | Medium functions (>1μs) |
+| **Memory** | ~330 MB (in-process) | ~2 MB (separate) | ~3 MB (separate) |
 
 ### 3. Production GPU Tracing
 
@@ -318,6 +345,9 @@ For ROCm/HIP API tracing:
 ```bash
 ./build.sh -c --no-ebpf   # Skip eBPF tracer
 ```
+
+**bpftime not installed:**
+bpftime is optional. Install from https://github.com/eunomia-bpf/bpftime to `~/.bpftime/`. The build uses the `BUILD_BPFTIME` CMake option.
 
 **Clang not found:**
 ```bash

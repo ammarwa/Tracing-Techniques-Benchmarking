@@ -2,10 +2,12 @@
 
 ## Overview
 
-This project includes a comprehensive Python-based benchmark suite that measures eBPF and LTTng tracing overhead across multiple realistic scenarios. The benchmark demonstrates how uprobe overhead scales with function duration and proves that eBPF is suitable for GPU/HIP API tracing.
+This project includes a comprehensive Python-based benchmark suite that measures eBPF, LTTng, and bpftime tracing overhead across multiple realistic scenarios. The benchmark demonstrates how uprobe overhead scales with function duration and proves that eBPF is suitable for GPU/HIP API tracing.
+
+bpftime is a userspace eBPF runtime that replaces kernel uprobes with userspace binary rewriting, eliminating the kernel context switch overhead. It is benchmarked as the 4th method alongside baseline, kernel eBPF, and LTTng.
 
 The benchmark generates interactive HTML reports with:
-- **Color-coded charts** for easy visual comparison (Gray=Baseline, Orange=LTTng, Blue=eBPF)
+- **Color-coded charts** for easy visual comparison (Gray=Baseline, Orange=LTTng, Blue=eBPF, Green=bpftime)
 - **Statistical confidence intervals** from multiple runs
 - **Scenario selection** for faster targeted testing
 
@@ -88,6 +90,7 @@ https://ammarwa.github.io/Tracing-Techniques-Benchmarking/full-hip-trace-benchma
   - Gray (`#7f8c8d`) = Baseline
   - Orange (`#e67e22`) = LTTng
   - Blue (`#3498db`) = eBPF
+  - Green (`#2ecc71`) = bpftime
 - **Grouped bar charts** (not stacked) for easier side-by-side comparison
 - **Interactive features**: hover, zoom, pan, download
 
@@ -170,6 +173,7 @@ The HTML report includes five interactive charts with consistent color coding, i
 **Type:** Line chart with markers
 - 🟠 **Orange**: LTTng per-call overhead percentage
 - 🔵 **Blue**: eBPF per-call overhead percentage
+- 🟢 **Green**: bpftime per-call overhead percentage
 
 **Purpose:** Shows how per-call tracing overhead scales with function execution time
 
@@ -184,6 +188,7 @@ The HTML report includes five interactive charts with consistent color coding, i
 **Type:** Line chart with markers
 - 🟠 **Orange**: LTTng total application overhead percentage
 - 🔵 **Blue**: eBPF total application overhead percentage
+- 🟢 **Green**: bpftime total application overhead percentage
 
 **Purpose:** Shows the total overhead impact on entire application execution time (wall clock time)
 
@@ -200,6 +205,7 @@ The HTML report includes five interactive charts with consistent color coding, i
 - ⬜ **Gray**: Baseline (no tracing) total execution time
 - 🟠 **Orange**: LTTng total execution time
 - 🔵 **Blue**: eBPF total execution time
+- 🟢 **Green**: bpftime total execution time
 
 **Purpose:** Direct comparison of absolute wall clock time for entire application
 
@@ -215,6 +221,7 @@ The HTML report includes five interactive charts with consistent color coding, i
 - ⬜ **Gray**: Baseline (no tracing)
 - 🟠 **Orange**: LTTng overhead
 - 🔵 **Blue**: eBPF overhead
+- 🟢 **Green**: bpftime overhead
 
 **Purpose:** Direct comparison of absolute time per function call
 
@@ -232,6 +239,7 @@ The HTML report includes five interactive charts with consistent color coding, i
 - ⬜ **Gray**: Baseline memory
 - 🟠 **Orange**: LTTng memory (~330 MB)
 - 🔵 **Blue**: eBPF memory (~2 MB)
+- 🟢 **Green**: bpftime memory
 
 **Purpose:** Compare memory consumption across methods
 
@@ -259,6 +267,7 @@ All charts support:
 - **Gray for Baseline**: Neutral color for reference measurement
 - **Orange for LTTng**: Warm color suggesting active userspace tracing
 - **Blue for eBPF**: Cool color representing kernel-level efficiency
+- **Green for bpftime**: Fresh color representing userspace eBPF innovation
 
 **Benefits:**
 - Consistent across ALL charts for easy correlation
@@ -271,7 +280,8 @@ Edit `scripts/benchmark.py` around lines 890-894:
 const colors = {
     baseline: '#7f8c8d',  // Gray
     lttng: '#e67e22',     // Orange
-    ebpf: '#3498db'       // Blue
+    ebpf: '#3498db',      // Blue
+    bpftime: '#2ecc71'    // Green
 };
 ```
 
@@ -335,6 +345,7 @@ HTML report shows comprehensive metrics including both whole app and per-call ov
 | 100 μs   | Baseline | 1.082 | 0% | 108,234.56 | ±12.34 | 0% |
 | 100 μs   | LTTng | 1.436 | 32.7% | 143,567.89 | ±23.45 | 32.6% |
 | 100 μs   | eBPF | 1.223 | 13.0% | 122,345.67 | ±18.92 | 13.0% |
+| 100 μs   | bpftime | 1.090 | ~0.7% | 109,012.34 | ±15.67 | ~0.7% |
 
 **Note:** Wall Time and App Overhead % columns are NEW and show the whole application impact!
 
@@ -451,6 +462,7 @@ The charts demonstrate why **eBPF is ideal for GPU tracing**:
 |--------|----------|------------|
 | **LTTng** | • Functions > 100ns<br>• Can modify app or use LD_PRELOAD<br>• Need rich userspace context<br>• High call frequency (>10K/sec) | • Cannot modify application<br>• Need kernel-level tracing<br>• Want dynamic attach/detach |
 | **eBPF** | • Functions > 10μs<br>• Cannot modify application<br>• Need kernel visibility<br>• Want dynamic attach/detach<br>• **GPU/HIP API tracing** | • Ultra-fast functions (<1μs)<br>• Very high frequency (>1M calls/sec)<br>• Need real-time streaming |
+| **bpftime** | • Functions > 1μs<br>• Want low overhead without kernel uprobes<br>• No root access available<br>• Can use LD_PRELOAD on target<br>• **GPU/HIP API tracing** | • Need kernel-level visibility<br>• Cannot control target launch (no LD_PRELOAD)<br>• Need to trace already-running processes |
 
 ### GPU/HIP Tracing Recommendation
 
@@ -544,6 +556,11 @@ lttng destroy test_session
 sudo ./build/bin/mylib_tracer /tmp/trace.txt
 SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
 sudo pkill -INT mylib_tracer
+
+# With bpftime (in separate terminal, no root needed)
+LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so ./build/bin/bpftime_tracer -l ./build/lib/libmylib.so
+# Then run the app with bpftime agent:
+LD_PRELOAD=~/.bpftime/libbpftime-agent.so SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
 ```
 
 ---
@@ -563,11 +580,13 @@ The benchmark uses only standard library modules (no external dependencies):
 
 ### Permission Errors
 
-eBPF tracing requires root:
+eBPF tracing requires root (bpftime does not):
 
 ```bash
 sudo python3 scripts/benchmark.py ./build
 ```
+
+**Note:** bpftime runs entirely in userspace and does not require root. However, the benchmark script still runs as root for the kernel eBPF method.
 
 ### LTTng Session Errors
 
@@ -602,11 +621,11 @@ If confidence intervals are wide (>10% of mean):
 
 | Runs | Total Tests | Estimated Duration |
 |------|-------------|-------------------|
-| 5 | 90 (6×3×5) | ~2-4 minutes |
-| **10** *(default)* | 180 (6×3×10) | ~4-6 minutes |
-| **20** *(CI)* | 360 (6×3×20) | ~8-12 minutes |
-| 50 | 900 (6×3×50) | ~20-30 minutes |
-| 100 | 1,800 (6×3×100) | ~40-60 minutes |
+| 5 | 120 (6×4×5) | ~3-5 minutes |
+| **10** *(default)* | 240 (6×4×10) | ~5-8 minutes |
+| **20** *(CI)* | 480 (6×4×20) | ~10-16 minutes |
+| 50 | 1,200 (6×4×50) | ~25-40 minutes |
+| 100 | 2,400 (6×4×100) | ~50-80 minutes |
 
 **Formula**: `duration_minutes ≈ num_runs × 0.4 to 0.6`
 
@@ -626,6 +645,7 @@ python3 scripts/benchmark.py ./build -s 2 3 4 -r 5
 **Peak disk usage during run:**
 - **LTTng**: ~150 MB (one trace at a time)
 - **eBPF**: ~1-5 MB (one trace at a time)
+- **bpftime**: ~1-5 MB (one trace at a time)
 
 **Final results directory:**
 - **HTML report + JSON**: ~1-5 MB
