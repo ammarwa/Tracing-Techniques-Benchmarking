@@ -10,19 +10,31 @@ With kernel uprobes, each traced function call triggers:
 3. BPF program execution in kernel
 4. Return to user mode (context switch)
 
-This context switch pair accounts for most of the ~5 us overhead per call. bpftime eliminates this entirely by performing all instrumentation and BPF execution in userspace.
+bpftime eliminates this by performing all instrumentation and BPF execution in userspace.
+
+## Benchmark Results
+
+Measured on AMD EPYC 9354 bare metal. bpftime measured in Docker with LLVM 16 JIT (10 runs per scenario):
+
+| Scenario | Kernel eBPF Overhead | bpftime JIT Overhead | Winner |
+|---|---|---|---|
+| Empty (0 μs) | ~26 μs | ~6 μs | **bpftime 4.5x faster** |
+| 5 μs Function | ~4 μs | ~6 μs | Kernel eBPF 1.6x faster |
+| 50 μs Function | ~17 μs | ~10 μs | **bpftime 1.7x faster** |
+| 100 μs Function | ~20 μs | ~11 μs | **bpftime 1.8x faster** |
+| 500 μs Function | ~17 μs | ~13 μs | **bpftime 1.4x faster** |
+| 1000 μs Function | ~25 μs | ~15 μs | **bpftime 1.7x faster** |
+
+**Key finding**: With LLVM 16 JIT, bpftime achieves **~6-15 μs overhead per call**, which is **comparable to or faster than** kernel eBPF (~4-26 μs) for most scenarios. bpftime runs purely in userspace with no root required.
+
+**Note**: bpftime was measured in Docker (Ubuntu 24.04 with LLVM 16) while kernel eBPF was measured directly on the host (Ubuntu 22.04). The overhead values are computed relative to each environment's own baseline.
 
 ## Architecture
 
 bpftime uses an **LD_PRELOAD mechanism** with two components:
 
-- **syscall-server** (`libbpftime-syscall-server.so`): Loaded into the tracer process via `LD_PRELOAD`. Intercepts BPF syscalls (`bpf()`, `perf_event_open()`) from the tracer and redirects them to the userspace runtime instead of the kernel.
-- **agent** (`libbpftime-agent.so`): Loaded into the target application via `LD_PRELOAD`. Injects Frida-gum based hooks into the target app's function prologues via code patching.
-
-Key architectural details:
-- Uses the **same BPF program/skeleton** as the kernel eBPF tracer (`mylib_tracer.bpf.c`) -- no code changes needed
-- **Frida-gum** hooks function prologues via binary code patching (rewriting the first few instructions to redirect to a trampoline)
-- **Shared memory (POSIX shm)** is used for inter-process communication between the syscall-server (tracer) and agent (target app)
+- **syscall-server** (`libbpftime-syscall-server.so`): Loaded into the tracer process via `LD_PRELOAD`. Intercepts BPF syscalls (`bpf()`, `perf_event_open()`) and redirects them to the userspace runtime.
+- **agent** (`libbpftime-agent.so`): Loaded into the target application via `LD_PRELOAD`. Injects Frida-gum based hooks into the target function's prologue via code patching.
 
 ```
 +--------------------------------------------------------------+
@@ -36,96 +48,87 @@ Key architectural details:
 |  |  libbpftime-     |          |  libbpftime-syscall-     |   |
 |  |  agent.so        |          |  server.so               |   |
 |  |                  |          |                          |   |
-|  |  libmylib.so     |          |  - Userspace BPF VM      |   |
+|  |  libmylib.so     |  shm    |  - Userspace BPF VM      |   |
 |  |  | (rewritten)   | ------> |  - Ring buffer polling   |   |
 |  |  my_traced_func()|          |  - Event buffering       |   |
-|  +------------------+          +-------------------------+   |
+|  +------------------+          +-------------------------+    |
 |                                                               |
 |  No kernel interaction for tracing!                           |
 +--------------------------------------------------------------+
 ```
 
+The same BPF program/skeleton (`mylib_tracer.bpf.c`) is used for both kernel eBPF and bpftime -- no code changes needed.
+
+## Critical: LLVM Version Requirement
+
+**bpftime requires LLVM 16.** LLVM 17 has a known symbol resolution bug (`llvm_orc_registerEHFrameSectionWrapper` not found) that prevents the JIT from working. See [bpftime issue #424](https://github.com/eunomia-bpf/bpftime/issues/424).
+
+This affects:
+- The official Docker image (`ghcr.io/eunomia-bpf/bpftime:latest`) which ships with LLVM 17 -- **their own examples fail**
+- Building from source on systems with LLVM 17 as default
+
+The fix: install LLVM 16 and point cmake to it with `-DLLVM_DIR=/usr/lib/llvm-16/cmake`.
+
 ## Critical: Compilation Requirements
 
-**This is the most important section.** The target library (`libmylib.so`) **MUST** be compiled with `-fno-omit-frame-pointer`.
+The target library (`libmylib.so`) **MUST** be compiled with `-fno-omit-frame-pointer`.
 
-### Why This Is Required
+Without frame pointers, Frida's instruction relocator generates invalid trampolines when hooking at function prologues, causing SIGTRAP crashes. This was discovered through debugging:
 
-Without frame pointers, Frida's instruction relocator generates **invalid trampolines** when hooking at function prologues, causing **SIGTRAP crashes**.
+- Hooking at offset 0x0 worked (noop/library base)
+- Hooking at the actual function offset (0x1120) crashed with SIGTRAP
+- Adding `-fno-omit-frame-pointer` resolved the issue by providing a standard `push %rbp; mov %rsp, %rbp` prologue that Frida can safely relocate
 
-Here is what happens under the hood:
-
-1. Frida's `gum_interceptor_attach` needs to save and relocate the first few instructions of the hooked function. These instructions are overwritten with a jump to the trampoline, and the original instructions are placed in a "relocated prologue" that executes before jumping back.
-
-2. With `-fno-omit-frame-pointer`, the function prologue follows the standard pattern:
-   ```asm
-   push %rbp
-   mov %rsp, %rbp
-   ```
-   These instructions are position-independent and can be safely relocated.
-
-3. **Without** frame pointers (the default for optimized builds), the compiler may emit a different prologue that is not safely relocatable. The relocated instruction sequence can be invalid, leading to crashes.
-
-### How This Was Discovered
-
-This was found through extensive debugging:
-- Hooking at **offset 0x0** worked (it is effectively a noop/library base)
-- Hooking at **offset 0x1120** (the actual function) crashed with SIGTRAP
-- The crash was traced to the function prologue format -- Frida could not safely relocate the non-standard prologue instructions
-- Adding `-fno-omit-frame-pointer` to the library's compilation flags resolved the issue completely
-
-### Build Flag
-
-In the project's CMake, ensure the target library is compiled with:
+In CMake:
 ```cmake
 target_compile_options(mylib PRIVATE -fno-omit-frame-pointer)
 ```
 
-Or if compiling manually:
+## Installation
+
+### Docker (Recommended)
+
+A `Dockerfile.bpftime` is provided in the repository:
+
 ```bash
-gcc -shared -fPIC -fno-omit-frame-pointer -o libmylib.so mylib.c
+docker build -t bpftime-bench -f Dockerfile.bpftime .
+docker run --rm --privileged -v $(pwd):/workspace bpftime-bench
 ```
 
-## LLVM JIT vs Interpreter
+This builds bpftime with LLVM 16 JIT from the official bpftime image.
 
-bpftime supports two BPF execution modes:
-
-### LLVM JIT (`-DBPFTIME_LLVM_JIT=ON`)
-
-Compiles BPF bytecode to native x86 machine code via LLVM at runtime. Approximately **3x faster** than the interpreter. This is the recommended mode for benchmarking.
-
-### Interpreter (`-DBPFTIME_LLVM_JIT=OFF`)
-
-Interprets BPF bytecode instruction by instruction. Slower but more portable and easier to debug.
-
-### Build Considerations
-
-- The **LLVM JIT full build** has a libbpf linker error when building the entire project. The workaround is to build only the `bpftime-agent` and `bpftime-syscall-server` targets individually, not the full project.
-- Set `BPFTIME_DISABLE_JIT=1` environment variable to force interpreter mode even when using a JIT-enabled build.
-- Set `BPFTIME_VM_NAME=ubpf` to use the alternative uBPF JIT backend instead of LLVM.
-
-## Building bpftime
-
-### Clone and Initialize
+### From Source
 
 ```bash
+# Prerequisites
+sudo apt-get install -y cmake build-essential clang llvm \
+    libbpf-dev libelf-dev zlib1g-dev libboost-dev libyaml-cpp-dev \
+    llvm-16-dev  # MUST be LLVM 16, not 17
+
+# Clone
 git clone --depth 1 https://github.com/eunomia-bpf/bpftime.git /tmp/bpftime
 cd /tmp/bpftime && git submodule update --init --recursive
+
+# Build with LLVM 16 JIT
+cmake -Bbuild \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DBPFTIME_LLVM_JIT=ON \
+    -DBUILD_BPFTIME_DAEMON=0 \
+    -DLLVM_DIR=/usr/lib/llvm-16/cmake
+cmake --build build --parallel $(nproc) --target all install
+
+# Libraries install to ~/.bpftime/
 ```
 
-### With LLVM JIT (Recommended)
-
+**Note on submodules**: If `git submodule update` fails with "directory already exists", remove the stale directory first:
 ```bash
-cmake -Bbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBPFTIME_LLVM_JIT=ON -DBUILD_BPFTIME_DAEMON=0
-cmake --build build --target bpftime-agent --target bpftime-syscall-server -j$(nproc)
-mkdir -p ~/.bpftime
-cp build/runtime/agent/libbpftime-agent.so ~/.bpftime/
-cp build/runtime/syscall-server/libbpftime-syscall-server.so ~/.bpftime/
+rm -rf third_party/bpftool/libbpf
+git submodule update --init --recursive
 ```
-
-Note: Building individual targets (`--target bpftime-agent --target bpftime-syscall-server`) avoids the libbpf linker error that occurs with a full project build.
 
 ### Without JIT (Fallback)
+
+If LLVM 16 is unavailable, build without JIT. This uses the BPF interpreter (~2x slower):
 
 ```bash
 cmake -Bbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBPFTIME_LLVM_JIT=OFF -DBUILD_BPFTIME_DAEMON=0
@@ -137,39 +140,36 @@ cp build/runtime/syscall-server/libbpftime-syscall-server.so ~/.bpftime/
 
 ## Running
 
-### Terminal 1: Start the Tracer with syscall-server
+### Terminal 1: Start the Tracer
 
 ```bash
-LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so ./build/bin/bpftime_tracer -l ./build/lib/libmylib.so
+LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so \
+    ./build/bin/bpftime_tracer -l ./build/lib/libmylib.so
 ```
 
-The syscall-server intercepts the BPF syscalls from the tracer binary and sets up the userspace BPF runtime. The tracer then waits for events, just as it would with kernel eBPF.
-
-### Terminal 2: Run the Target App with agent
+### Terminal 2: Run the Target App
 
 ```bash
-LD_PRELOAD=~/.bpftime/libbpftime-agent.so SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
+LD_PRELOAD=~/.bpftime/libbpftime-agent.so \
+    SIMULATED_WORK_US=100 ./build/bin/sample_app 10000
 ```
 
-The agent connects to the shared memory region created by the syscall-server, reads the hook configuration, and uses Frida-gum to patch the target function's prologue. When `my_traced_function()` is called, execution is redirected to the userspace BPF program.
-
-No root/sudo is required -- all tracing happens in userspace.
+No root/sudo is required.
 
 ## Shared Memory Management
 
-bpftime uses **POSIX shared memory** for inter-process communication between the tracer (syscall-server) and target app (agent).
+bpftime uses POSIX shared memory (`/dev/shm/bpftime_maps_shm`) for IPC.
 
-- Shared memory location: `/dev/shm/bpftime_maps_shm`
-- **Stale shm from previous runs MUST be cleaned** before starting a new session:
-  ```bash
-  sudo rm -f /dev/shm/bpftime*
-  ```
-- When running under `sudo`, the shm files are owned by root. Subsequent non-root runs will fail with "Permission denied" because they cannot open the root-owned shm.
-- The benchmark script (`scripts/run_benchmarks.sh` or equivalent) cleans shm automatically between runs.
+**Important**: Stale shm from previous runs MUST be cleaned before starting a new session:
+```bash
+sudo rm -f /dev/shm/bpftime*
+```
+
+When running under `sudo`, shm files are owned by root. Subsequent non-root runs fail with "Permission denied". The benchmark script cleans shm automatically between runs.
 
 ## Verified Userspace Operation
 
-The following checks confirm that bpftime runs purely in userspace with zero kernel involvement:
+Verified via strace and kernel debugging interfaces:
 
 | Check | Result |
 |---|---|
@@ -179,40 +179,68 @@ The following checks confirm that bpftime runs purely in userspace with zero ker
 | `strace` for `perf_event_open()` syscalls | Zero calls |
 | Root/sudo required | No |
 
-This confirms that bpftime's tracing is entirely userspace-based, with no kernel uprobes, no BPF program loading into the kernel, and no perf event registration.
+## Observations and Findings
+
+### 1. bpftime With LLVM JIT Is Comparable To Kernel eBPF
+
+With LLVM 16 JIT in Docker, bpftime achieves **~6-15 μs overhead per call**, which is comparable to kernel eBPF's ~4-26 μs. For most function durations (50 μs+), bpftime is actually **1.4-1.8x faster** than kernel eBPF. The constant overhead for empty functions is ~6 μs (vs kernel eBPF's ~26 μs on the host).
+
+The improvement comes from eliminating the kernel context switch (INT3 trap + return). However, the exact comparison depends on the environment — kernel eBPF overhead varies between host and Docker.
+
+### 2. Interpreter Mode Is Much Slower
+
+Without LLVM JIT (`-DBPFTIME_LLVM_JIT=OFF`), bpftime uses the ubpf interpreter:
+- Interpreter mode: ~35-47 μs overhead per call (~4-8x slower than kernel eBPF)
+- System CPU time dominates, suggesting the interpreter makes kernel calls despite being "userspace"
+
+### 3. LLVM 17 Incompatibility
+
+bpftime's LLVM JIT is broken with LLVM 17. The `llvm_orc_registerEHFrameSectionWrapper` symbol is missing, causing the agent to crash on startup. This affects:
+- The official Docker image
+- Any build using LLVM 17
+- The fix is to use LLVM 16
+
+### 4. Ring Buffer Event Delivery
+
+Ring buffer events are captured successfully in Docker with LLVM 16 JIT (20,000 events for 10,000 iterations = entry + exit). On the host with interpreter mode, events were not delivered (0 captured), though tracing overhead was still measurable.
+
+### 5. Frame Pointer Dependency
+
+Without `-fno-omit-frame-pointer` on the target library, Frida's instruction relocator generates invalid trampolines. This is a fundamental requirement for bpftime's Frida-based hooking approach.
 
 ## Environment Variables
 
 | Variable | Effect |
 |---|---|
-| `BPFTIME_DISABLE_JIT` | Set to `1` to force interpreter mode even with JIT build |
+| `BPFTIME_DISABLE_JIT` | Set to `1` to force interpreter mode |
 | `BPFTIME_VM_NAME` | Select VM backend (`llvm`, `ubpf`) |
-| `BPFTIME_SHM_MEMORY_MB` | Configure shared memory size in megabytes |
-| `SPDLOG_LEVEL` | Log level for bpftime internals (`debug`, `info`, `warn`, `error`) |
+| `BPFTIME_SHM_MEMORY_MB` | Shared memory size in megabytes |
+| `SPDLOG_LEVEL` | Log level (`debug`, `info`, `warn`, `error`) |
 
 ## Trade-offs vs Kernel Uprobes
 
 | Aspect | Kernel eBPF (uprobes) | bpftime (userspace) |
 |--------|----------------------|---------------------|
-| **Overhead** | ~5 us/call | ~0.5 us/call (~10x reduction) |
+| **Overhead per call** | ~4-26 μs | ~6-15 μs (JIT), ~35-47 μs (interpreter) |
 | **Root required** | Yes (CAP_SYS_ADMIN) | No |
 | **Kernel visibility** | Full kernel context | No kernel visibility |
-| **Attach to running process** | Yes | No (requires LD_PRELOAD at launch) |
-| **BPF program** | Runs in kernel VM | Runs in userspace VM |
-| **Target modification** | None | LD_PRELOAD on target app |
-| **Frame pointer requirement** | No | Yes (`-fno-omit-frame-pointer`) |
+| **Attach to running process** | Yes | No (requires LD_PRELOAD) |
+| **BPF program** | Runs in kernel JIT | Runs in userspace JIT/interpreter |
+| **Target modification** | None | LD_PRELOAD + frame pointers required |
+| **LLVM version** | N/A | Must be LLVM 16 (not 17) |
 
 ## Known Limitations
 
-- **Ring buffer event delivery**: Event delivery from the agent process to the tracer process via shared memory may not work in all configurations. In some setups, events are captured in-process only.
-- **Requires `-fno-omit-frame-pointer`**: Target libraries must be compiled with frame pointers for Frida-gum's instruction relocator to work correctly. Without this, SIGTRAP crashes occur.
-- **LLVM JIT full build has a libbpf linker error**: The workaround is to build individual targets (`bpftime-agent` and `bpftime-syscall-server`) rather than the full project.
-- **No kernel-level visibility**: bpftime cannot trace kernel functions, only userspace functions.
-- **LD_PRELOAD required**: Cannot attach to already-running processes; the target must be launched with the agent preloaded.
+1. **LLVM 17 incompatible**: JIT crashes with missing ORC symbols. Use LLVM 16.
+2. **Requires `-fno-omit-frame-pointer`**: Target libraries need standard prologues for Frida hooks.
+3. **Comparable to kernel eBPF with JIT**: ~6-15 μs vs ~4-26 μs. Faster for most scenarios, but not the 10x improvement claimed.
+4. **No kernel visibility**: Cannot trace kernel functions.
+5. **LD_PRELOAD required**: Cannot attach to already-running processes.
+6. **Shared memory cleanup**: Stale shm causes failures; must clean between runs.
 
 ## References
 
 - [bpftime GitHub Repository](https://github.com/eunomia-bpf/bpftime)
+- [bpftime Issue #424: LLVM 17 Symbol Bug](https://github.com/eunomia-bpf/bpftime/issues/424)
 - [Frida-gum (binary instrumentation)](https://frida.re/)
 - [BPF Documentation](https://www.kernel.org/doc/html/latest/bpf/index.html)
-- [libbpf Documentation](https://libbpf.readthedocs.io/)

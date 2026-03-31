@@ -98,20 +98,12 @@
     <div class="container">
         <h1>📊 eBPF vs bpftime vs LTTng Comprehensive Benchmark Report</h1>
 
-                
-        <div style="background: #e8f4fd; border: 1px solid #bee5eb; border-radius: 5px; padding: 15px; margin: 20px 0;">
-            <p style="margin: 0;"><strong>🔗 Additional Resources:</strong> 
-            <a href="full-hip-trace-benchmark/" style="color: #0066cc; text-decoration: none;">
-                <strong>Full HIP Trace Benchmark Results</strong>
-            </a> - Complete tracing tools comparison including eBPF, LTTng/Exatracer, and ROCProfV3, measuring wall-time overhead added to application processes in real-world HIP tracing scenarios.</p>
-        </div>
-
         <div class="metadata">
-            <strong>Generated:</strong> 2026-03-31 02:21:40<br>
+            <strong>Generated:</strong> 2026-03-31 12:50:06<br>
             <strong>Test Scenarios:</strong> 6<br>
             <strong>Function Durations Tested:</strong> 0 μs (empty) to 1000 μs<br>
-            <strong>Runs Per Scenario:</strong> 10 (for statistical reliability)<br>
-            <strong>Total Tests Run:</strong> 240
+            <strong>Runs Per Scenario:</strong> 1 (for statistical reliability)<br>
+            <strong>Total Tests Run:</strong> 24
         </div>
 
         <div class="key-finding">
@@ -210,13 +202,13 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>7.194</td>
-                    <td class="bad">187.5%</td>
-                    <td>71948.39</td>
-                    <td><small>±501.72</small></td>
-                    <td class="bad">187.1%</td>
-                    <td>7.187</td>
-                    <td>9,911 (app)</td>
+                    <td>0.617</td>
+                    <td class="good">-75.3%</td>
+                    <td>30923.29</td>
+                    <td><small>±184.72</small></td>
+                    <td class="warning">23.4%</td>
+                    <td>0.607</td>
+                    <td>71,841 (app)</td>
                 </tr>
 
                 <tr>
@@ -256,13 +248,13 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>7.666</td>
-                    <td class="good">-2.4%</td>
-                    <td>76677.86</td>
-                    <td><small>±745.72</small></td>
-                    <td class="good">-2.4%</td>
-                    <td>7.659</td>
-                    <td>9,883 (app)</td>
+                    <td>1.144</td>
+                    <td class="good">-85.4%</td>
+                    <td>84643.91</td>
+                    <td><small>±152.06</small></td>
+                    <td class="good">7.7%</td>
+                    <td>1.135</td>
+                    <td>71,782 (app)</td>
                 </tr>
 
                 <tr>
@@ -302,13 +294,13 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>7.930</td>
-                    <td class="warning">29.9%</td>
-                    <td>158611.56</td>
-                    <td><small>±1594.55</small></td>
-                    <td class="warning">29.9%</td>
-                    <td>7.920</td>
-                    <td>9,888 (app)</td>
+                    <td>3.057</td>
+                    <td class="good">-49.9%</td>
+                    <td>132527.79</td>
+                    <td><small>±215.43</small></td>
+                    <td class="good">8.5%</td>
+                    <td>3.041</td>
+                    <td>71,890 (app)</td>
                 </tr>
 
                 <tr>
@@ -348,13 +340,13 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>2.476</td>
-                    <td class="warning">16.9%</td>
-                    <td>247563.30</td>
-                    <td><small>±3796.94</small></td>
-                    <td class="warning">16.6%</td>
-                    <td>2.465</td>
-                    <td>9,875 (app)</td>
+                    <td>1.142</td>
+                    <td class="good">-46.1%</td>
+                    <td>223589.47</td>
+                    <td><small>±324.50</small></td>
+                    <td class="good">5.3%</td>
+                    <td>1.130</td>
+                    <td>70,532 (app)</td>
                 </tr>
 
                 <tr>
@@ -394,13 +386,13 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>3.464</td>
-                    <td class="good">6.7%</td>
-                    <td>692833.57</td>
-                    <td><small>±5189.45</small></td>
-                    <td class="good">6.6%</td>
-                    <td>3.457</td>
-                    <td>9,892 (app)</td>
+                    <td>2.597</td>
+                    <td class="good">-20.0%</td>
+                    <td>662733.01</td>
+                    <td><small>±470.69</small></td>
+                    <td class="good">1.9%</td>
+                    <td>2.586</td>
+                    <td>70,156 (app)</td>
                 </tr>
 
                 <tr>
@@ -440,13 +432,13 @@
 
                 <tr>
                     <td>bpftime</td>
-                    <td>2.498</td>
-                    <td class="good">4.0%</td>
-                    <td>1248828.75</td>
-                    <td><small>±3090.00</small></td>
-                    <td class="good">3.8%</td>
-                    <td>2.490</td>
-                    <td>9,899 (app)</td>
+                    <td>2.061</td>
+                    <td class="good">-14.2%</td>
+                    <td>1218005.46</td>
+                    <td><small>±716.86</small></td>
+                    <td class="good">1.2%</td>
+                    <td>2.050</td>
+                    <td>69,728 (app)</td>
                 </tr>
 
                 </tbody>
@@ -526,7 +518,7 @@
         </ul>
 
         <h2>📚 Data Files</h2>
-        <p>Raw benchmark data: <code>benchmark_results_20260331_014459/results.json</code></p>
+        <p>Raw benchmark data: <code>report/results.json</code></p>
         <p><em>Note: Individual trace files are automatically cleaned up after data extraction to minimize disk usage.</em></p>
     </div>
 
@@ -552,11 +544,11 @@
         const lttng_app_overhead_pct = [5.235811350919284, 0.2419457532153224, 1.933158584534711, 1.7469310670443994, 2.4330150908530968, 2.789342214820989];
         const ebpf_app_overhead_pct = [104.55635491606716, 4.749777155227308, 14.056356487549149, 9.726156751652493, 2.6485987064983174, 2.0815986677768405];
 
-        const bpftime_overhead_pct = [187.06681069669537, -2.398169830623631, 29.86173934107894, 16.565397394114424, 6.577972174839575, 3.8061335973237798];
-        const bpftime_total_ns = [71948.393, 76677.861, 158611.561, 247563.301, 692833.567, 1248828.747];
-        const memory_bpftime = [9911, 9883, 9888, 9875, 9892, 9899];
-        const bpftime_wall_s = [7.194, 7.666, 7.93, 2.476, 3.464, 2.498];
-        const bpftime_app_overhead_pct = [187.5299760191847, -2.3812555711193117, 29.91480996068152, 16.90273843248349, 6.683092085001552, 3.9966694421315507];
+        const bpftime_overhead_pct = [23.38080727783085, 7.741665238811857, 8.505897057620349, 5.2772966296536605, 1.9476303833668718, 1.2440157220512393];
+        const bpftime_total_ns = [30923.292, 84643.909, 132527.793, 223589.467, 662733.0109999999, 1218005.458];
+        const memory_bpftime = [71841, 71782, 71890, 70532, 70156, 69728];
+        const bpftime_wall_s = [0.617, 1.144, 3.057, 1.142, 2.597, 2.061];
+        const bpftime_app_overhead_pct = [-75.33972821742606, -85.43231885903477, -49.91808650065531, -46.08120868744099, -20.018478595626732, -14.19650291423814];
 
         // Color scheme: LTTng = orange, eBPF = blue, bpftime = green, Baseline = gray
         const colors = {
