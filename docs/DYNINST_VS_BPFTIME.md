@@ -157,9 +157,34 @@ bpftime's higher overhead compared to Dyninst comes from:
 
 ## References
 
-- [Dyninst GitHub](https://github.com/dyninst/dyninst)
-- [bpftime GitHub](https://github.com/eunomia-bpf/bpftime)
-- [Frida-gum Interceptor Source](https://github.com/frida/frida-gum/blob/main/gum/guminterceptor.c)
-- [Anywhere, Any-Time Binary Instrumentation (Bernat & Miller)](https://pages.cs.wisc.edu/~bernat/publications/Bernat11AWAT.pdf)
-- [The Return of the Frame Pointers (Brendan Gregg)](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html)
-- [bpftime Design Documentation](BPFTIME_DESIGN.md)
+### Dyninst
+- [Dyninst GitHub Repository](https://github.com/dyninst/dyninst)
+- [Anywhere, Any-Time Binary Instrumentation (Bernat & Miller, 2011)](https://pages.cs.wisc.edu/~bernat/publications/Bernat11AWAT.pdf) — Describes Dyninst's two-level trampoline architecture and instruction relocation approach
+- [An API for Runtime Code Patching (Buck & Hollingsworth, 2000)](https://doi.org/10.1177/109434200001400404) — Original Dyninst paper describing the code patching and CFG analysis techniques
+- [Dyninst Programmer's Guide](https://github.com/dyninst/dyninst/wiki) — Official documentation covering BPatch API, process attachment, and binary rewriting
+- [Dyninst on RISC-V (SC'25)](https://dl.acm.org/doi/10.1145/3731599.3767527) — Recent work extending Dyninst's instrumentation to new architectures
+- [Using the SystemTap Dyninst Runtime (Red Hat)](https://developers.redhat.com/blog/2021/04/16/using-the-systemtap-dyninst-runtime-environment) — Practical use of Dyninst as SystemTap's userspace backend
+
+### bpftime and Frida
+- [bpftime GitHub Repository](https://github.com/eunomia-bpf/bpftime)
+- [bpftime: Userspace eBPF Runtime (Zheng et al., 2023)](https://arxiv.org/abs/2311.07923) — Original bpftime paper with performance claims
+- [bpftime Issue #424: LLVM 17 Symbol Bug](https://github.com/eunomia-bpf/bpftime/issues/424) — Documents the LLVM ORC JIT incompatibility
+- [Frida-gum Interceptor Source (guminterceptor.c)](https://github.com/frida/frida-gum/blob/main/gum/guminterceptor.c) — Core hooking logic
+- [Frida-gum x86 Relocator (gumx86relocator.c)](https://github.com/frida/frida-gum/blob/main/gum/arch-x86/gumx86relocator.c) — Instruction relocation implementation that requires safe prologues
+- [Frida: Comparison of Function Hooking Libraries](https://github.com/frida/frida/wiki/Comparison-of-function-hooking-libraries) — Frida's own comparison with other hooking frameworks
+
+### Binary Instrumentation Background
+- [Unveiling Dynamic Binary Instrumentation Techniques (2025)](https://arxiv.org/html/2508.00682v1) — Survey comparing DBI tools including Dyninst, Pin, DynamoRIO, and Frida
+- [iProbe: A Lightweight User-Level Dynamic Instrumentation Tool (Arora et al.)](https://www.nipunarora.net/pdf/iprobe.pdf) — Compares overhead of Dyninst, SystemTap, and iProbe for userspace tracing
+- [Unravelling Code Injection in Binaries (Tuxology)](https://suchakra.wordpress.com/2016/07/03/unravelling-code-injection-in-binaries/) — Visual explanation of code patching and trampoline techniques
+- [Learning How Frida Works (IdentX Labs)](https://medium.com/@identx_labs/learning-how-frida-works-a-deep-dive-into-the-hooking-framework-d522ae13cc67) — Deep dive into Frida's interceptor internals
+
+### Frame Pointers and x86-64 ABI
+- [The Return of the Frame Pointers (Brendan Gregg, 2024)](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html) — Why frame pointers are making a comeback in production systems
+- [Stack Frame Layout on x86-64 (Eli Bendersky)](https://eli.thegreenplace.net/2011/09/06/stack-frame-layout-on-x86-64/) — Technical reference for x86-64 function prologues and the red zone
+- [System V AMD64 ABI](https://gitlab.com/x86-psABIs/x86-64-ABI) — Official x86-64 calling convention and stack frame specification
+
+### This Project
+- [bpftime Design Documentation](BPFTIME_DESIGN.md) — Full bpftime integration findings, installation, and benchmark results
+- [eBPF Tracer Design](EBPF_DESIGN.md) — Kernel eBPF uprobe implementation details
+- [Benchmark Methodology](BENCHMARK.md) — How the benchmarks are structured and run
