@@ -30,6 +30,29 @@ bpftime delegates to **Frida-gum's `gum_interceptor`** for inline hooking:
 
 bpftime then executes **eBPF bytecode** (via LLVM JIT or ubpf interpreter) as the instrumentation payload, rather than arbitrary C/C++ code.
 
+## Why Dyninst Loads the Entire Library (and bpftime Doesn't)
+
+Dyninst requires **parsing the entire binary/library** before instrumenting any function. This is fundamental to how it achieves safe instrumentation without requiring frame pointers:
+
+1. **Control Flow Graph (CFG) construction**: Before patching any function, Dyninst parses all instructions to build a complete CFG. It must know where every basic block starts/ends and where branches go, so it can safely insert trampolines without breaking existing jump targets.
+
+2. **Function boundary detection**: Dyninst doesn't trust symbol tables alone. It performs recursive disassembly from known entry points to discover all functions, including those stripped from the symbol table. This requires reading the entire `.text` section.
+
+3. **Instruction relocation safety**: When relocating instructions at a patch point, Dyninst must verify that no other code jumps INTO the middle of the bytes being overwritten. Only a full CFG analysis can guarantee this. If some branch elsewhere targets byte 3 of a 5-byte patch zone, the patch would corrupt that branch target.
+
+4. **Address space management**: Dyninst allocates trampoline memory and must track all code and data sections to avoid conflicts.
+
+bpftime (via Frida) skips all this analysis — it patches at the given offset without understanding the surrounding code. This is the fundamental trade-off:
+
+| | Dyninst | bpftime (Frida) |
+|---|---|---|
+| **Startup cost** | High (parse entire binary) | Low (just patch at offset) |
+| **Safety guarantee** | Proven safe (full CFG analysis) | Best-effort (may crash on complex prologues) |
+| **Frame pointers needed** | No (knows full code structure) | Yes (can't analyze surrounding code) |
+| **Large binary penalty** | Yes (parsing time scales with binary size) | No (constant-time attach) |
+
+This trade-off explains why Dyninst is the standard in HPC (where binaries are large and optimized) while bpftime/Frida is preferred for lightweight, quick-attach scenarios where the target can be recompiled.
+
 ## Why bpftime Needs `-fno-omit-frame-pointer` (and Dyninst Doesn't)
 
 This is the key technical difference between the two tools.
