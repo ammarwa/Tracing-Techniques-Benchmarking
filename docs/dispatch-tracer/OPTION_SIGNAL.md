@@ -159,9 +159,11 @@ Phase 3 (queries): Controller uses socket for CMD_STATUS, CMD_FLUSH
 - Bidirectional via socket for queries
 - Zero filesystem footprint
 
-## Initialization: rocprofiler-register Methodology
+## Integration with rocprofiler-sdk
 
-Same as all options — see [Option B](OPTION_B_MMAP_FILE.md#initialization-rocprofiler-register-methodology) for the full registration flow. The signal setup happens during the tool's registration callback, not in a constructor.
+Same as all options — the tool uses standard rocprofiler-sdk APIs. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
+
+The signal handler's job is simple: when woken, the background thread calls `rocprofiler_start_context()` or `rocprofiler_stop_context()`. The signal setup happens during the tool's `initialize` callback.
 
 ## Components
 
@@ -227,16 +229,17 @@ static void* config_loop(void* arg) {
         char buf[64];
         while (read(wakeup_pipe[0], buf, sizeof(buf)) > 0) {}
 
-        // Check for new config
+        // Check for new command
         uint32_t ver = __atomic_load_n(&ctrl->version, __ATOMIC_ACQUIRE);
         if (ver > last_version) {
-            // Heavy setup work (safe to do here, not on hot path):
-            allocate_ring_buffers(ctrl->ring_buffer_size);
-            open_output_file(ctrl->output_path);
-            apply_filters(ctrl->filter_pattern, ctrl->exclude_pattern);
-
-            // Enable tracing (hot path will see this)
-            __atomic_store_n(&ctrl->tracing_enabled, 1, __ATOMIC_RELEASE);
+            uint32_t cmd = __atomic_load_n(&ctrl->command, __ATOMIC_ACQUIRE);
+            if (cmd == CMD_ACTIVATE && !context_active) {
+                rocprofiler_start_context(saved_ctx);  // EXISTING API
+                context_active = true;
+            } else if (cmd == CMD_DEACTIVATE && context_active) {
+                rocprofiler_stop_context(saved_ctx);   // EXISTING API
+                context_active = false;
+            }
             last_version = ver;
         }
     }

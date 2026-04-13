@@ -172,99 +172,44 @@ Controller                      Library (bg thread)
     ├──────────────────────────────>│
 ```
 
-## Initialization: rocprofiler-register Methodology
+## Integration with rocprofiler-sdk
 
-Same as all options — see [Option B](OPTION_B_MMAP_FILE.md#initialization-rocprofiler-register-methodology) for the full registration flow. The runtime library calls `dispatch_register_library_api_table()` during its own init. The tool library receives the API table via a callback, saves originals, installs shim wrappers, and sets up the socket control channel.
+Same as all options — the tool uses standard rocprofiler-sdk APIs (`rocprofiler_configure`, `rocprofiler_create_context`, `rocprofiler_configure_callback_tracing_service`, `rocprofiler_start_context` / `rocprofiler_stop_context`). The existing dispatch table machinery (`copy_table`/`update_table`/`functor`) is reused as-is. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
 
-No `__attribute__((constructor))` or `dlsym(RTLD_NEXT)` — original function pointers come from the registration.
+The **only difference from Option B** is the IPC mechanism: instead of an mmap'd file, this option uses a Unix domain socket. The tool's `initialize` callback sets up the socket instead of the mmap file.
 
 ## Components
 
-### 1. Dispatch Tool Library (`libdispatch_tool.so`)
+### 1. Tool Library (socket control channel setup)
+
+The `rocprofiler_configure` and context setup are identical to Option B. Only the control channel differs:
 
 ```c
-static _Atomic uint32_t local_enabled = 0;
-static dispatch_config_t local_config;
-static mylib_api_table_t orig_table;  // saved during registration
-static pthread_t control_thread;
-static int listen_fd_global = -1;
-
-/* Called during registration — tool receives the API table */
-static void on_intercept_table_registration(
-    const char* lib_name,
-    void** api_table,
-    size_t func_count)
-{
-    // Save originals from registration (not dlsym)
-    memcpy(&orig_table, api_table, func_count * sizeof(void*));
-
-    // Install shim wrappers into the runtime's API table
-    ((mylib_api_table_t*)api_table)->my_traced_function =
-        shim_my_traced_function;
-
-    // Setup socket control channel
+/* In tool_initialize — after creating context and registering domains */
+static void setup_socket_control(rocprofiler_context_id_t ctx) {
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     addr.sun_path[0] = '\0';
     snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1,
-             "dispatch_%d", getpid());
+             "rocprofiler_%d", getpid());
     bind(sock, (struct sockaddr*)&addr,
          offsetof(struct sockaddr_un, sun_path) + 1 +
          strlen(addr.sun_path + 1));
     listen(sock, 1);
     listen_fd_global = sock;
+    saved_ctx = ctx;
 
-    // Spawn background control thread (joinable for clean shutdown)
-    pthread_create(&control_thread, NULL, control_loop, (void*)(intptr_t)sock);
-}
-
-/* Tool finalize callback — called by registration library via atexit()
- * or during explicit detach. Same pattern as rocprofiler-sdk:
- * atomic flag prevents double-finalization. */
-static _Atomic int finalize_status = 0;
-
-static void tool_finalize(void* tool_data) {
-    int expected = 0;
-    if (!__atomic_compare_exchange_n(&finalize_status, &expected, -1,
-                                     0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-        return;
-
-    __atomic_store_n(&local_enabled, 0, __ATOMIC_RELEASE);
-
-    // Close listen fd to break accept() in the control thread
-    if (listen_fd_global >= 0) {
-        close(listen_fd_global);
-        listen_fd_global = -1;
-    }
-    // Join the thread (blocks until it exits from the accept error)
-    pthread_join(control_thread, NULL);
-
-    __atomic_store_n(&finalize_status, 1, __ATOMIC_SEQ_CST);
-}
-
-/* Shim: noop by default, traces when enabled by controller */
-__attribute__((hot))
-static void shim_my_traced_function(
-    int arg1, uint64_t arg2, double arg3, void* arg4)
-{
-    if (__builtin_expect(
-            __atomic_load_n(&local_enabled, __ATOMIC_ACQUIRE), 0)) {
-        trace_entry(FUNC_MY_TRACED_FUNCTION, arg1, arg2, arg3, arg4);
-        orig_table.my_traced_function(arg1, arg2, arg3, arg4);
-        trace_exit(FUNC_MY_TRACED_FUNCTION);
-        return;
-    }
-    orig_table.my_traced_function(arg1, arg2, arg3, arg4);
+    pthread_create(&control_thread, NULL, control_loop,
+                   (void*)(intptr_t)sock);
 }
 ```
 
-### 2. Control Loop (background thread)
+### 2. Control Loop (background thread — receives commands, toggles context)
 
 ```c
 static void* control_loop(void* arg) {
     int listen_fd = (intptr_t)arg;
 
-    // Block all signals in this thread (safety, like rocprofiler-sdk)
     sigset_t all;
     sigfillset(&all);
     pthread_sigmask(SIG_SETMASK, &all, NULL);
@@ -277,15 +222,25 @@ static void* control_loop(void* arg) {
         struct ucred cred;
         socklen_t len = sizeof(cred);
         getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &len);
+        if (cred.uid != getuid()) { close(client); continue; }
 
-        if (cred.uid != getuid()) {
-            // Reject connection from different user
-            close(client);
-            continue;
+        // Process commands
+        dispatch_cmd_header_t cmd;
+        while (recv(client, &cmd, sizeof(cmd), 0) > 0) {
+            switch (cmd.type) {
+            case CMD_ENABLE:
+                rocprofiler_start_context(saved_ctx);  // EXISTING API
+                send_response(client, STATUS_OK);
+                break;
+            case CMD_DISABLE:
+                rocprofiler_stop_context(saved_ctx);   // EXISTING API
+                send_response(client, STATUS_OK);
+                break;
+            case CMD_STATUS:
+                send_status(client, saved_ctx);
+                break;
+            }
         }
-
-        // Process commands from this client
-        handle_client(client);
         close(client);
     }
     return NULL;

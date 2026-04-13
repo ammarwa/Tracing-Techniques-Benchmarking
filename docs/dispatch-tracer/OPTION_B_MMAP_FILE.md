@@ -2,364 +2,297 @@
 
 ## Overview
 
-This design uses a **memory-mapped regular file** as the control channel between the LD_PRELOAD dispatch tracer library and an external controller process. The file lives under the user's private runtime directory (`/run/user/<uid>/`), providing directory-level permission isolation. Both the controller and the library mmap the same file, giving ~1-5 ns atomic load overhead on the hot path with no syscall.
+This design uses a **memory-mapped regular file** as the control channel between the tool library inside the target process and an external controller process. The file lives under the user's private runtime directory (`/run/user/<uid>/`), providing directory-level permission isolation.
 
-## Initialization: rocprofiler-register Methodology
+The key insight from analyzing rocprofiler-sdk's existing code: **the existing functor wrappers already check active contexts on every call** via `populate_contexts()`. When no context is active, the wrapper calls the original directly (~10-20 ns overhead). So the control channel's job is simply to **toggle context activation** — everything else (wrapper installation, callback dispatch, buffer management) is already implemented.
 
-Instead of using `__attribute__((constructor))` or `dlsym(RTLD_NEXT)`, the dispatch tracer uses the **rocprofiler-register** pattern: each runtime library (HIP, HSA, etc.) registers its API table during its own initialization, and the tracer intercepts the tables during registration.
+## What Reuses Existing rocprofiler-sdk Code (No Changes)
 
-```
-Registration flow:
+- `rocprofiler_set_api_table()` — runtime registration entry point
+- `copy_table()` / `update_table()` — saves originals, installs wrappers
+- `hip_api_impl<TableIdx, OpIdx>::functor()` — the wrapper template
+- `populate_contexts()` / `context_filter()` — the call-time noop check
+- `callback_tracing_service` / `buffer_tracing_service` — context services
+- `execute_phase_enter_callbacks()` / `execute_phase_exit_callbacks()` — callback dispatch
+- `execute_buffer_record_emplace()` — buffer record writing
+- Correlation ID system, domain/operation bitsets, all of it
 
-  1. Runtime library (e.g., libamdhip64.so) initializes
-  2. Runtime calls: rocprofiler_register_library_api_table(
-         "hip", import_func, version, &api_tables, table_count, &id)
-  3. rocprofiler-register scans for rocprofiler_configure symbols
-  4. If found, invokes tool callbacks with the API table pointers
-  5. Tool (dispatch tracer) receives table pointers, saves originals,
-     installs noop shim wrappers that check ctrl->tracing_enabled
-  6. Runtime continues — all API calls now go through shims
-```
+## What Changes (Minimal)
 
-This means:
-- **No LD_PRELOAD needed** for the interception itself — the runtime voluntarily passes its API table
-- **No `dlsym(RTLD_NEXT)`** — original function pointers come directly from the registration
-- **Works with any library** that calls `rocprofiler_register_library_api_table()`
-- **Tool discovery** via `rocprofiler_configure` symbol (weak symbol or `ROCP_TOOL_LIBRARIES` env var)
+1. **Tool `initialize` callback**: creates the mmap control file and a background thread that polls it
+2. **Background thread**: reads the mmap'd control struct; when it sees `enabled=1`, calls `rocprofiler_start_context(ctx_id)`; when `enabled=0`, calls `rocprofiler_stop_context(ctx_id)`
+3. **`should_wrap_functor` override**: the tool registers interest in all operations during `rocprofiler_configure`, so wrappers are installed for everything (Level 1 noop is bypassed, but Level 2 noop still works at ~10-20 ns)
 
-For the benchmark repo's sample library, we simulate this by adding a `register_api_table()` call in `libmylib.so`'s init.
+That's it. The wrapper code, dispatch table machinery, and callback infrastructure are untouched.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     Target Process (sample_app)              │
+│                     Target Process                           │
 │                                                              │
-│  libmylib.so (runtime library):                             │
-│    init():                                                   │
-│      api_table.my_traced_function = &real_impl;             │
-│      dispatch_register_library_api_table(                   │
-│          "mylib", &api_table, 1);                           │
+│  Existing rocprofiler-sdk flow (unchanged):                 │
+│    Runtime → rocprofiler_set_api_table() → copy_table()     │
+│    → update_table() installs functor wrappers                │
 │                                                              │
-│  libdispatch_tool.so (tracer — discovered via               │
-│                       DISPATCH_TOOL_LIBRARIES env var):      │
-│    dispatch_configure():                                     │
-│      // Called by register library during registration       │
-│      save original: orig_table = copy(api_table);           │
-│      install shim:  api_table->my_traced_function =         │
-│                       &shim_my_traced_function;             │
-│      setup control: create mmap file, init ctrl struct      │
-│                                                              │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │  Shim setup (during registration callback):             │ │
-│  │    dir = /run/user/<uid>/dispatch/<pid>/                │ │
-│  │    mkdir(dir, 0700)                                     │ │
-│  │    fd = open(dir/ctrl, O_CREAT|O_RDWR, 0600)           │ │
-│  │    ctrl = mmap(fd, ...)                                 │ │
-│  │    ctrl->tracing_enabled = 0  // noop by default        │ │
-│  └────────────────────────────────────────────────────────┘ │
+│  Tool library (loaded via ROCP_TOOL_LIBRARIES):             │
+│    rocprofiler_configure():                                  │
+│      create context with callback/buffer tracing             │
+│      register interest in ALL HIP/HSA/RCCL/OMPT operations  │
+│      DO NOT activate context yet (stays inactive)            │
+│    initialize():                                             │
+│      create mmap control file at                             │
+│        /run/user/<uid>/rocprofiler/<pid>/ctrl                │
+│      spawn background thread polling the control file        │
 │                                                              │
 │  ┌────────────────────────────────────────────────────────┐ │
-│  │  hot path (every intercepted call):                     │ │
+│  │  Existing functor hot path (NO CHANGES):                │ │
 │  │                                                         │ │
-│  │    if (__atomic_load_n(&ctrl->tracing_enabled,          │ │
-│  │                        __ATOMIC_ACQUIRE)) {             │ │
-│  │        uint32_t fmask = __atomic_load_n(                │ │
-│  │            &ctrl->func_enable_mask[func_id / 32],       │ │
-│  │            __ATOMIC_RELAXED);                           │ │
-│  │        if (fmask & (1u << (func_id % 32))) {           │ │
-│  │            trace_entry(func_id, args);                  │ │
-│  │            real_fn(args);                               │ │
-│  │            trace_exit(func_id);                         │ │
-│  │            return;                                      │ │
-│  │        }                                                │ │
-│  │    }                                                    │ │
-│  │    real_fn(args);                                       │ │
+│  │  hip_api_impl<T,Op>::functor(args...):                  │ │
+│  │    populate_contexts(domain, op,                        │ │
+│  │        callback_ctxs, buffered_ctxs);                   │ │
+│  │    if (callback_ctxs.empty() && buffered_ctxs.empty())  │ │
+│  │        return exec(get_table_func(), args);  // noop    │ │
+│  │    // ... full tracing path (callbacks, buffers, etc.)  │ │
 │  └────────────────────────────────────────────────────────┘ │
 │                                                              │
-│  File: /run/user/1000/dispatch/12345/ctrl  [mode 0600]      │
-│        /run/user/1000/dispatch/            [mode 0700]      │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  Background thread (NEW — reads mmap'd control file):   │ │
+│  │                                                         │ │
+│  │  loop:                                                  │ │
+│  │    if (ctrl->command == CMD_ACTIVATE &&                 │ │
+│  │        !context_active) {                               │ │
+│  │        rocprofiler_start_context(ctx_id);  // existing  │ │
+│  │        context_active = true;                           │ │
+│  │    }                                                    │ │
+│  │    if (ctrl->command == CMD_DEACTIVATE &&               │ │
+│  │        context_active) {                                │ │
+│  │        rocprofiler_stop_context(ctx_id);   // existing  │ │
+│  │        context_active = false;                          │ │
+│  │    }                                                    │ │
+│  │    usleep or futex_wait on ctrl->version change         │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  /run/user/1000/rocprofiler/12345/ctrl  [mode 0600]         │
+│  /run/user/1000/rocprofiler/            [mode 0700]         │
 └──────────────────┬──────────────────────────────────────────┘
-                   │ mmap (same physical pages via page cache)
+                   │ mmap (same physical pages)
 ┌──────────────────▼──────────────────────────────────────────┐
-│                  Controller (dispatch_ctrl_mmap)              │
+│  Controller (e.g., rocprofv3 --attach --channel mmap)       │
 │                                                              │
-│  fd = open(/run/user/<uid>/dispatch/<pid>/ctrl, O_RDWR)     │
+│  fd = open(/run/user/<uid>/rocprofiler/<pid>/ctrl, O_RDWR)  │
 │  ctrl = mmap(fd, PROT_READ|PROT_WRITE, MAP_SHARED)         │
-│  verify ctrl->magic                                         │
+│  verify ctrl->magic, ctrl->struct_version                   │
 │                                                              │
-│  // ATTACH: write config then enable                        │
-│  ctrl->output_format = OUTPUT_JSON;                         │
-│  ctrl->ring_buffer_size = 4 * 1024 * 1024;                 │
-│  memset(ctrl->func_enable_mask, 0xFF, ...);  // all funcs  │
+│  // ATTACH:                                                 │
+│  ctrl->command = CMD_ACTIVATE;                              │
 │  __atomic_store_n(&ctrl->version, v+1, __ATOMIC_RELEASE);  │
-│  __atomic_store_n(&ctrl->tracing_enabled, 1,               │
-│                   __ATOMIC_RELEASE);                        │
 │                                                              │
 │  // DETACH:                                                 │
-│  __atomic_store_n(&ctrl->tracing_enabled, 0,               │
-│                   __ATOMIC_RELEASE);                        │
+│  ctrl->command = CMD_DEACTIVATE;                            │
+│  __atomic_store_n(&ctrl->version, v+1, __ATOMIC_RELEASE);  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Control Structure
 
+Since the existing rocprofiler-sdk context system handles per-operation enable/disable, buffer management, output format, and callback configuration, the mmap control struct is dramatically simplified. It only needs to carry **commands** (activate/deactivate) and **status** (statistics from the tool):
+
 ```c
-#define DISPATCH_MAGIC 0xD15EA7C0
-#define MAX_TRACED_FUNCTIONS 2048  // Enough for HIP (1300+), HSA (400+), etc.
-#define DISPATCH_STRUCT_VERSION 1  // Bump on layout changes for compat detection
+#define ROCP_CTRL_MAGIC   0xD15EA7C0
+#define ROCP_CTRL_VERSION 1
+
+enum rocp_ctrl_command {
+    CMD_NONE       = 0,   // No pending command
+    CMD_ACTIVATE   = 1,   // Activate the context (start tracing)
+    CMD_DEACTIVATE = 2,   // Deactivate the context (stop tracing)
+};
 
 typedef struct {
     /* Identification */
-    uint32_t magic;                      // Must equal DISPATCH_MAGIC
-    uint32_t struct_version;             // DISPATCH_STRUCT_VERSION — detects layout mismatches
-    uint32_t config_version;             // Bumped on every config change
+    uint32_t magic;              // Must equal ROCP_CTRL_MAGIC
+    uint32_t struct_version;     // ROCP_CTRL_VERSION
 
-    /* Master control */
-    _Atomic uint32_t tracing_enabled;    // 0 = noop, 1 = trace
+    /* Command channel (controller → tool) */
+    _Atomic uint32_t command;    // rocp_ctrl_command
+    _Atomic uint32_t version;    // Bumped by controller on every command
 
-    /* Per-function enable bitmask (double-buffered for atomic config swap).
-     * The controller writes to the inactive slot [!active_config_slot],
-     * then does an atomic CAS on active_config_slot to publish. Readers
-     * load active_config_slot with ACQUIRE, then read that slot's bitmask.
-     * This eliminates data races during reconfiguration. */
-    _Atomic uint32_t active_config_slot; // 0 or 1
-    _Atomic uint32_t func_enable_mask[2][MAX_TRACED_FUNCTIONS / 32];
-
-    /* Output configuration (written to inactive slot, swapped atomically) */
-    struct {
-        uint32_t output_format;          // TEXT=0, JSON=1, PERFETTO=2
-        uint32_t ring_buffer_size;       // Bytes, must be power of 2
-        char output_path[256];           // Where to write trace data
-        char filter_pattern[256];        // Glob include pattern
-        char exclude_pattern[256];       // Glob exclude pattern
-    } config_slots[2];
-
-    /* Statistics (written by library, read by controller) */
+    /* Status (tool → controller, read-only from controller side) */
+    _Atomic uint32_t context_active;  // 0 = inactive, 1 = active
+    _Atomic uint32_t context_id;      // rocprofiler_context_id_t.handle
     _Atomic uint64_t events_traced;
     _Atomic uint64_t events_dropped;
-} __attribute__((aligned(64))) dispatch_ctrl_t;
-// aligned(64) on the struct ensures sizeof is a multiple of a cache line,
-// preventing false sharing with adjacent allocations.
+
+    /* Tool identification */
+    uint32_t pid;                // Target process PID (for stale detection)
+    uint64_t start_time;         // /proc/<pid>/stat start time (for PID reuse)
+} __attribute__((aligned(64))) rocp_ctrl_t;
 ```
+
+**Why this is so much simpler**: All the per-function bitmasks, output format, ring buffer sizes, filter patterns, etc. are configured through the existing `rocprofiler_configure_callback_tracing_service()` / `rocprofiler_configure_buffer_tracing_service()` APIs during the tool's `initialize` callback. The mmap control channel only toggles context activation — a single atomic flag that the existing `populate_contexts()` already checks.
 
 ## Components
 
-### 1. Runtime Library Registration (`libmylib.so` — the traced library)
+### 1. Tool Library (`librocprofiler-sdk-tool.so` — uses existing rocprofiler-sdk APIs)
 
-The runtime library registers its API table during its own initialization. This replaces LD_PRELOAD + `dlsym(RTLD_NEXT)`:
-
-```c
-/* In the runtime library (e.g., libmylib.so or libamdhip64.so) */
-
-/* The API table: function pointers for all public APIs */
-typedef struct {
-    void (*my_traced_function)(int, uint64_t, double, void*);
-    void (*set_simulated_work_duration)(unsigned int);
-} mylib_api_table_t;
-
-static mylib_api_table_t api_table = {
-    .my_traced_function = real_my_traced_function_impl,
-    .set_simulated_work_duration = real_set_simulated_work_duration_impl,
-};
-
-/* Called during library init — NOT a constructor, but part of the
- * library's normal initialization path. In rocprofiler-sdk, HIP/HSA
- * runtimes call this during their first API call or explicit init. */
-void mylib_init(void) {
-    /* Register our API table with the registration library.
-     * If a tool (dispatch tracer) has registered interest via
-     * dispatch_configure, it will be called back with a pointer
-     * to our api_table, allowing it to save originals and
-     * install shim wrappers. */
-    dispatch_register_library_api_table(
-        "mylib",                    // library name
-        MYLIB_API_VERSION,          // version
-        (void**)&api_table,         // pointer to API table
-        sizeof(api_table) / sizeof(void(*)(void)),  // function count
-        NULL);                      // output identifier
-}
-
-/* All public API functions go through the table */
-void my_traced_function(int a1, uint64_t a2, double a3, void* a4) {
-    api_table.my_traced_function(a1, a2, a3, a4);
-}
-```
-
-### 2. Dispatch Tool Library (`libdispatch_tool.so` — the tracer)
-
-The tool library provides a `dispatch_configure` function (analogous to `rocprofiler_configure`). The registration library discovers it via `DISPATCH_TOOL_LIBRARIES` environment variable or weak symbol scan.
+The tool uses standard rocprofiler-sdk APIs. No custom dispatch table, no custom wrappers, no custom bitmasks. The only new code is the mmap control channel setup and background thread.
 
 ```c
-/* Discovered by the registration library during library registration */
-dispatch_tool_configure_result_t* dispatch_configure(
-    uint32_t version,
-    const char* version_string,
-    uint32_t client_id)
+/* rocprofiler_configure — discovered via ROCP_TOOL_LIBRARIES */
+rocprofiler_tool_configure_result_t*
+rocprofiler_configure(uint32_t version, const char* runtime_version,
+                      uint32_t priority, rocprofiler_client_id_t* id)
 {
-    static dispatch_tool_configure_result_t result = {
+    *id = (rocprofiler_client_id_t){.name = "mmap-channel-tool"};
+    static rocprofiler_tool_configure_result_t result = {
+        .size = sizeof(result),
         .initialize = tool_initialize,
         .finalize = tool_finalize,
     };
     return &result;
 }
 
-/* Called when a runtime library registers its API table */
-static void on_intercept_table_registration(
-    const char* lib_name,
-    void** api_table,
-    size_t func_count)
+/* tool_initialize — called after all runtimes registered */
+static void tool_initialize(rocprofiler_client_finalize_t fini_func,
+                             void* tool_data)
 {
-    // Save original function pointers
-    memcpy(&orig_table, api_table, func_count * sizeof(void*));
+    /* 1. Create context with callback+buffer tracing (existing API) */
+    rocprofiler_context_id_t ctx;
+    rocprofiler_create_context(&ctx);
 
-    // Install noop shim wrappers
-    ((mylib_api_table_t*)api_table)->my_traced_function =
-        shim_my_traced_function;
+    /* 2. Register interest in ALL HIP/HSA/RCCL operations.
+     *    This causes update_table() to install wrappers for everything.
+     *    (NULL operations = all operations in the domain) */
+    rocprofiler_configure_callback_tracing_service(
+        ctx, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
+        NULL, 0, my_callback, NULL);
+    rocprofiler_configure_callback_tracing_service(
+        ctx, ROCPROFILER_CALLBACK_TRACING_HSA_CORE_API,
+        NULL, 0, my_callback, NULL);
+    /* ... repeat for RCCL, OMPT, rocdecode, rocjpeg ... */
 
-    // Setup control channel (mmap file)
-    setup_mmap_control();
+    /* 3. DO NOT activate context yet — stays inactive.
+     *    populate_contexts() will find nothing → wrappers noop. */
+
+    /* 4. Setup mmap control channel (the only new code) */
+    setup_mmap_control(ctx);
 }
 
-static void setup_mmap_control(void) {
+static void setup_mmap_control(rocprofiler_context_id_t ctx) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/run/user/%u/dispatch",
+    snprintf(path, sizeof(path), "/run/user/%u/rocprofiler",
              (unsigned)getuid());
     mkdir(path, 0700);
-    snprintf(path, sizeof(path), "/run/user/%u/dispatch/%d",
+    snprintf(path, sizeof(path), "/run/user/%u/rocprofiler/%d",
              (unsigned)getuid(), getpid());
-    if (mkdir(path, 0700) < 0 && errno != EEXIST) { /* handle */ }
+    mkdir(path, 0700);
     strncat(path, "/ctrl", sizeof(path) - strlen(path) - 1);
 
     int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
-    ftruncate(fd, sizeof(dispatch_ctrl_t));
-    ctrl = mmap(NULL, sizeof(dispatch_ctrl_t),
+    ftruncate(fd, sizeof(rocp_ctrl_t));
+    ctrl = mmap(NULL, sizeof(rocp_ctrl_t),
                 PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);  // mapping persists after close
+    close(fd);
 
-    ctrl->magic = DISPATCH_MAGIC;
-    ctrl->struct_version = DISPATCH_STRUCT_VERSION;
-    ctrl->active_config_slot = 0;
-    ctrl->tracing_enabled = 0;
-}
+    ctrl->magic = ROCP_CTRL_MAGIC;
+    ctrl->struct_version = ROCP_CTRL_VERSION;
+    ctrl->command = CMD_NONE;
+    ctrl->context_active = 0;
+    ctrl->context_id = ctx.handle;
+    ctrl->pid = getpid();
 
-/* Shim: noop by default, traces when enabled */
-__attribute__((hot))
-static void shim_my_traced_function(
-    int arg1, uint64_t arg2, double arg3, void* arg4)
-{
-    if (__builtin_expect(
-            __atomic_load_n(&ctrl->tracing_enabled, __ATOMIC_ACQUIRE), 0)) {
-        trace_entry(FUNC_MY_TRACED_FUNCTION, arg1, arg2, arg3, arg4);
-        orig_table.my_traced_function(arg1, arg2, arg3, arg4);
-        trace_exit(FUNC_MY_TRACED_FUNCTION);
-        return;
-    }
-    orig_table.my_traced_function(arg1, arg2, arg3, arg4);
+    /* Spawn background thread to poll control file */
+    saved_ctx = ctx;
+    pthread_create(&bg_thread, NULL, control_poll_loop, NULL);
 }
 ```
 
-### 2. Controller (`dispatch_ctrl_mmap.c`)
+### 2. Background Thread (polls mmap for commands)
+
+```c
+static void* control_poll_loop(void* arg) {
+    uint32_t last_version = 0;
+    while (!__atomic_load_n(&shutdown_flag, __ATOMIC_ACQUIRE)) {
+        uint32_t ver = __atomic_load_n(&ctrl->version, __ATOMIC_ACQUIRE);
+        if (ver != last_version) {
+            uint32_t cmd = __atomic_load_n(&ctrl->command, __ATOMIC_ACQUIRE);
+            if (cmd == CMD_ACTIVATE && !ctrl->context_active) {
+                rocprofiler_start_context(saved_ctx);   // EXISTING API
+                __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
+            } else if (cmd == CMD_DEACTIVATE && ctrl->context_active) {
+                rocprofiler_stop_context(saved_ctx);    // EXISTING API
+                __atomic_store_n(&ctrl->context_active, 0, __ATOMIC_RELEASE);
+            }
+            last_version = ver;
+        }
+        usleep(1000);  // 1ms poll (or futex_wait on ctrl->version)
+    }
+    return NULL;
+}
+```
+
+### 3. Controller (external process)
 
 ```c
 int main(int argc, char** argv) {
     pid_t target_pid = parse_args(argc, argv);
+    const char* action = parse_action(argc, argv);  // "activate" or "deactivate"
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/run/user/%u/dispatch/%d/ctrl",
+    snprintf(path, sizeof(path), "/run/user/%u/rocprofiler/%d/ctrl",
              (unsigned)getuid(), target_pid);
 
     int fd = open(path, O_RDWR | O_NOFOLLOW);
-    if (fd < 0) {
-        fprintf(stderr, "Cannot open control file for PID %d "
-                "(is the dispatch tracer loaded?)\n", target_pid);
-        return 1;
+    rocp_ctrl_t* ctrl = mmap(NULL, sizeof(rocp_ctrl_t),
+                              PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    if (ctrl->magic != ROCP_CTRL_MAGIC) { /* error */ }
+    if (ctrl->struct_version != ROCP_CTRL_VERSION) { /* error */ }
+
+    if (strcmp(action, "activate") == 0) {
+        __atomic_store_n(&ctrl->command, CMD_ACTIVATE, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctrl->version, ctrl->version + 1, __ATOMIC_RELEASE);
+        printf("Activated context %u for PID %d\n", ctrl->context_id, target_pid);
+    } else {
+        __atomic_store_n(&ctrl->command, CMD_DEACTIVATE, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctrl->version, ctrl->version + 1, __ATOMIC_RELEASE);
+        printf("Deactivated. Events: %lu\n", ctrl->events_traced);
     }
-
-    dispatch_ctrl_t* ctrl = mmap(NULL, sizeof(dispatch_ctrl_t),
-                                  PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (ctrl->magic != DISPATCH_MAGIC) {
-        fprintf(stderr, "Invalid magic — wrong version or corrupted\n");
-        return 1;
-    }
-
-    if (ctrl->struct_version != DISPATCH_STRUCT_VERSION) {
-        fprintf(stderr, "Struct version mismatch (expected %d, got %d)\n",
-                DISPATCH_STRUCT_VERSION, ctrl->struct_version);
-        return 1;
-    }
-
-    // Write config to inactive slot, then swap atomically
-    uint32_t inactive = !__atomic_load_n(&ctrl->active_config_slot, __ATOMIC_ACQUIRE);
-    memset(ctrl->func_enable_mask[inactive], 0xFF,
-           sizeof(ctrl->func_enable_mask[0]));
-    ctrl->config_slots[inactive].output_format = OUTPUT_TEXT;
-    ctrl->config_slots[inactive].ring_buffer_size = 4 * 1024 * 1024;
-    // Publish: swap active slot (atomic CAS)
-    uint32_t expected = !inactive;
-    __atomic_compare_exchange_n(&ctrl->active_config_slot, &expected, inactive,
-                                0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
-    __atomic_store_n(&ctrl->tracing_enabled, 1, __ATOMIC_RELEASE);
-    printf("Attached to PID %d, tracing enabled\n", target_pid);
-
-    // Wait for user to press Enter, then disable
-    getchar();
-    __atomic_store_n(&ctrl->tracing_enabled, 0, __ATOMIC_RELEASE);
-    printf("Detached. Events traced: %lu\n",
-           __atomic_load_n(&ctrl->events_traced, __ATOMIC_RELAXED));
     return 0;
 }
 ```
 
-### 3. Finalization (rocprofiler-sdk pattern)
-
-Cleanup uses the same `atexit()` + `tool_finalize` callback pattern as rocprofiler-sdk. No `__attribute__((destructor))` is used — finalization is driven by the registration library.
+### 4. Finalization (atexit, rocprofiler-sdk pattern)
 
 ```c
-/* Finalization status — atomic flag prevents double-finalization */
-static _Atomic int finalize_status = 0;  // 0=ready, -1=in-progress, 1=done
+static _Atomic int finalize_status = 0;
 
-/* Called by the registration library during process exit (via atexit)
- * or during explicit detach. This is the tool's finalize callback,
- * returned from dispatch_configure(). */
 static void tool_finalize(void* tool_data) {
-    /* Prevent double-finalization (same pattern as rocprofiler-sdk) */
     int expected = 0;
     if (!__atomic_compare_exchange_n(&finalize_status, &expected, -1,
                                      0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-        return;  // already finalized or in progress
+        return;
 
-    /* 1. Disable tracing (hot path sees this immediately) */
-    if (ctrl)
-        __atomic_store_n(&ctrl->tracing_enabled, 0, __ATOMIC_RELEASE);
+    /* Stop context if still active */
+    if (ctrl && ctrl->context_active)
+        rocprofiler_stop_context(saved_ctx);
 
-    /* 2. Cleanup control channel */
-    if (ctrl) {
-        munmap(ctrl, sizeof(dispatch_ctrl_t));
-        ctrl = NULL;
-    }
+    /* Shutdown background thread */
+    __atomic_store_n(&shutdown_flag, 1, __ATOMIC_RELEASE);
+    pthread_join(bg_thread, NULL);
+
+    /* Cleanup mmap */
+    if (ctrl) { munmap(ctrl, sizeof(rocp_ctrl_t)); ctrl = NULL; }
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/run/user/%u/dispatch/%d/ctrl",
+    snprintf(path, sizeof(path), "/run/user/%u/rocprofiler/%d/ctrl",
              (unsigned)getuid(), getpid());
     unlink(path);
-    char dir[PATH_MAX];
-    snprintf(dir, sizeof(dir), "/run/user/%u/dispatch/%d",
+    snprintf(path, sizeof(path), "/run/user/%u/rocprofiler/%d",
              (unsigned)getuid(), getpid());
-    rmdir(dir);
+    rmdir(path);
 
-    /* 3. Mark finalization complete */
     __atomic_store_n(&finalize_status, 1, __ATOMIC_SEQ_CST);
 }
-
-/* Registration library calls atexit() during init:
- *   atexit([]() {
- *       invoke_client_finalizers();  // calls tool_finalize for each tool
- *       destroy_static_objects();
- *   });
- *
- * This ensures cleanup happens at process exit even if the tool
- * doesn't explicitly detach. The atexit handler is registered once
- * during the first runtime library registration. */
 ```
 
 ## Security Analysis

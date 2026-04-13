@@ -6,19 +6,43 @@ This document surveys all control channel mechanisms considered for a new tracin
 
 The core architecture is inspired by [rocprofiler-sdk](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocprofiler-sdk), which uses intercept tables that start as passthrough and are swapped to tracing wrappers when a profiling tool attaches. The goal is to bring this pattern to the Tracing-Techniques-Benchmarking framework and evaluate it against the existing LTTng, eBPF, and bpftime techniques.
 
-### Initialization: rocprofiler-register Methodology
+### How rocprofiler-sdk's Dispatch Table Already Works
 
-All designs in this document use the **rocprofiler-register** pattern for initialization, not `__attribute__((constructor))` or `dlsym(RTLD_NEXT)`:
+The existing rocprofiler-sdk already implements a dispatch table with a two-level noop fast-path. Understanding it precisely reveals what we can reuse and what the minimal change is.
 
-1. Each **runtime library** (HIP, HSA, RCCL, or the benchmark's `libmylib.so`) calls `dispatch_register_library_api_table()` during its own initialization, passing its API function pointer table.
-2. The **registration library** scans for `dispatch_configure` symbols (via `DISPATCH_TOOL_LIBRARIES` env var or weak symbol lookup).
-3. If a **tool** (dispatch tracer) is found, its `on_intercept_table_registration()` callback receives the API table pointers.
-4. The tool **saves the original function pointers** and **installs noop shim wrappers** in the API table.
-5. The tool sets up the **control channel** (the subject of this survey) so an external controller can later toggle the shims from noop to active tracing.
+**Existing flow (no changes needed):**
 
-This means the runtime libraries **voluntarily participate** in registration — no LD_PRELOAD symbol interposition is needed for the interception mechanism itself. The tool library is discovered and loaded automatically during the first runtime library's registration.
+1. Runtime (HIP/HSA) calls `rocprofiler_set_api_table(name, version, instance, &tables, count)` during its init, passing its mutable function pointer table.
+2. `copy_table()` saves the original function pointers into a static singleton.
+3. `update_table()` iterates every `OpIdx` and checks `should_wrap_functor()` which queries all registered contexts. Only operations with interested contexts get wrappers; the rest keep original pointers (**Level 1 noop: zero overhead**).
+4. Installed wrappers use `hip_api_impl<TableIdx, OpIdx>::functor()` which at call time calls `populate_contexts()` to check active contexts. If `callback_contexts` and `buffered_contexts` are both empty, it calls the original directly (**Level 2 noop: ~10-20 ns**).
+5. When contexts ARE active, the wrapper fires enter callbacks, calls the original, fires exit callbacks, and emplaces buffer records.
 
-The key design question is: **how does the external controller tell the tool library to start/stop tracing and with what configuration?** This is the "control channel."
+**The noop overhead today** (wrapper installed but no active context): ~10-20 ns per call. `populate_contexts()` iterates active contexts (bitset check), finds none, returns.
+
+### Minimal Change Strategy
+
+The designs in this document minimize changes to rocprofiler-sdk:
+
+1. **Reuse `copy_table`/`update_table`/`functor` machinery as-is.** No changes to wrapper code.
+2. **Reuse `context`, `callback_tracing_service`, `buffer_tracing_service` as-is.** No new service types needed.
+3. **Install wrappers for all operations at init time** (`should_wrap_functor` returns true for the tool's registered domains). Level 1 noop is bypassed but Level 2 noop still works.
+4. **Add an external control channel** that activates/deactivates the tool's context at runtime. When active, `populate_contexts()` finds it; when inactive, wrappers fall through to originals.
+
+The control channel's job is narrow: **toggle a `rocprofiler_context_id_t` between active and inactive.** Everything else (wrappers, callbacks, buffers, correlation IDs) is already implemented.
+
+**Changes required to rocprofiler-sdk:**
+- `rocprofiler_context_activate_external()` / `rocprofiler_context_deactivate_external()` API callable from a control channel handler
+- Control channel setup in the tool's `initialize` callback (shm/socket/memfd)
+- Background thread or signal handler to receive commands and call activate/deactivate
+- Optionally: extend `rocprofiler_configure_attach()` to support new channels alongside ptrace
+
+**What the control channel does NOT need to do:**
+- No custom dispatch table or function pointer management (rocprofiler-sdk already handles this)
+- No double-buffered config struct (context activation/deactivation is atomic)
+- No per-function bitmask in shared memory (context domain/operation masks handle this)
+
+The key design question remains: **what IPC mechanism does the external controller use to toggle contexts?**
 
 ## Requirements
 

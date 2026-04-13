@@ -10,11 +10,11 @@ This design combines the **Unix domain socket** (Option F) for authentication an
 
 This is the **recommended option for production** (e.g., rocprofiler-sdk) as it has the strongest security guarantees and lowest possible hot-path overhead with no cleanup burden.
 
-## Initialization: rocprofiler-register Methodology
+## Integration with rocprofiler-sdk
 
-Same as all options — see [Option B](OPTION_B_MMAP_FILE.md#initialization-rocprofiler-register-methodology) for the full registration flow. The runtime library calls `dispatch_register_library_api_table()` during its own init. The tool library receives the API table via a callback, saves originals, installs shim wrappers, creates the memfd + socket control channel, and spawns the background thread.
+Same as all options — the tool uses standard rocprofiler-sdk APIs. The existing dispatch table machinery is reused as-is. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
 
-No `__attribute__((constructor))` or `dlsym(RTLD_NEXT)` — original function pointers come from the registration.
+This option combines Option F's socket (for authentication + commands) with a memfd (for the `rocp_ctrl_t` struct shared via `SCM_RIGHTS`). The control struct is the same as Option B but lives in anonymous memory. The background thread uses `rocprofiler_start_context()` / `rocprofiler_stop_context()` — same as all options.
 
 ## Architecture
 
