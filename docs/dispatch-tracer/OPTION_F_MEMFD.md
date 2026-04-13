@@ -312,6 +312,30 @@ Runtime:
 
 This scales cleanly to any number of runtimes without protocol changes.
 
+### OpenMP Constraint
+
+OMPT (OpenMP Tools) does not support late attachment — `ompt_start_tool()` is called once during runtime init. The dispatch shim must be loaded before OpenMP initializes. Since LD_PRELOAD constructors run before `main()`, this is satisfied when the shim is LD_PRELOAD'd. The control channel still dynamically enables/disables tracing — the shim is resident but noop until the controller attaches.
+
+### Third-Party API Plugin Support
+
+For APIs outside the team's control (RCCL, rocdecode, rocjpeg, future libraries), the socket protocol can be extended with a plugin registration command:
+
+```
+CMD_REGISTER_PLUGIN:
+  Controller sends: {plugin_name, function_count, function_names[]}
+  Library responds: {status, assigned memfd for plugin's control region}
+  Library sends: new memfd via SCM_RIGHTS for the plugin's bitmask
+
+CMD_LIST_PLUGINS:
+  Library responds: {count, [{name, version, func_count, enabled}]}
+```
+
+External teams provide a shared library implementing the `dispatch_plugin` interface (see [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#third-party-api-tracing-plugin-interface)). The core tracer discovers plugins via `DISPATCH_PLUGIN_LIBRARIES` environment variable (similar to `ROCP_TOOL_LIBRARIES` in rocprofiler-sdk).
+
+### OpenTelemetry Export
+
+The output format can be extended with `OUTPUT_OTLP` to export trace events as OpenTelemetry spans via OTLP. Each intercepted API call maps to an OTel span with attributes like `hip.function`, `hip.stream`, `gpu.device_id`, `memory.size_bytes`. This enables integration with Jaeger, Grafana Tempo, and other OTel-compatible backends.
+
 ## File Layout
 
 ```

@@ -31,3 +31,12 @@ These designs emerged from evaluating 13 different IPC mechanisms against two ha
 2. **Cross-user security** — Other users must not be able to interfere with profiling sessions
 
 See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) for the full evaluation including the 9 eliminated options and why they were rejected.
+
+## Additional Topics
+
+The survey also covers:
+
+- **OpenMP OMPT late attachment** — why OMPT cannot be enabled after process start, and how the dispatch tracer handles this
+- **Third-party API plugin interface** — how external teams (RCCL, rocdecode, rocjpeg) can register their own tracing
+- **OpenTelemetry as output format** — using OTel for export/transport, not instrumentation
+- **Cross-platform considerations** — Linux-specific mechanisms and portability fallbacks

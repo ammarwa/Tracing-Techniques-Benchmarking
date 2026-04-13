@@ -142,6 +142,87 @@ We applied two hard filters:
 | Graceful detach with flush | Write disable flag | Send DETACH command, get ACK | Send DETACH, get ACK | Signal + paired |
 | Dynamic reconfiguration | Write new config struct | Send CONFIG command | Write to memfd | Signal + write |
 
+## Special Considerations
+
+### OpenMP OMPT: Late Attachment Is Not Supported
+
+The OpenMP 5.0/5.1/5.2 spec defines OMPT tool initialization as a **one-shot event** during runtime startup. The runtime calls `ompt_start_tool()` exactly once during the first OpenMP construct or API call. If no tool is found at that point, OMPT is disabled for the lifetime of the process. There is no re-initialization path.
+
+- `OMP_TOOL_LIBRARIES` must be set **before process launch**. The runtime reads it during initialization only.
+- `OMP_TOOL=enabled|disabled` is similarly read once at init time.
+- OpenMP 6.0 does not change this — OMPT remains init-time-only.
+
+**Implication for the dispatch tracer**: For OpenMP tracing, the dispatch shim must be loaded before the OpenMP runtime initializes. This means either:
+1. The shim is compiled into the runtime (build-time integration), or
+2. `LD_PRELOAD` injects the shim before the runtime's constructor runs (viable since LD_PRELOAD constructors run before the application's `main()` and typically before OpenMP's lazy init).
+
+The late-attach control channel (Options B/F/F+memfd) can still dynamically **enable/disable** OMPT-style tracing, but the shim code must already be resident in the process. The control channel toggles an atomic flag that the pre-loaded shim checks — this is consistent with our noop-by-default architecture.
+
+For APIs entirely outside the team's control (e.g., a third-party library using OpenMP internally), the shim approach cannot intercept OMPT callbacks without the library's cooperation. In such cases, a **standardized annotation interface** (see below) is the fallback.
+
+### Third-Party API Tracing: Plugin Interface
+
+Not all APIs will be under the team's control. OpenMP, RCCL, rocdecode, rocjpeg, and future libraries may be maintained by other teams or external contributors. The dispatch tracer needs a mechanism for external parties to register their own tracing without modifying the core tracer.
+
+Existing profiling tools handle this differently:
+
+| Tool | Approach | How third parties participate |
+|------|----------|------------------------------|
+| **rocprofiler-sdk** | Compile-time code generation from API table YAML/CSV files. Adding a new API family means adding table definitions and regenerating. | Fork/PR — not a runtime plugin system |
+| **Intel VTune (ITT)** | Annotation API: libraries call `__itt_task_begin()`/`__itt_task_end()` to mark regions. VTune collects events. | Library must instrument itself with ITT calls |
+| **NVIDIA Nsight (NVTX)** | Annotation API: `nvtxRangePush()`/`nvtxRangePop()` with custom domains. Nsight collects alongside CUPTI. | Library must instrument itself with NVTX calls |
+
+For the dispatch tracer, a **plugin-based approach** would combine both models:
+
+```c
+/* Plugin interface: third-party libraries register their own intercepts */
+struct dispatch_plugin {
+    const char *name;           // e.g., "rccl", "rocdecode"
+    const char *version;
+
+    /* Discovery: plugin resolves original function pointers */
+    int (*register_intercepts)(struct intercept_table *table);
+
+    /* Lifecycle */
+    int (*init)(struct tracer_context *ctx);
+    void (*fini)(void);
+
+    /* Event output: plugin flushes events to shared ring buffer */
+    void (*flush_events)(struct event_buffer *buf);
+};
+
+/* Registration: plugins call this at load time */
+int dispatch_register_plugin(const struct dispatch_plugin *plugin);
+```
+
+This allows external teams to:
+1. Provide wrapper functions for their API (dispatch-table interception)
+2. Use the shared control channel and ring buffer infrastructure
+3. Participate in the same enable/disable lifecycle as built-in APIs
+
+### OpenTelemetry as Output Format
+
+[OpenTelemetry](https://opentelemetry.io/) (OTel) does not have first-party instrumentation for HIP, CUDA, HSA, or ROCm. No OTel auto-instrumentation libraries exist for GPU API calls. AMD uses rocprofiler-sdk/roctracer; NVIDIA uses CUPTI/NVTX.
+
+However, OTel is valuable as the **output and transport layer**, not the instrumentation layer:
+
+- **Instrumentation**: The dispatch table shim intercepts API calls (faster and more precise than OTel auto-instrumentation).
+- **Export**: Convert trace events to OTel spans using the [OTel C/C++ SDK](https://github.com/open-telemetry/opentelemetry-cpp). Each API call becomes a span with GPU-specific attributes (kernel name, stream, device, memory size).
+- **Transport**: OTLP (gRPC or HTTP) to any OTel collector, then to Jaeger, Grafana Tempo, Zipkin, or any OTel-compatible backend.
+
+This pattern — custom dispatch-table instrumentation feeding OTel export — provides the best of both worlds: low-overhead interception with industry-standard trace output. The output format choice (`OUTPUT_TEXT`, `OUTPUT_JSON`, `OUTPUT_PERFETTO`) in the control structure could be extended with `OUTPUT_OTLP` for OTel export.
+
+### Cross-Platform Considerations
+
+All four surviving control channel options (B, F, F+memfd, Signal) are **Linux-specific**:
+
+- Abstract Unix sockets (Options F, F+memfd) are Linux-only (not macOS/BSD)
+- `memfd_create` (Option F+memfd) is Linux-only
+- `/run/user/<uid>/` (Option B) depends on systemd
+- Real-time signals with `sigqueue` (Option Signal) are POSIX but behavior varies
+
+For future cross-platform support, Option B could fall back to a platform-appropriate temp directory, and Option F could fall back to filesystem-namespace Unix sockets. The dispatch table mechanism itself (atomic load + function pointer check) is portable to any platform with C11 atomics.
+
 ## Recommendation
 
 The four surviving options each have distinct strengths:
