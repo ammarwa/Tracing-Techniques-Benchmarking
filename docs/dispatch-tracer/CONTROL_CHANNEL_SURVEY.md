@@ -242,6 +242,79 @@ However, OTel is valuable as the **output and transport layer**, not the instrum
 
 This pattern — custom dispatch-table instrumentation feeding OTel export — provides the best of both worlds: low-overhead interception with industry-standard trace output. The output format choice (`OUTPUT_TEXT`, `OUTPUT_JSON`, `OUTPUT_PERFETTO`) in the control structure could be extended with `OUTPUT_OTLP` for OTel export.
 
+### Late Configuration vs Late Activation
+
+A critical distinction needs to be made about what "attach" means in this design vs the existing rocprofiler-sdk ptrace attach:
+
+**rocprofiler-sdk ptrace attach (`rocprofv3 --attach --pid`) — full late configuration:**
+- Tool library is `dlopen`'d at attach time inside the target
+- `rocprofiler_configure()` runs at attach time with full configuration
+- Context creation, domain registration, service setup all happen at attach
+- Wrappers installed at attach via `update_table` re-propagation
+- Trade-off: requires ptrace (`CAP_SYS_PTRACE` in containers), x86-64 only, ~10-50 ms attach latency
+
+**Control channel design (this document) — late activation + late tool-side reconfiguration:**
+- Tool library loaded at process start via `ROCP_TOOL_LIBRARIES`
+- During init: context created, **interest registered in all domains** (so wrappers install for every API)
+- Context starts inactive
+- Control channel can toggle activation and adjust tool-side filtering/output
+- Trade-off: cannot add new domains after init (the dispatch table is locked at init time)
+
+**Why the constraint exists**: rocprofiler-sdk's `update_table` runs `should_wrap_functor()` for every operation at init. Operations with no interested context get the original function pointer (Level 1 noop). To enable Level 2 noop (~10-20 ns) for an operation, a context must be registered for that operation BEFORE init completes. After init, the dispatch table cannot grow new wrappers.
+
+**What the control channel CAN do at attach time:**
+
+| Late operation | Possible? | How |
+|---|---|---|
+| Toggle tracing on/off globally | Yes | `rocprofiler_start_context()` / `rocprofiler_stop_context()` |
+| Filter which APIs to trace | Yes | Tool-side filter in callback (check `operation_id`, return early) |
+| Change output format/destination | Yes | Tool-side callback writes to controller-specified destination |
+| Resize ring buffers | Partial | Allocate new buffers in callback path; existing buffer service is fixed |
+| Add a domain not registered at init | No | Wrappers weren't installed; only ptrace attach can do this |
+| Change correlation ID strategy | No | Locked at context creation |
+
+**Extended control channel protocol for richer late configuration:**
+
+Instead of just `CMD_ACTIVATE` / `CMD_DEACTIVATE`, the control channel can carry a configuration payload that the tool's callbacks honor at runtime:
+
+```c
+typedef struct {
+    uint32_t magic;
+    uint32_t struct_version;
+
+    _Atomic uint32_t command;     // CMD_ACTIVATE, CMD_DEACTIVATE, CMD_RECONFIGURE
+    _Atomic uint32_t version;
+
+    /* Late-configurable settings (read by tool callbacks at runtime) */
+    _Atomic uint32_t enabled_domain_mask;   // Which domains to actually emit events for
+    _Atomic uint32_t output_format;         // TEXT=0, JSON=1, OTLP=2, ...
+    _Atomic uint32_t buffer_size_kb;
+    char output_path[256];
+    char filter_pattern[256];
+    char exclude_pattern[256];
+
+    /* Status (tool → controller) */
+    _Atomic uint32_t context_active;
+    _Atomic uint64_t events_traced;
+    _Atomic uint64_t events_dropped;
+} rocp_ctrl_t;
+```
+
+The tool's callback reads `enabled_domain_mask`, `filter_pattern`, etc. on every event and decides whether to emit it. This gives **per-operation late filtering** without needing to add new domains. Performance impact: a few extra atomic loads per traced event (~2-5 ns, negligible compared to the ~50-200 ns full-tracing cost).
+
+**Recommendation: coexist with ptrace attach.**
+
+The two mechanisms serve different purposes and should be used together:
+
+| Use case | Mechanism |
+|---|---|
+| App didn't have ROCP_TOOL_LIBRARIES set, profile from outside | ptrace attach |
+| App was launched with ROCP_TOOL_LIBRARIES (always loaded), toggle tracing on/off | control channel |
+| Need to add a domain not in the pre-registered set | ptrace attach |
+| Need fast (~5 μs) on/off without ptrace permissions | control channel |
+| Multi-runtime config that doesn't change at runtime | control channel |
+| Change which APIs are profiled mid-run | control channel (tool-side filter) or ptrace (re-register) |
+
 ### Cross-Platform Considerations
 
 All four surviving control channel options (B, F, F+memfd, Signal) are **Linux-specific**:

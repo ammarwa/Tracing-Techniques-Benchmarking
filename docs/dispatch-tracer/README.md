@@ -41,4 +41,5 @@ The survey also covers:
 - **OpenMP OMPT integration** — OMPT starts enabled at init, shim controls noop behavior inside callbacks, same control channel as other runtimes
 - **OpenMP tool plugin interface** — how the OMPT tool library fits the dispatch tracer architecture, compared with rocprofiler-sdk, VTune, and Nsight approaches
 - **OpenTelemetry as output format** — using OTel for export/transport, not instrumentation
+- **Late configuration vs late activation** — what the control channel can and cannot reconfigure after process start, and how it coexists with rocprofiler-sdk's existing ptrace attach
 - **Cross-platform considerations** — Linux-specific mechanisms and portability fallbacks
