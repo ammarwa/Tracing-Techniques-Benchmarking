@@ -53,7 +53,7 @@ The control channel must satisfy:
 3. **No specific kernel version** — Must work on any modern Linux kernel
 4. **Cross-user security** — Other users on the system must not be able to interfere with, read, or modify another user's profiling session
 5. **Minimal hot-path overhead** — The "is tracing enabled?" check runs on every intercepted API call and must be as close to zero-cost as possible
-6. **Configuration richness** — Must support per-function enable/disable, filter patterns, output format, buffer sizes
+6. **Configuration richness** — Per-function enable/disable, filter patterns, output format, and buffer sizes are handled by existing `rocprofiler_configure_*` APIs at init time. The control channel must at minimum support activate/deactivate commands, and optionally carry additional runtime configuration
 7. **Multi-runtime applicability** — Must scale to tracing HIP, HSA/ROCR, RCCL, OpenMP, rocdecode, rocjpeg, and other GPU API libraries simultaneously
 
 ## Approaches Evaluated
@@ -67,7 +67,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 | A | POSIX shared memory (`shm_open` + `mmap`) | ~1-5 ns | Nothing | File mode `0600` on `/dev/shm/` |
 | B | mmap on regular file | ~1-5 ns | Nothing | Dir `0700` + file `0600` |
 
-**How they work:** The LD_PRELOAD library creates a shared memory region at initialization. The controller opens the same region and writes configuration (enable/disable flags, filter masks, output settings). The library reads the control flags via atomic loads on every intercepted call. No syscall on the hot path — pure memory access.
+**How they work:** The tool library creates a shared memory region during its `initialize` callback. The controller opens the same region and writes commands (activate/deactivate context). The tool's background thread reads the command and calls `rocprofiler_start_context()` / `rocprofiler_stop_context()`. No IPC on the hot path — the hot path is entirely within rocprofiler-sdk's existing `populate_contexts()` check.
 
 ### Category 2: BPF-Based
 
@@ -78,7 +78,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 | P | BPF ring buffer | ~10-50 ns | `CAP_BPF`, kernel 6.1+ for USER_RINGBUF | Capability-gated |
 | Q | BPF token + mmapable map | ~1-5 ns | Kernel 6.9+ | Token-delegated |
 
-**How they work:** BPF maps are kernel-managed shared data structures accessible from both userspace and BPF programs. A mmapable BPF array map (`BPF_F_MMAPABLE`) can be mmap'd by both the controller and the LD_PRELOAD library, giving the same ~1-5 ns atomic load performance as POSIX shm. The unique value is that the same map is simultaneously readable by kernel-side BPF programs, enabling hybrid kernel+userspace tracing controlled by a single flag. BPF ring buffers provide high-throughput streaming (good for trace data) but are unidirectional and message-based (poor for shared state).
+**How they work:** BPF maps are kernel-managed shared data structures accessible from both userspace and BPF programs. A mmapable BPF array map (`BPF_F_MMAPABLE`) can be mmap'd by both the controller and the tool library, giving ~1-5 ns atomic load performance. The unique value is that the same map is simultaneously readable by kernel-side BPF programs, enabling hybrid kernel+userspace tracing controlled by a single flag. BPF ring buffers provide high-throughput streaming (good for trace data) but are unidirectional and message-based (poor for shared state).
 
 ### Category 3: Socket-Based
 
@@ -87,7 +87,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 | F | Unix domain socket | ~1-5 ns (local atomic) | Nothing | `SO_PEERCRED` (kernel-verified effective UID/PID) |
 | F+memfd | Unix socket + `memfd_create` | ~1-5 ns (mmap'd memfd) | Nothing | `SO_PEERCRED` + no filesystem entry |
 
-**How they work:** The LD_PRELOAD library creates a listener socket (abstract namespace) and spawns a background thread. The controller connects, is authenticated via `SO_PEERCRED` (kernel-verified effective UID/GID at connect time, unforgeable), and sends commands. The library updates a process-local atomic variable that the hot path checks. The socket is only for the control plane — no socket I/O per intercepted call. The F+memfd variant adds `memfd_create` to create anonymous shared memory passed via `SCM_RIGHTS`, combining socket authentication with mmap-speed shared config access.
+**How they work:** The tool library creates a listener socket (abstract namespace) and spawns a background thread during its `initialize` callback. The controller connects, is authenticated via `SO_PEERCRED` (kernel-verified effective UID/GID at connect time, unforgeable), and sends commands. The background thread calls `rocprofiler_start_context()` / `rocprofiler_stop_context()`. No socket I/O on the hot path — the hot path is entirely within rocprofiler-sdk's existing `populate_contexts()`. The F+memfd variant adds `memfd_create` for anonymous shared memory passed via `SCM_RIGHTS`, enabling the controller to write commands directly to mmap'd memory.
 
 ### Category 4: Direct Memory Access
 
@@ -96,7 +96,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 | L | `/proc/<pid>/mem` direct write | ~1-5 ns (target side) | ptrace permissions | `ptrace_scope` + UID |
 | M | `process_vm_writev` | ~1-5 ns (target side) | ptrace permissions | `ptrace_scope` + UID |
 
-**How they work:** The LD_PRELOAD library exports known symbols (`__dispatch_ctrl`, `__dispatch_config`) in its `.data` section. The controller resolves their addresses by parsing `/proc/<pid>/maps` + ELF symbol offsets, then writes directly to the target's memory via `/proc/<pid>/mem` (pwrite) or `process_vm_writev` (scatter-gather syscall). The target process is completely passive — no setup, no threads, no IPC. This is conceptually how GDB modifies variables in a running process.
+**How they work:** The tool library exports known symbols in its `.data` section. The controller resolves their addresses by parsing `/proc/<pid>/maps` + ELF symbol offsets, then writes directly to the target's memory via `/proc/<pid>/mem` (pwrite) or `process_vm_writev` (scatter-gather syscall). The target process is completely passive — no background thread needed. This is conceptually how GDB modifies variables in a running process.
 
 ### Category 5: Signal-Based
 
@@ -105,7 +105,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 | J | SIGUSR1/SIGUSR2 | ~1-5 ns (`sig_atomic_t`) | Nothing | `kill()` UID check |
 | K | Real-time signal (SIGRTMIN+n) | ~1-5 ns | Nothing | `kill()` UID check |
 
-**How they work:** The LD_PRELOAD library registers a signal handler that toggles a `volatile sig_atomic_t` flag. The controller sends `kill(target_pid, SIGUSR1)`. The kernel enforces that only processes with the same UID can send signals. Carries zero configuration data (SIGUSR1/2) or one `int` via `sigqueue()` (real-time signals). Useful only as a trigger, not a config channel.
+**How they work:** The tool library registers a signal handler during its `initialize` callback. The controller sends `kill(target_pid, SIGUSR1)`. The kernel enforces that only processes with the same UID can send signals. Carries zero configuration data (SIGUSR1/2) or one `int` via `sigqueue()` (real-time signals). Useful as an instant wakeup trigger paired with a data channel (B or F+memfd) for the actual command.
 
 ### Category 6: Code Injection
 
@@ -123,7 +123,7 @@ We applied two hard filters:
 
 | Eliminated | Reason |
 |------------|--------|
-| **C** (BPF map + mmap) | Requires `CAP_BPF` on both controller and LD_PRELOAD library |
+| **C** (BPF map + mmap) | Requires `CAP_BPF` on both controller and tool library |
 | **O** (BPF map syscall) | Requires `CAP_BPF`; also ~150-300 ns per-call syscall overhead is unacceptable |
 | **P** (BPF ring buffer) | Requires `CAP_BPF`; kernel 6.1+ for `USER_RINGBUF`; wrong primitive for control state |
 | **Q** (BPF token) | Requires kernel 6.9+ (not available on RHEL 8/9, Ubuntu 22.04) |
@@ -211,11 +211,11 @@ Anthony raised the concern about tracing OpenMP when the runtime is outside the 
 | `OMP_TOOL_LIBRARIES` | Environment variable listing shared libraries that provide `ompt_start_tool()`. | User sets before launch |
 | `ompt_set_callback()` | Tool registers callbacks for specific OMPT events (parallel begin/end, task create, sync, etc.). | Tool library at init time |
 
-The dispatch tracer provides its OMPT tool as a shared library (e.g., `libdispatch_ompt_tool.so`) that:
+The dispatch tracer provides its OMPT tool as a shared library (e.g., `librocprofiler-sdk-ompt-tool.so`) that:
 1. Exports `ompt_start_tool()` — discovered via `OMP_TOOL_LIBRARIES`
 2. Registers all OMPT callbacks via `ompt_set_callback()`
-3. Each callback checks the dispatch tracer's `tracing_enabled` flag
-4. Events flow through the same ring buffer / output infrastructure as HIP/HSA events
+3. Each callback feeds into rocprofiler-sdk's context system — `populate_contexts()` determines whether the context is active
+4. Events flow through the existing `callback_tracing_service` / `buffer_tracing_service` infrastructure
 
 For comparison, here is how other profiling tools handle OpenMP:
 
