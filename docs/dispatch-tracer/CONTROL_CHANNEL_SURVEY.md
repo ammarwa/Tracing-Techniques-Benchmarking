@@ -2,11 +2,23 @@
 
 ## Overview
 
-This document surveys all control channel mechanisms considered for a new tracing technique: the **Dispatch Table Tracer**. This tracer uses LD_PRELOAD to intercept API calls via a function dispatch table that starts as a **noop passthrough** and only activates tracing when an external controller process attaches at runtime with configuration.
+This document surveys all control channel mechanisms considered for a new tracing technique: the **Dispatch Table Tracer**. This tracer intercepts API calls via a function dispatch table that starts as a **noop passthrough** and only activates tracing when an external controller process attaches at runtime with configuration.
 
 The core architecture is inspired by [rocprofiler-sdk](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocprofiler-sdk), which uses intercept tables that start as passthrough and are swapped to tracing wrappers when a profiling tool attaches. The goal is to bring this pattern to the Tracing-Techniques-Benchmarking framework and evaluate it against the existing LTTng, eBPF, and bpftime techniques.
 
-The key design question is: **how does the external controller tell the LD_PRELOAD library to start/stop tracing and with what configuration?** This is the "control channel."
+### Initialization: rocprofiler-register Methodology
+
+All designs in this document use the **rocprofiler-register** pattern for initialization, not `__attribute__((constructor))` or `dlsym(RTLD_NEXT)`:
+
+1. Each **runtime library** (HIP, HSA, RCCL, or the benchmark's `libmylib.so`) calls `dispatch_register_library_api_table()` during its own initialization, passing its API function pointer table.
+2. The **registration library** scans for `dispatch_configure` symbols (via `DISPATCH_TOOL_LIBRARIES` env var or weak symbol lookup).
+3. If a **tool** (dispatch tracer) is found, its `on_intercept_table_registration()` callback receives the API table pointers.
+4. The tool **saves the original function pointers** and **installs noop shim wrappers** in the API table.
+5. The tool sets up the **control channel** (the subject of this survey) so an external controller can later toggle the shims from noop to active tracing.
+
+This means the runtime libraries **voluntarily participate** in registration — no LD_PRELOAD symbol interposition is needed for the interception mechanism itself. The tool library is discovered and loaded automatically during the first runtime library's registration.
+
+The key design question is: **how does the external controller tell the tool library to start/stop tracing and with what configuration?** This is the "control channel."
 
 ## Requirements
 

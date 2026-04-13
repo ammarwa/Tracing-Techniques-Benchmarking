@@ -159,15 +159,28 @@ Phase 3 (queries): Controller uses socket for CMD_STATUS, CMD_FLUSH
 - Bidirectional via socket for queries
 - Zero filesystem footprint
 
+## Initialization: rocprofiler-register Methodology
+
+Same as all options — see [Option B](OPTION_B_MMAP_FILE.md#initialization-rocprofiler-register-methodology) for the full registration flow. The signal setup happens during the tool's registration callback, not in a constructor.
+
 ## Components
 
-### 1. Signal Registration (`dispatch_signal_wrapper.c`)
+### 1. Signal Registration (in the registration callback)
 
 ```c
 static int wakeup_pipe[2];
 
-__attribute__((constructor))
-static void init(void) {
+/* Called during registration — NOT a constructor */
+static void on_intercept_table_registration(
+    const char* lib_name,
+    void** api_table,
+    size_t func_count)
+{
+    // Save originals and install shim wrappers (same as other options)
+    memcpy(&orig_table, api_table, func_count * sizeof(void*));
+    ((mylib_api_table_t*)api_table)->my_traced_function =
+        shim_my_traced_function;
+
     // Cache UID for signal handler (avoids calling getuid() in handler)
     cached_uid = getuid();
 
@@ -185,7 +198,7 @@ static void init(void) {
     // Initialize data channel (B or F+memfd)
     init_data_channel();
 
-    // Spawn background config thread (joinable for clean shutdown on dlclose)
+    // Spawn background config thread (joinable for clean shutdown)
     pthread_create(&config_thread, NULL, config_loop, NULL);
 }
 ```

@@ -4,25 +4,59 @@
 
 This design uses a **memory-mapped regular file** as the control channel between the LD_PRELOAD dispatch tracer library and an external controller process. The file lives under the user's private runtime directory (`/run/user/<uid>/`), providing directory-level permission isolation. Both the controller and the library mmap the same file, giving ~1-5 ns atomic load overhead on the hot path with no syscall.
 
+## Initialization: rocprofiler-register Methodology
+
+Instead of using `__attribute__((constructor))` or `dlsym(RTLD_NEXT)`, the dispatch tracer uses the **rocprofiler-register** pattern: each runtime library (HIP, HSA, etc.) registers its API table during its own initialization, and the tracer intercepts the tables during registration.
+
+```
+Registration flow:
+
+  1. Runtime library (e.g., libamdhip64.so) initializes
+  2. Runtime calls: rocprofiler_register_library_api_table(
+         "hip", import_func, version, &api_tables, table_count, &id)
+  3. rocprofiler-register scans for rocprofiler_configure symbols
+  4. If found, invokes tool callbacks with the API table pointers
+  5. Tool (dispatch tracer) receives table pointers, saves originals,
+     installs noop shim wrappers that check ctrl->tracing_enabled
+  6. Runtime continues — all API calls now go through shims
+```
+
+This means:
+- **No LD_PRELOAD needed** for the interception itself — the runtime voluntarily passes its API table
+- **No `dlsym(RTLD_NEXT)`** — original function pointers come directly from the registration
+- **Works with any library** that calls `rocprofiler_register_library_api_table()`
+- **Tool discovery** via `rocprofiler_configure` symbol (weak symbol or `ROCP_TOOL_LIBRARIES` env var)
+
+For the benchmark repo's sample library, we simulate this by adding a `register_api_table()` call in `libmylib.so`'s init.
+
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Target Process (sample_app)              │
 │                                                              │
-│  LD_PRELOAD=libmylib_dispatch_mmap.so                       │
+│  libmylib.so (runtime library):                             │
+│    init():                                                   │
+│      api_table.my_traced_function = &real_impl;             │
+│      dispatch_register_library_api_table(                   │
+│          "mylib", &api_table, 1);                           │
+│                                                              │
+│  libdispatch_tool.so (tracer — discovered via               │
+│                       DISPATCH_TOOL_LIBRARIES env var):      │
+│    dispatch_configure():                                     │
+│      // Called by register library during registration       │
+│      save original: orig_table = copy(api_table);           │
+│      install shim:  api_table->my_traced_function =         │
+│                       &shim_my_traced_function;             │
+│      setup control: create mmap file, init ctrl struct      │
 │                                                              │
 │  ┌────────────────────────────────────────────────────────┐ │
-│  │  constructor():                                         │ │
+│  │  Shim setup (during registration callback):             │ │
 │  │    dir = /run/user/<uid>/dispatch/<pid>/                │ │
 │  │    mkdir(dir, 0700)                                     │ │
 │  │    fd = open(dir/ctrl, O_CREAT|O_RDWR, 0600)           │ │
-│  │    ftruncate(fd, sizeof(dispatch_ctrl_t))               │ │
-│  │    ctrl = mmap(fd, PROT_READ|PROT_WRITE, MAP_SHARED)   │ │
-│  │    ctrl->magic = random_nonce()                         │ │
-│  │    ctrl->version = 0                                    │ │
-│  │    ctrl->tracing_enabled = 0                            │ │
-│  │    dlsym(RTLD_NEXT) → resolve real function pointers    │ │
+│  │    ctrl = mmap(fd, ...)                                 │ │
+│  │    ctrl->tracing_enabled = 0  // noop by default        │ │
 │  └────────────────────────────────────────────────────────┘ │
 │                                                              │
 │  ┌────────────────────────────────────────────────────────┐ │
@@ -111,30 +145,90 @@ typedef struct {
 
 ## Components
 
-### 1. LD_PRELOAD Library (`dispatch_mmap_wrapper.c`)
+### 1. Runtime Library Registration (`libmylib.so` — the traced library)
 
-The wrapper library intercepts `my_traced_function()` via symbol interposition (same mechanism as the existing LTTng wrapper):
+The runtime library registers its API table during its own initialization. This replaces LD_PRELOAD + `dlsym(RTLD_NEXT)`:
 
 ```c
-// Resolve real function at load time
-static void (*real_my_traced_function)(int, uint64_t, double, void*) = NULL;
+/* In the runtime library (e.g., libmylib.so or libamdhip64.so) */
 
-__attribute__((constructor))
-static void init(void) {
-    real_my_traced_function = dlsym(RTLD_NEXT, "my_traced_function");
+/* The API table: function pointers for all public APIs */
+typedef struct {
+    void (*my_traced_function)(int, uint64_t, double, void*);
+    void (*set_simulated_work_duration)(unsigned int);
+} mylib_api_table_t;
 
-    // Create control region
+static mylib_api_table_t api_table = {
+    .my_traced_function = real_my_traced_function_impl,
+    .set_simulated_work_duration = real_set_simulated_work_duration_impl,
+};
+
+/* Called during library init — NOT a constructor, but part of the
+ * library's normal initialization path. In rocprofiler-sdk, HIP/HSA
+ * runtimes call this during their first API call or explicit init. */
+void mylib_init(void) {
+    /* Register our API table with the registration library.
+     * If a tool (dispatch tracer) has registered interest via
+     * dispatch_configure, it will be called back with a pointer
+     * to our api_table, allowing it to save originals and
+     * install shim wrappers. */
+    dispatch_register_library_api_table(
+        "mylib",                    // library name
+        MYLIB_API_VERSION,          // version
+        (void**)&api_table,         // pointer to API table
+        sizeof(api_table) / sizeof(void(*)(void)),  // function count
+        NULL);                      // output identifier
+}
+
+/* All public API functions go through the table */
+void my_traced_function(int a1, uint64_t a2, double a3, void* a4) {
+    api_table.my_traced_function(a1, a2, a3, a4);
+}
+```
+
+### 2. Dispatch Tool Library (`libdispatch_tool.so` — the tracer)
+
+The tool library provides a `dispatch_configure` function (analogous to `rocprofiler_configure`). The registration library discovers it via `DISPATCH_TOOL_LIBRARIES` environment variable or weak symbol scan.
+
+```c
+/* Discovered by the registration library during library registration */
+dispatch_tool_configure_result_t* dispatch_configure(
+    uint32_t version,
+    const char* version_string,
+    uint32_t client_id)
+{
+    static dispatch_tool_configure_result_t result = {
+        .initialize = tool_initialize,
+        .finalize = tool_finalize,
+    };
+    return &result;
+}
+
+/* Called when a runtime library registers its API table */
+static void on_intercept_table_registration(
+    const char* lib_name,
+    void** api_table,
+    size_t func_count)
+{
+    // Save original function pointers
+    memcpy(&orig_table, api_table, func_count * sizeof(void*));
+
+    // Install noop shim wrappers
+    ((mylib_api_table_t*)api_table)->my_traced_function =
+        shim_my_traced_function;
+
+    // Setup control channel (mmap file)
+    setup_mmap_control();
+}
+
+static void setup_mmap_control(void) {
     char path[PATH_MAX];
-    // Create parent directory first, then PID-specific subdirectory.
-    // Use O_NOFOLLOW on open to prevent symlink attacks by same-user processes.
     snprintf(path, sizeof(path), "/run/user/%u/dispatch",
              (unsigned)getuid());
-    mkdir(path, 0700);  // may already exist — OK
+    mkdir(path, 0700);
     snprintf(path, sizeof(path), "/run/user/%u/dispatch/%d",
              (unsigned)getuid(), getpid());
-    if (mkdir(path, 0700) < 0 && errno != EEXIST) {
-        // Fallback or error handling
-    }
+    if (mkdir(path, 0700) < 0 && errno != EEXIST) { /* handle */ }
     strncat(path, "/ctrl", sizeof(path) - strlen(path) - 1);
 
     int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
@@ -149,18 +243,19 @@ static void init(void) {
     ctrl->tracing_enabled = 0;
 }
 
-// Hot path
+/* Shim: noop by default, traces when enabled */
 __attribute__((hot))
-void my_traced_function(int arg1, uint64_t arg2, double arg3, void* arg4) {
+static void shim_my_traced_function(
+    int arg1, uint64_t arg2, double arg3, void* arg4)
+{
     if (__builtin_expect(
             __atomic_load_n(&ctrl->tracing_enabled, __ATOMIC_ACQUIRE), 0)) {
-        // Tracing logic: timestamps, ring buffer, etc.
         trace_entry(FUNC_MY_TRACED_FUNCTION, arg1, arg2, arg3, arg4);
-        real_my_traced_function(arg1, arg2, arg3, arg4);
+        orig_table.my_traced_function(arg1, arg2, arg3, arg4);
         trace_exit(FUNC_MY_TRACED_FUNCTION);
         return;
     }
-    real_my_traced_function(arg1, arg2, arg3, arg4);
+    orig_table.my_traced_function(arg1, arg2, arg3, arg4);
 }
 ```
 

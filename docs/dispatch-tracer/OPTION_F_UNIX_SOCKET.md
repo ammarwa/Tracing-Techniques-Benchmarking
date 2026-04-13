@@ -172,21 +172,37 @@ Controller                      Library (bg thread)
     ├──────────────────────────────>│
 ```
 
+## Initialization: rocprofiler-register Methodology
+
+Same as all options — see [Option B](OPTION_B_MMAP_FILE.md#initialization-rocprofiler-register-methodology) for the full registration flow. The runtime library calls `dispatch_register_library_api_table()` during its own init. The tool library receives the API table via a callback, saves originals, installs shim wrappers, and sets up the socket control channel.
+
+No `__attribute__((constructor))` or `dlsym(RTLD_NEXT)` — original function pointers come from the registration.
+
 ## Components
 
-### 1. LD_PRELOAD Library (`dispatch_sock_wrapper.c`)
+### 1. Dispatch Tool Library (`libdispatch_tool.so`)
 
 ```c
 static _Atomic uint32_t local_enabled = 0;
 static dispatch_config_t local_config;
-static void (*real_my_traced_function)(int, uint64_t, double, void*) = NULL;
+static mylib_api_table_t orig_table;  // saved during registration
 static pthread_t control_thread;
+static int listen_fd_global = -1;
 
-__attribute__((constructor))
-static void init(void) {
-    real_my_traced_function = dlsym(RTLD_NEXT, "my_traced_function");
+/* Called during registration — tool receives the API table */
+static void on_intercept_table_registration(
+    const char* lib_name,
+    void** api_table,
+    size_t func_count)
+{
+    // Save originals from registration (not dlsym)
+    memcpy(&orig_table, api_table, func_count * sizeof(void*));
 
-    // Create abstract namespace socket (SOCK_CLOEXEC prevents fd leak across exec)
+    // Install shim wrappers into the runtime's API table
+    ((mylib_api_table_t*)api_table)->my_traced_function =
+        shim_my_traced_function;
+
+    // Setup socket control channel
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     addr.sun_path[0] = '\0';
@@ -196,35 +212,31 @@ static void init(void) {
          offsetof(struct sockaddr_un, sun_path) + 1 +
          strlen(addr.sun_path + 1));
     listen(sock, 1);
+    listen_fd_global = sock;
 
-    // Spawn background control thread (joinable — NOT detached, so destructor
-    // can cleanly shut it down before the library is unmapped on dlclose)
+    // Spawn background control thread (joinable for clean shutdown)
     pthread_create(&control_thread, NULL, control_loop, (void*)(intptr_t)sock);
 }
 
-// Destructor: signal shutdown and join thread before library unmap
-static int listen_fd_global = -1;  // set in init, used for shutdown
-
-__attribute__((destructor))
-static void cleanup(void) {
-    // Close the listen fd to break accept() in the control thread
+/* Tool finalize (called during shutdown) */
+static void tool_finalize(void) {
     if (listen_fd_global >= 0) close(listen_fd_global);
-    // Join the thread (blocks until it exits from the accept error)
     pthread_join(control_thread, NULL);
 }
 
-
-// Hot path — no socket involvement
+/* Shim: noop by default, traces when enabled by controller */
 __attribute__((hot))
-void my_traced_function(int arg1, uint64_t arg2, double arg3, void* arg4) {
+static void shim_my_traced_function(
+    int arg1, uint64_t arg2, double arg3, void* arg4)
+{
     if (__builtin_expect(
             __atomic_load_n(&local_enabled, __ATOMIC_ACQUIRE), 0)) {
         trace_entry(FUNC_MY_TRACED_FUNCTION, arg1, arg2, arg3, arg4);
-        real_my_traced_function(arg1, arg2, arg3, arg4);
+        orig_table.my_traced_function(arg1, arg2, arg3, arg4);
         trace_exit(FUNC_MY_TRACED_FUNCTION);
         return;
     }
-    real_my_traced_function(arg1, arg2, arg3, arg4);
+    orig_table.my_traced_function(arg1, arg2, arg3, arg4);
 }
 ```
 

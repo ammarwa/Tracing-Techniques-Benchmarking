@@ -10,29 +10,41 @@ This design combines the **Unix domain socket** (Option F) for authentication an
 
 This is the **recommended option for production** (e.g., rocprofiler-sdk) as it has the strongest security guarantees and lowest possible hot-path overhead with no cleanup burden.
 
+## Initialization: rocprofiler-register Methodology
+
+Same as all options — see [Option B](OPTION_B_MMAP_FILE.md#initialization-rocprofiler-register-methodology) for the full registration flow. The runtime library calls `dispatch_register_library_api_table()` during its own init. The tool library receives the API table via a callback, saves originals, installs shim wrappers, creates the memfd + socket control channel, and spawns the background thread.
+
+No `__attribute__((constructor))` or `dlsym(RTLD_NEXT)` — original function pointers come from the registration.
+
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Target Process (sample_app)                   │
 │                                                                  │
-│  LD_PRELOAD=libmylib_dispatch_memfd.so                          │
+│  libmylib.so (runtime):                                         │
+│    init(): dispatch_register_library_api_table("mylib", ...)    │
+│                                                                  │
+│  libdispatch_tool.so (tracer — via DISPATCH_TOOL_LIBRARIES):    │
+│    on_intercept_table_registration():                            │
+│      save orig_table, install shim wrappers                     │
+│      create memfd + socket, spawn bg thread                     │
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Main Thread                                               │  │
+│  │  Main Thread (API calls go through shims in api_table)     │  │
 │  │                                                            │  │
 │  │  hot path:                                                 │  │
 │  │    enabled = __atomic_load_n(&ctrl->tracing_enabled,       │  │
 │  │                              __ATOMIC_ACQUIRE);            │  │
-│  │    if (enabled) { trace(); real_fn(); trace_exit(); }      │  │
-│  │    else { real_fn(); }                                     │  │
+│  │    if (enabled) { trace(); orig_fn(); trace_exit(); }      │  │
+│  │    else { orig_fn(); }                                     │  │
 │  │                                                            │  │
 │  │  ctrl points to mmap'd memfd (anonymous shared memory)     │  │
 │  │  ~1-5 ns per check — no syscall, no socket, no file I/O   │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Background Thread (bootstrap only)                        │  │
+│  │  Background Thread (created during registration callback)  │  │
 │  │                                                            │  │
 │  │  Phase 1: Create memfd + control struct                   │  │
 │  │    memfd = memfd_create("ctrl", MFD_CLOEXEC |             │  │
