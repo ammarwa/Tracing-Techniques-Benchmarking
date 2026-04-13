@@ -218,10 +218,28 @@ static void on_intercept_table_registration(
     pthread_create(&control_thread, NULL, control_loop, (void*)(intptr_t)sock);
 }
 
-/* Tool finalize (called during shutdown) */
-static void tool_finalize(void) {
-    if (listen_fd_global >= 0) close(listen_fd_global);
+/* Tool finalize callback — called by registration library via atexit()
+ * or during explicit detach. Same pattern as rocprofiler-sdk:
+ * atomic flag prevents double-finalization. */
+static _Atomic int finalize_status = 0;
+
+static void tool_finalize(void* tool_data) {
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&finalize_status, &expected, -1,
+                                     0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;
+
+    __atomic_store_n(&local_enabled, 0, __ATOMIC_RELEASE);
+
+    // Close listen fd to break accept() in the control thread
+    if (listen_fd_global >= 0) {
+        close(listen_fd_global);
+        listen_fd_global = -1;
+    }
+    // Join the thread (blocks until it exits from the accept error)
     pthread_join(control_thread, NULL);
+
+    __atomic_store_n(&finalize_status, 1, __ATOMIC_SEQ_CST);
 }
 
 /* Shim: noop by default, traces when enabled by controller */
@@ -454,8 +472,8 @@ build/bin/dispatch_ctrl_sock --pid $! status
 
 ## Limitations
 
-1. **Background thread** — Default pthread stack is ~2 MB (configurable). Thread must be joinable for clean `dlclose()` shutdown.
-2. **fork() handling** — After `fork()`, the background thread is gone. `pthread_atfork()` child handler must close the listen fd and reset `local_enabled = 0`.
+1. **Background thread** — Default pthread stack is ~2 MB (configurable). Thread must be joinable so `tool_finalize` can `pthread_join()` it.
+2. **fork() handling** — After `fork()`, the background thread is gone. `pthread_atfork()` child handler must close the listen fd, reset `local_enabled = 0`, and set `finalize_status = 1` so the child's atexit handler skips cleanup.
 5. **Socket buffer limits** — Large config payloads may require multiple `send()`/`recv()` calls with framing.
 6. **Abstract namespace portability** — Abstract Unix sockets are Linux-specific (not available on macOS/BSD). For cross-platform, fall back to filesystem sockets.
 7. **Config update latency** — ~2-5 μs per config change (socket round-trip) vs ~50-100 ns for mmap-based options. Irrelevant for attach/detach but noticeable for high-frequency config updates.

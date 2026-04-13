@@ -350,10 +350,10 @@ build/bin/dispatch_ctrl_signal --pid $! disable
 1. **Signal handler context** — Only async-signal-safe functions allowed in the handler. Our handler only sets an atomic flag and writes 1 byte to a pipe (both safe).
 2. **Signal conflict** — If the application also uses `SIGRTMIN+7`, our handler clobbers theirs. Mitigated by using a configurable signal number via environment variable (`DISPATCH_SIGNAL=SIGRTMIN+9`).
 3. **Signal queuing limit** — `RLIMIT_SIGPENDING` (default ~128K) limits queued signals. Not a concern for config changes (rare events).
-4. **Background thread** — Same overhead as Options F/F+memfd (~2 MB default stack). Thread must be joinable for clean shutdown on `dlclose()`.
+4. **Background thread** — Same overhead as Options F/F+memfd (~2 MB default stack). Thread must be joinable so `tool_finalize()` (called via `atexit()`) can shut it down cleanly.
 5. **Lost wakeup recovery** — If signal handler fires when the self-pipe is full (`O_NONBLOCK`), the wakeup byte is silently dropped. The background thread uses `poll()` with a 30-second timeout as a fallback, so config changes are eventually applied even under signal flood.
 6. **Signal number coordination** — The controller and library must use the same signal number. If both sides are configured independently via environment variables (`DISPATCH_SIGNAL`), a mismatch causes silent failure. The controller should verify via `/proc/<pid>/status` SigCgt mask that the expected signal is registered.
-7. **fork() behavior** — After `fork()`, the signal handler is inherited but the background thread is not. The child has a registered handler that writes to a pipe nobody reads. A `pthread_atfork()` child handler should reset the signal handler to SIG_DFL and close the pipe.
+7. **fork() behavior** — After `fork()`, the signal handler is inherited but the background thread is not. A `pthread_atfork()` child handler should reset the signal handler to SIG_DFL, close the pipe, and set `finalize_status = 1` so the child's atexit handler skips cleanup.
 8. **Complexity** — This is a composite option (signal + data channel), so it has more moving parts than B or F alone. The benefit is instant notification for heavy config changes.
 9. **Overhead estimates are pre-implementation** — All timing figures should be validated with benchmarks after implementation.
 

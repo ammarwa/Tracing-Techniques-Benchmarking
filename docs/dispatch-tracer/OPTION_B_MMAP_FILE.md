@@ -311,24 +311,55 @@ int main(int argc, char** argv) {
 }
 ```
 
-### 3. Destructor / Cleanup
+### 3. Finalization (rocprofiler-sdk pattern)
+
+Cleanup uses the same `atexit()` + `tool_finalize` callback pattern as rocprofiler-sdk. No `__attribute__((destructor))` is used — finalization is driven by the registration library.
 
 ```c
-__attribute__((destructor))
-static void cleanup(void) {
+/* Finalization status — atomic flag prevents double-finalization */
+static _Atomic int finalize_status = 0;  // 0=ready, -1=in-progress, 1=done
+
+/* Called by the registration library during process exit (via atexit)
+ * or during explicit detach. This is the tool's finalize callback,
+ * returned from dispatch_configure(). */
+static void tool_finalize(void* tool_data) {
+    /* Prevent double-finalization (same pattern as rocprofiler-sdk) */
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&finalize_status, &expected, -1,
+                                     0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;  // already finalized or in progress
+
+    /* 1. Disable tracing (hot path sees this immediately) */
+    if (ctrl)
+        __atomic_store_n(&ctrl->tracing_enabled, 0, __ATOMIC_RELEASE);
+
+    /* 2. Cleanup control channel */
     if (ctrl) {
         munmap(ctrl, sizeof(dispatch_ctrl_t));
+        ctrl = NULL;
     }
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/run/user/%u/dispatch/%d/ctrl",
              (unsigned)getuid(), getpid());
     unlink(path);
-    // Remove directory (only succeeds if empty)
     char dir[PATH_MAX];
     snprintf(dir, sizeof(dir), "/run/user/%u/dispatch/%d",
              (unsigned)getuid(), getpid());
     rmdir(dir);
+
+    /* 3. Mark finalization complete */
+    __atomic_store_n(&finalize_status, 1, __ATOMIC_SEQ_CST);
 }
+
+/* Registration library calls atexit() during init:
+ *   atexit([]() {
+ *       invoke_client_finalizers();  // calls tool_finalize for each tool
+ *       destroy_static_objects();
+ *   });
+ *
+ * This ensures cleanup happens at process exit even if the tool
+ * doesn't explicitly detach. The atexit handler is registered once
+ * during the first runtime library registration. */
 ```
 
 ## Security Analysis
@@ -427,5 +458,5 @@ build/bin/dispatch_ctrl_mmap --pid $! --enable
 2. **Depends on `/run/user/<uid>/`** — Requires systemd's `pam_systemd` or equivalent to create the per-user tmpfs directory. If unavailable, a fallback to `/tmp/` is possible but requires extra care: `/tmp/` is world-writable, so the implementation must use `mkdtemp`-style randomization and `O_NOFOLLOW` to prevent symlink attacks.
 3. **No bidirectional communication** — The controller cannot query the library's state (e.g., "how many functions were discovered?"). It can only read the statistics counters.
 4. **Config struct size fixed at compile time** — `MAX_TRACED_FUNCTIONS=2048` is sufficient for all current ROCm APIs (HIP around 1300, HSA around 400, RCCL around 300). If new runtimes exceed this, bump the constant and `DISPATCH_STRUCT_VERSION`.
-5. **fork() behavior** — After `fork()`, the child inherits the mmap'd control region but has a different PID. The child's destructor would unlink a non-existent path. A `pthread_atfork()` child handler should reset `ctrl->tracing_enabled = 0` and set a flag to skip cleanup in the destructor.
+5. **fork() behavior** — After `fork()`, the child inherits the mmap'd control region but has a different PID. A `pthread_atfork()` child handler should reset `ctrl->tracing_enabled = 0` and set `finalize_status = 1` (already-finalized) so the child's atexit handler skips cleanup for the parent's control file.
 6. **Overhead estimates are pre-implementation** — All timing figures are projected from known syscall/memory-access costs and should be validated with benchmarks after implementation.

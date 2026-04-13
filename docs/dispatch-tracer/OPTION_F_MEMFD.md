@@ -399,7 +399,7 @@ build/bin/dispatch_ctrl_memfd --pid $! disable
 
 ## Limitations
 
-1. **Background thread** — Default pthread stack is ~2 MB. Thread must be joinable (not detached) so the destructor can `pthread_join()` before library unmap on `dlclose()`.
+1. **Background thread** — Default pthread stack is ~2 MB. Thread must be joinable so `tool_finalize()` (called via `atexit()`) can close the listen fd and `pthread_join()` it. No `__attribute__((destructor))` — cleanup is driven by the registration library's atexit handler, matching rocprofiler-sdk.
 2. **fork() handling** — After `fork()`, the child inherits the socket fd but the background thread is gone. A `pthread_atfork()` child handler must: close the listen fd, set `tracing_enabled = 0`, and optionally re-create the control socket.
 3. **Socket/memfd on exec()** — Listen socket must use `SOCK_CLOEXEC`, memfd must use `MFD_CLOEXEC`, to prevent fd leak after `execve()`.
 4. **`memfd_create` availability** — Requires kernel 3.17+ (2014). Sealing requires `MFD_ALLOW_SEALING` flag at creation.
