@@ -157,9 +157,9 @@ Phase 3 (queries): Controller uses socket for CMD_STATUS, CMD_FLUSH
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool uses standard rocprofiler-sdk APIs. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
+Same as all options — the tool uses standard rocprofiler-sdk APIs including `rocprofiler_force_configure()` for **late configuration**. See [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal) for the full late-configuration design.
 
-The signal handler's job is simple: when woken, the background thread calls `rocprofiler_start_context()` or `rocprofiler_stop_context()`. The signal setup happens during the tool's `initialize` callback.
+The signal serves as an instant wake mechanism for the background thread. When woken, the thread reads the paired data channel (mmap or memfd) and dispatches the command: `CMD_CONFIGURE` → `rocprofiler_force_configure()`, `CMD_ACTIVATE` → `rocprofiler_start_context()`, `CMD_DEACTIVATE` → `rocprofiler_stop_context()`. The signal handler itself only writes a wake byte to a pipe — the heavy work (force_configure, propagation, etc.) happens in the background thread, not the signal context.
 
 ## Components
 

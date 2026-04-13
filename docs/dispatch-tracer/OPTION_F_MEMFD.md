@@ -12,9 +12,9 @@ This is the **recommended option for production** (e.g., rocprofiler-sdk) as it 
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool uses standard rocprofiler-sdk APIs. The existing dispatch table machinery is reused as-is. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
+Same as all options — the tool uses standard rocprofiler-sdk APIs including `rocprofiler_force_configure()` for **late configuration**. See [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal) for the full late-configuration design.
 
-This option combines Option F's socket (for authentication + status queries) with a memfd containing the same `rocp_ctrl_t` struct as Option B. The difference from Option B: the control struct lives in anonymous memory (no filesystem), and authentication is via `SO_PEERCRED` (not directory permissions). The background thread polls the memfd for commands and calls `rocprofiler_start_context()` / `rocprofiler_stop_context()` — same as Option B.
+This option combines Option F's socket (for authentication + bootstrap) with a memfd containing the same `rocp_ctrl_t` struct as Option B (including the `rocp_config_t` payload for late configuration). The differences from Option B: the control struct lives in anonymous memory (no filesystem) and authentication is via `SO_PEERCRED`. The background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` and calls `rocprofiler_force_configure()` / `rocprofiler_start_context()` / `rocprofiler_stop_context()` — same as Option B.
 
 ## Architecture
 

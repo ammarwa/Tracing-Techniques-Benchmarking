@@ -14,14 +14,14 @@ This directory contains the design documentation for adding an **external contro
 
 ## Quick Comparison
 
-| Option | Hot-Path (noop) | Auth Model | Filesystem Footprint | Best For |
-|--------|----------------|------------|---------------------|----------|
-| **B** (mmap file) | ~10-20 ns | Dir `0700` + file `0600` | `/run/user/<uid>/rocprofiler/` | Simplicity |
-| **F** (Unix socket) | ~10-20 ns | `SO_PEERCRED` (kernel-verified) | None (abstract namespace) | Authentication |
-| **F+memfd** | ~10-20 ns | `SO_PEERCRED` + anonymous memory | None whatsoever | Production |
-| **Signal+B/F** | ~10-20 ns | `kill()` UID + paired channel | Depends on pair | Instant notification |
+| Option | Hot-Path (no attach) | Hot-Path (attached, inactive) | Auth Model | Best For |
+|--------|----------------------|-------------------------------|------------|----------|
+| **B** (mmap file) | **0 ns** | ~10-20 ns | Dir `0700` + file `0600` | Simplicity |
+| **F** (Unix socket) | **0 ns** | ~10-20 ns | `SO_PEERCRED` (kernel-verified) | Authentication |
+| **F+memfd** | **0 ns** | ~10-20 ns | `SO_PEERCRED` + anonymous memory | Production |
+| **Signal+B/F** | **0 ns** | ~10-20 ns | `kill()` UID + paired channel | Instant attach |
 
-Hot-path overhead is ~10-20 ns from rocprofiler-sdk's existing `populate_contexts()` call (iterates active contexts, bitset check). The control channel adds zero overhead to the hot path — it only toggles context activation from a background thread.
+When no controller has ever attached, the tool registers no contexts, `update_table()` installs zero wrappers, and the original function pointers stay in the dispatch table — **true zero overhead**. After the controller attaches via `CMD_CONFIGURE`, the tool calls `rocprofiler_force_configure()` which re-propagates runtime API tables and installs wrappers for the requested domains. The hot path then becomes ~10-20 ns when the context is inactive (existing `populate_contexts()`) or ~50-200 ns when active (full tracing pipeline).
 
 All options require **no root, no capabilities, and no specific kernel version**.
 

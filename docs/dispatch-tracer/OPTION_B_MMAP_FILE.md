@@ -19,11 +19,12 @@ The key insight from analyzing rocprofiler-sdk's existing code: **the existing f
 
 ## What Changes (Minimal)
 
-1. **Tool `initialize` callback**: creates the mmap control file and a background thread that polls it
-2. **Background thread**: reads the mmap'd control struct; when it sees `enabled=1`, calls `rocprofiler_start_context(ctx_id)`; when `enabled=0`, calls `rocprofiler_stop_context(ctx_id)`
-3. **`should_wrap_functor` override**: the tool registers interest in all operations during `rocprofiler_configure`, so wrappers are installed for everything (Level 1 noop is bypassed, but Level 2 noop still works at ~10-20 ns)
+1. **Placeholder `rocprofiler_configure`** at process start: returns a tool that does nothing — no context created, no domains registered. This means `update_table()` installs ZERO wrappers and the application runs at 100% native speed when no controller is attached.
+2. **Tool `initialize` callback**: only sets up the mmap control file and a background thread.
+3. **Background thread**: reads commands from the mmap. On `CMD_CONFIGURE`, stashes the config and calls `rocprofiler_force_configure(real_configure)`. On `CMD_ACTIVATE` / `CMD_DEACTIVATE`, calls `rocprofiler_start_context()` / `rocprofiler_stop_context()`.
+4. **Real configure callback** (called by SDK during `force_configure`): creates the context with the controller-specified domains, services, and output settings. The SDK automatically re-propagates runtime API tables, installing wrappers for the newly-interested operations.
 
-That's it. The wrapper code, dispatch table machinery, and callback infrastructure are untouched.
+That's it. The wrapper code, dispatch table machinery, and callback infrastructure are untouched. **Late configuration is fully supported** — no ptrace required.
 
 ## Architecture
 
@@ -33,17 +34,20 @@ That's it. The wrapper code, dispatch table machinery, and callback infrastructu
 │                                                              │
 │  Existing rocprofiler-sdk flow (unchanged):                 │
 │    Runtime → rocprofiler_set_api_table() → copy_table()     │
-│    → update_table() installs functor wrappers                │
+│    → update_table() — installs ZERO wrappers initially       │
+│      (placeholder tool registered no contexts)               │
 │                                                              │
 │  Tool library (loaded via ROCP_TOOL_LIBRARIES):             │
-│    rocprofiler_configure():                                  │
-│      create context with callback/buffer tracing             │
-│      register interest in ALL HIP/HSA/RCCL/OMPT operations  │
-│      DO NOT activate context yet (stays inactive)            │
-│    initialize():                                             │
-│      create mmap control file at                             │
+│    placeholder_configure():                                  │
+│      // Phase 1: do NOTHING                                  │
+│      // No context, no domains, no services                  │
+│      return result with initialize=phase1_init only          │
+│    phase1_init():                                            │
+│      // Only setup the control channel                       │
+│      create mmap file at                                     │
 │        /run/user/<uid>/rocprofiler/<pid>/ctrl                │
 │      spawn background thread polling the control file        │
+│      // No rocprofiler context exists yet                    │
 │                                                              │
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │  Existing functor hot path (NO CHANGES):                │ │
@@ -104,9 +108,30 @@ Since the existing rocprofiler-sdk context system handles per-operation enable/d
 
 enum rocp_ctrl_command {
     CMD_NONE       = 0,   // No pending command
-    CMD_ACTIVATE   = 1,   // Activate the context (start tracing)
-    CMD_DEACTIVATE = 2,   // Deactivate the context (stop tracing)
+    CMD_CONFIGURE  = 1,   // Apply config, create/recreate context (force_configure)
+    CMD_ACTIVATE   = 2,   // Start an existing configured context
+    CMD_DEACTIVATE = 3,   // Stop the context (wrappers stay, Level 2 noop)
 };
+
+/* Configuration the controller sends with CMD_CONFIGURE.
+ * The tool's real_tool_initialize reads this to decide which
+ * domains/services to register. */
+typedef struct {
+    uint32_t enable_hip       : 1;
+    uint32_t enable_hsa       : 1;
+    uint32_t enable_rccl      : 1;
+    uint32_t enable_ompt      : 1;
+    uint32_t enable_rocdecode : 1;
+    uint32_t enable_rocjpeg   : 1;
+    uint32_t enable_kernel_dispatch : 1;
+    uint32_t reserved         : 25;
+
+    uint32_t output_format;   // TEXT=0, JSON=1, OTLP=2, PERFETTO=3
+    uint32_t buffer_size_kb;
+    char output_path[256];
+    char filter_pattern[256];
+    char exclude_pattern[256];
+} rocp_config_t;
 
 typedef struct {
     /* Identification */
@@ -117,9 +142,12 @@ typedef struct {
     _Atomic uint32_t command;    // rocp_ctrl_command
     _Atomic uint32_t version;    // Bumped by controller on every command
 
+    /* Configuration (controller writes, tool reads on CMD_CONFIGURE) */
+    rocp_config_t config;
+
     /* Status (tool → controller, read-only from controller side) */
     _Atomic uint32_t context_active;  // 0 = inactive, 1 = active
-    _Atomic uint32_t context_id;      // rocprofiler_context_id_t.handle
+    _Atomic uint32_t context_id;      // rocprofiler_context_id_t.handle (0 if not yet configured)
     _Atomic uint64_t events_traced;
     _Atomic uint64_t events_dropped;
 
@@ -152,33 +180,15 @@ rocprofiler_configure(uint32_t version, const char* runtime_version,
     return &result;
 }
 
-/* tool_initialize — called after all runtimes registered */
-static void tool_initialize(rocprofiler_client_finalize_t fini_func,
-                             void* tool_data)
+/* phase1_init — placeholder, only sets up the control channel.
+ * No context, no domains, no services.
+ * update_table() installs ZERO wrappers — application runs at native speed. */
+static void phase1_init(rocprofiler_client_finalize_t fini_func, void* tool_data)
 {
-    /* 1. Create context with callback+buffer tracing (existing API) */
-    rocprofiler_context_id_t ctx;
-    rocprofiler_create_context(&ctx);
-
-    /* 2. Register interest in ALL HIP/HSA/RCCL operations.
-     *    This causes update_table() to install wrappers for everything.
-     *    (NULL operations = all operations in the domain) */
-    rocprofiler_configure_callback_tracing_service(
-        ctx, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
-        NULL, 0, my_callback, NULL);
-    rocprofiler_configure_callback_tracing_service(
-        ctx, ROCPROFILER_CALLBACK_TRACING_HSA_CORE_API,
-        NULL, 0, my_callback, NULL);
-    /* ... repeat for RCCL, OMPT, rocdecode, rocjpeg ... */
-
-    /* 3. DO NOT activate context yet — stays inactive.
-     *    populate_contexts() will find nothing → wrappers noop. */
-
-    /* 4. Setup mmap control channel (the only new code) */
-    setup_mmap_control(ctx);
+    setup_mmap_control();  /* Only new code at process start */
 }
 
-static void setup_mmap_control(rocprofiler_context_id_t ctx) {
+static void setup_mmap_control(void) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/run/user/%u/rocprofiler",
              (unsigned)getuid());
@@ -198,12 +208,60 @@ static void setup_mmap_control(rocprofiler_context_id_t ctx) {
     ctrl->struct_version = ROCP_CTRL_VERSION;
     ctrl->command = CMD_NONE;
     ctrl->context_active = 0;
-    ctrl->context_id = ctx.handle;
     ctrl->pid = getpid();
 
-    /* Spawn background thread to poll control file */
-    saved_ctx = ctx;
+    /* Spawn background thread — context will be created later on attach */
     pthread_create(&bg_thread, NULL, control_poll_loop, NULL);
+}
+```
+
+### 1b. Real Configure (Phase 2 — invoked at attach via `force_configure`)
+
+```c
+/* Stash for the new configure callback to read */
+static rocp_config_t g_pending_config;
+static rocprofiler_context_id_t saved_ctx = {0};
+
+/* Called by the SDK when the bg thread invokes rocprofiler_force_configure() */
+rocprofiler_tool_configure_result_t*
+real_tool_configure(uint32_t version, const char* runtime_version,
+                    uint32_t priority, rocprofiler_client_id_t* id)
+{
+    *id = (rocprofiler_client_id_t){.name = "rocp-mmap-real"};
+    static rocprofiler_tool_configure_result_t result = {
+        .size = sizeof(result),
+        .initialize = real_tool_initialize,
+        .finalize   = real_tool_finalize,
+    };
+    return &result;
+}
+
+/* Creates context with controller-specified domains.
+ * SDK then re-propagates runtime API tables, installing wrappers
+ * only for operations this context cares about. */
+static void real_tool_initialize(rocprofiler_client_finalize_t fini, void* d)
+{
+    rocprofiler_context_id_t ctx;
+    rocprofiler_create_context(&ctx);
+
+    if (g_pending_config.enable_hip)
+        rocprofiler_configure_callback_tracing_service(
+            ctx, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
+            NULL, 0, my_callback, NULL);
+    if (g_pending_config.enable_hsa)
+        rocprofiler_configure_callback_tracing_service(
+            ctx, ROCPROFILER_CALLBACK_TRACING_HSA_CORE_API,
+            NULL, 0, my_callback, NULL);
+    if (g_pending_config.enable_rccl)
+        rocprofiler_configure_callback_tracing_service(
+            ctx, ROCPROFILER_CALLBACK_TRACING_RCCL_API,
+            NULL, 0, my_callback, NULL);
+    /* ... OMPT, rocdecode, rocjpeg per controller config ... */
+
+    saved_ctx = ctx;
+    __atomic_store_n(&ctrl->context_id, ctx.handle, __ATOMIC_RELEASE);
+    rocprofiler_start_context(ctx);
+    __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
 }
 ```
 
@@ -212,15 +270,37 @@ static void setup_mmap_control(rocprofiler_context_id_t ctx) {
 ```c
 static void* control_poll_loop(void* arg) {
     uint32_t last_version = 0;
+    bool first_configure = true;
+
     while (!__atomic_load_n(&shutdown_flag, __ATOMIC_ACQUIRE)) {
         uint32_t ver = __atomic_load_n(&ctrl->version, __ATOMIC_ACQUIRE);
         if (ver != last_version) {
             uint32_t cmd = __atomic_load_n(&ctrl->command, __ATOMIC_ACQUIRE);
-            if (cmd == CMD_ACTIVATE && !ctrl->context_active) {
-                rocprofiler_start_context(saved_ctx);   // EXISTING API
+
+            if (cmd == CMD_CONFIGURE) {
+                /* Read controller's config from the mmap */
+                memcpy(&g_pending_config, &ctrl->config, sizeof(g_pending_config));
+
+                if (first_configure) {
+                    /* First attach: trigger late configuration via SDK API.
+                     * SDK will call real_tool_configure → real_tool_initialize
+                     * → re-propagate runtime API tables → install wrappers */
+                    rocprofiler_force_configure(real_tool_configure);
+                    first_configure = false;
+                } else {
+                    /* Reconfigure: stop current context, force re-configure
+                     * with new domains, start new context */
+                    rocprofiler_stop_context(saved_ctx);
+                    rocprofiler_force_configure(real_tool_configure);
+                    /* real_tool_initialize creates new context and starts it */
+                }
+
+            } else if (cmd == CMD_ACTIVATE && saved_ctx.handle != 0) {
+                rocprofiler_start_context(saved_ctx);
                 __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
-            } else if (cmd == CMD_DEACTIVATE && ctrl->context_active) {
-                rocprofiler_stop_context(saved_ctx);    // EXISTING API
+
+            } else if (cmd == CMD_DEACTIVATE && saved_ctx.handle != 0) {
+                rocprofiler_stop_context(saved_ctx);
                 __atomic_store_n(&ctrl->context_active, 0, __ATOMIC_RELEASE);
             }
             last_version = ver;
@@ -249,7 +329,22 @@ int main(int argc, char** argv) {
     if (ctrl->magic != ROCP_CTRL_MAGIC) { /* error */ }
     if (ctrl->struct_version != ROCP_CTRL_VERSION) { /* error */ }
 
-    if (strcmp(action, "activate") == 0) {
+    if (strcmp(action, "configure") == 0) {
+        /* First-time attach OR reconfigure: write config, send CMD_CONFIGURE.
+         * The tool's bg thread will call rocprofiler_force_configure(),
+         * which causes wrappers to be installed for the requested domains. */
+        ctrl->config.enable_hip       = parse_flag(argc, argv, "--hip");
+        ctrl->config.enable_hsa       = parse_flag(argc, argv, "--hsa");
+        ctrl->config.enable_rccl      = parse_flag(argc, argv, "--rccl");
+        ctrl->config.enable_ompt      = parse_flag(argc, argv, "--ompt");
+        ctrl->config.output_format    = parse_format(argc, argv);
+        ctrl->config.buffer_size_kb   = parse_int(argc, argv, "--buf-kb", 4096);
+        strncpy(ctrl->config.output_path, parse_str(argc, argv, "--out"), 255);
+
+        __atomic_store_n(&ctrl->command, CMD_CONFIGURE, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctrl->version, ctrl->version + 1, __ATOMIC_RELEASE);
+        printf("Configured & activated tracing for PID %d\n", target_pid);
+    } else if (strcmp(action, "activate") == 0) {
         __atomic_store_n(&ctrl->command, CMD_ACTIVATE, __ATOMIC_RELAXED);
         __atomic_store_n(&ctrl->version, ctrl->version + 1, __ATOMIC_RELEASE);
         printf("Activated context %u for PID %d\n", ctrl->context_id, target_pid);
@@ -311,13 +406,16 @@ static void tool_finalize(void* tool_data) {
 
 | Phase | Cost | Detail |
 |-------|------|--------|
-| Tool init | ~10-50 μs | `mkdir` + `open` + `ftruncate` + `mmap` + `pthread_create` |
-| Controller attach | ~5-20 μs | `open` + `mmap` + write CMD_ACTIVATE |
-| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — iterates active contexts, finds none |
-| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
-| Context toggle latency | ~1 ms | Background thread poll interval (or futex wake) |
-| Controller detach | ~1 μs | Write CMD_DEACTIVATE + munmap |
+| Tool init (Phase 1, no context) | ~10-50 μs | `mkdir` + `open` + `ftruncate` + `mmap` + `pthread_create` |
+| **Hot-path before any attach** | **0 ns** | No wrappers installed — original function pointers in dispatch table |
+| Controller attach + first configure | ~5-50 ms | `mmap` + `force_configure` + re-propagate runtime API tables + `update_table` |
+| **Hot-path (tool configured but inactive)** | **~10-20 ns** | Existing `populate_contexts()` finds no active context |
+| **Hot-path (tool configured and active)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
+| Activate / Deactivate (after configure) | ~1 μs | Write `CMD_*` + bg thread sees within 1 ms |
+| Reconfigure (add new domains) | ~5-50 ms | Same as first configure (re-run propagation) |
 | Tool cleanup | ~5 μs | `rocprofiler_stop_context` + munmap + unlink + rmdir |
+
+**Key property**: when no controller ever attaches, the tool has **zero hot-path overhead** because no wrappers are installed. The application runs at 100% native speed.
 
 ## Multi-Runtime Application (rocprofiler-sdk)
 
@@ -374,19 +472,27 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead (tool loaded, context not activated):
+# Zero overhead (tool loaded, no controller attached, no wrappers installed):
 ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_mmap.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
-# With tracing:
+# Late configuration + activation (true late attach, no ptrace):
 # Terminal 1:
 ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_mmap.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
-# Terminal 2:
-build/bin/rocp_ctrl_mmap --pid $! activate
-# ... tracing active ...
+# Terminal 2 — first attach: configure which APIs to trace:
+build/bin/rocp_ctrl_mmap --pid $! configure --hip --hsa --output json --out trace.json
+# ... tracing now active for HIP+HSA only ...
+
+# Toggle off without losing config:
 build/bin/rocp_ctrl_mmap --pid $! deactivate
+
+# Toggle on again:
+build/bin/rocp_ctrl_mmap --pid $! activate
+
+# Reconfigure mid-run to add RCCL:
+build/bin/rocp_ctrl_mmap --pid $! configure --hip --hsa --rccl --output json --out trace.json
 ```
 
 ## Limitations

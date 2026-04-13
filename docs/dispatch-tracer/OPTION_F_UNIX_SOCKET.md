@@ -129,11 +129,11 @@ Controller                      Tool (bg thread)
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool uses standard rocprofiler-sdk APIs. The existing dispatch table machinery is reused as-is. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
+Same as all options — the tool uses standard rocprofiler-sdk APIs including `rocprofiler_force_configure()` for **late configuration**. See [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal) for the full late-configuration design (placeholder configure at process start, real configure invoked at attach via `rocprofiler_force_configure`, propagation re-runs `update_table` to install wrappers for the requested domains).
 
-The **only difference from Option B** is the IPC mechanism: instead of an mmap'd file polled by a background thread, this option uses a Unix domain socket where the background thread blocks on `accept()`/`recv()` and responds to commands directly.
+The **only difference from Option B** is the IPC mechanism: instead of an mmap'd file polled by a background thread, this option uses a Unix domain socket where the background thread blocks on `accept()`/`recv()` and responds to commands directly. The protocol carries `CMD_CONFIGURE` (with full `rocp_config_t` payload), `CMD_ACTIVATE`, `CMD_DEACTIVATE`, and `CMD_STATUS`.
 
-**Advantage over Option B**: the socket is inherently bidirectional, so the controller can query status and receive acknowledgments. Option B's mmap only supports one-way commands with status fields.
+**Advantage over Option B**: the socket is inherently bidirectional, so the controller can synchronously wait for `CMD_CONFIGURE` to complete (including `force_configure` and propagation, ~5-50 ms) and receive a confirmation that wrappers are installed.
 
 ## Components
 
