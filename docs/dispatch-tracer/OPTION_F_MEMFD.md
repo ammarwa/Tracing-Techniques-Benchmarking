@@ -312,25 +312,25 @@ Runtime:
 
 This scales cleanly to any number of runtimes without protocol changes.
 
-### OpenMP Constraint
+### OpenMP Integration
 
-OMPT (OpenMP Tools) does not support late attachment — `ompt_start_tool()` is called once during runtime init. The dispatch shim must be loaded before OpenMP initializes. Since LD_PRELOAD constructors run before `main()`, this is satisfied when the shim is LD_PRELOAD'd. The control channel still dynamically enables/disables tracing — the shim is resident but noop until the controller attaches.
+OMPT is started **enabled at init time** — the OMPT tool library (`libdispatch_ompt_tool.so`) is loaded via `OMP_TOOL_LIBRARIES` before the OpenMP runtime initializes. All OMPT callbacks are registered immediately but behave as **noops by default** — each checks the same `ctrl->tracing_enabled` atomic flag that the dispatch table hot path uses. When the controller attaches and sets `tracing_enabled = 1`, OMPT callbacks begin recording events through the same memfd-backed ring buffer as HIP/HSA events. This makes OpenMP tracing a peer of other runtimes, controlled by the same memfd control region.
 
-### Third-Party API Plugin Support
-
-For APIs outside the team's control (RCCL, rocdecode, rocjpeg, future libraries), the socket protocol can be extended with a plugin registration command:
+The OMPT tool's memfd is included in the bootstrap handshake alongside the other runtimes:
 
 ```
-CMD_REGISTER_PLUGIN:
-  Controller sends: {plugin_name, function_count, function_names[]}
-  Library responds: {status, assigned memfd for plugin's control region}
-  Library sends: new memfd via SCM_RIGHTS for the plugin's bitmask
-
-CMD_LIST_PLUGINS:
-  Library responds: {count, [{name, version, func_count, enabled}]}
+Bootstrap (updated):
+  Library sends 7 memfds via SCM_RIGHTS:
+    fd[0] = hip_ctrl
+    fd[1] = hsa_ctrl
+    fd[2] = rccl_ctrl
+    fd[3] = ompt_ctrl    ← OpenMP OMPT control
+    fd[4] = rocdecode_ctrl
+    fd[5] = rocjpeg_ctrl
+    fd[6] = global_ctrl  ← master enable + aggregated stats
 ```
 
-External teams provide a shared library implementing the `dispatch_plugin` interface (see [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#third-party-api-tracing-plugin-interface)). The core tracer discovers plugins via `DISPATCH_PLUGIN_LIBRARIES` environment variable (similar to `ROCP_TOOL_LIBRARIES` in rocprofiler-sdk).
+See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full OMPT noop-shim design and callback examples.
 
 ### OpenTelemetry Export
 

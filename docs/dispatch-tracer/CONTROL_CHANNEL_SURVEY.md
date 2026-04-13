@@ -144,61 +144,70 @@ We applied two hard filters:
 
 ## Special Considerations
 
-### OpenMP OMPT: Late Attachment Is Not Supported
+### OpenMP OMPT: Always-Enabled Shim with Noop Control
 
-The OpenMP 5.0/5.1/5.2 spec defines OMPT tool initialization as a **one-shot event** during runtime startup. The runtime calls `ompt_start_tool()` exactly once during the first OpenMP construct or API call. If no tool is found at that point, OMPT is disabled for the lifetime of the process. There is no re-initialization path.
+The OpenMP 5.0/5.1/5.2 spec defines OMPT tool initialization as a **one-shot event** during runtime startup. The runtime calls `ompt_start_tool()` exactly once during the first OpenMP construct or API call. If no tool is found at that point, OMPT is disabled for the lifetime of the process. There is no re-initialization or late-attachment path.
 
 - `OMP_TOOL_LIBRARIES` must be set **before process launch**. The runtime reads it during initialization only.
 - `OMP_TOOL=enabled|disabled` is similarly read once at init time.
 - OpenMP 6.0 does not change this — OMPT remains init-time-only.
 
-**Implication for the dispatch tracer**: For OpenMP tracing, the dispatch shim must be loaded before the OpenMP runtime initializes. This means either:
-1. The shim is compiled into the runtime (build-time integration), or
-2. `LD_PRELOAD` injects the shim before the runtime's constructor runs (viable since LD_PRELOAD constructors run before the application's `main()` and typically before OpenMP's lazy init).
-
-The late-attach control channel (Options B/F/F+memfd) can still dynamically **enable/disable** OMPT-style tracing, but the shim code must already be resident in the process. The control channel toggles an atomic flag that the pre-loaded shim checks — this is consistent with our noop-by-default architecture.
-
-For APIs entirely outside the team's control (e.g., a third-party library using OpenMP internally), the shim approach cannot intercept OMPT callbacks without the library's cooperation. In such cases, a **standardized annotation interface** (see below) is the fallback.
-
-### Third-Party API Tracing: Plugin Interface
-
-Not all APIs will be under the team's control. OpenMP, RCCL, rocdecode, rocjpeg, and future libraries may be maintained by other teams or external contributors. The dispatch tracer needs a mechanism for external parties to register their own tracing without modifying the core tracer.
-
-Existing profiling tools handle this differently:
-
-| Tool | Approach | How third parties participate |
-|------|----------|------------------------------|
-| **rocprofiler-sdk** | Compile-time code generation from API table YAML/CSV files. Adding a new API family means adding table definitions and regenerating. | Fork/PR — not a runtime plugin system |
-| **Intel VTune (ITT)** | Annotation API: libraries call `__itt_task_begin()`/`__itt_task_end()` to mark regions. VTune collects events. | Library must instrument itself with ITT calls |
-| **NVIDIA Nsight (NVTX)** | Annotation API: `nvtxRangePush()`/`nvtxRangePop()` with custom domains. Nsight collects alongside CUPTI. | Library must instrument itself with NVTX calls |
-
-For the dispatch tracer, a **plugin-based approach** would combine both models:
+**The solution: start OMPT enabled, let the shim control noop behavior inside.** The OMPT tool is always registered and active from process start, but its callbacks are noop by default — they check the same `tracing_enabled` atomic flag as the rest of the dispatch tracer:
 
 ```c
-/* Plugin interface: third-party libraries register their own intercepts */
-struct dispatch_plugin {
-    const char *name;           // e.g., "rccl", "rocdecode"
-    const char *version;
+/* OMPT callback registered at init — always present, noop until attach */
+static void on_ompt_parallel_begin(
+    ompt_data_t *encountering_task,
+    const ompt_frame_t *encountering_frame,
+    ompt_data_t *parallel_data,
+    unsigned int requested_parallelism,
+    int flags,
+    const void *codeptr_ra)
+{
+    /* Same noop check as dispatch table hot path */
+    if (!__atomic_load_n(&ctrl->tracing_enabled, __ATOMIC_ACQUIRE))
+        return;  /* noop — ~1-5 ns overhead */
 
-    /* Discovery: plugin resolves original function pointers */
-    int (*register_intercepts)(struct intercept_table *table);
-
-    /* Lifecycle */
-    int (*init)(struct tracer_context *ctx);
-    void (*fini)(void);
-
-    /* Event output: plugin flushes events to shared ring buffer */
-    void (*flush_events)(struct event_buffer *buf);
-};
-
-/* Registration: plugins call this at load time */
-int dispatch_register_plugin(const struct dispatch_plugin *plugin);
+    /* Tracing active: record the event */
+    trace_ompt_parallel_begin(parallel_data, requested_parallelism,
+                              codeptr_ra);
+}
 ```
 
-This allows external teams to:
-1. Provide wrapper functions for their API (dispatch-table interception)
-2. Use the shared control channel and ring buffer infrastructure
-3. Participate in the same enable/disable lifecycle as built-in APIs
+This approach means:
+1. **OMPT is registered at process start** via `ompt_start_tool()` / `OMP_TOOL_LIBRARIES`
+2. **All OMPT callbacks are installed** but each checks `ctrl->tracing_enabled` and returns immediately if disabled
+3. **When the controller attaches** and sets `tracing_enabled = 1`, OMPT callbacks start recording — no re-registration needed
+4. **When the controller detaches**, callbacks go back to noop
+5. **Overhead when disabled**: one atomic load per OMPT callback invocation (~1-5 ns) — same as the dispatch table hot path
+
+This is fully consistent with the noop-by-default dispatch tracer architecture. The OMPT shim is just another "runtime" alongside HIP, HSA, RCCL, etc., controlled by the same atomic flag and same control channel.
+
+### OpenMP Tool Plugin Interface
+
+Anthony raised the concern about tracing OpenMP when the runtime is outside the team's direct control. The OMPT spec itself defines a **plugin-based tool interface** that fits naturally into the dispatch tracer:
+
+| Mechanism | How it works | Who controls it |
+|-----------|-------------|-----------------|
+| `ompt_start_tool()` | The OpenMP runtime calls this to discover tools. The tool returns callback registrations. | OpenMP spec — standard interface |
+| `OMP_TOOL_LIBRARIES` | Environment variable listing shared libraries that provide `ompt_start_tool()`. | User sets before launch |
+| `ompt_set_callback()` | Tool registers callbacks for specific OMPT events (parallel begin/end, task create, sync, etc.). | Tool library at init time |
+
+The dispatch tracer provides its OMPT tool as a shared library (e.g., `libdispatch_ompt_tool.so`) that:
+1. Exports `ompt_start_tool()` — discovered via `OMP_TOOL_LIBRARIES`
+2. Registers all OMPT callbacks via `ompt_set_callback()`
+3. Each callback checks the dispatch tracer's `tracing_enabled` flag
+4. Events flow through the same ring buffer / output infrastructure as HIP/HSA events
+
+For comparison, here is how other profiling tools handle OpenMP:
+
+| Tool | OpenMP approach |
+|------|----------------|
+| **rocprofiler-sdk** | Provides an OMPT tool library; registers at init via `OMP_TOOL_LIBRARIES` |
+| **Intel VTune** | Uses ITT + OMPT integration; OMPT tool built into VTune collector |
+| **NVIDIA Nsight** | OMPT support via `libnvtx_ompt.so` loaded via `OMP_TOOL_LIBRARIES` |
+
+All of them follow the same pattern: ship an OMPT tool library, register at init, control behavior at runtime. The dispatch tracer's noop-shim approach is identical.
 
 ### OpenTelemetry as Output Format
 

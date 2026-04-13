@@ -36,7 +36,7 @@ See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) for the full evaluati
 
 The survey also covers:
 
-- **OpenMP OMPT late attachment** — why OMPT cannot be enabled after process start, and how the dispatch tracer handles this
-- **Third-party API plugin interface** — how external teams (RCCL, rocdecode, rocjpeg) can register their own tracing
+- **OpenMP OMPT integration** — OMPT starts enabled at init, shim controls noop behavior inside callbacks, same control channel as other runtimes
+- **OpenMP tool plugin interface** — how the OMPT tool library fits the dispatch tracer architecture, compared with rocprofiler-sdk, VTune, and Nsight approaches
 - **OpenTelemetry as output format** — using OTel for export/transport, not instrumentation
 - **Cross-platform considerations** — Linux-specific mechanisms and portability fallbacks

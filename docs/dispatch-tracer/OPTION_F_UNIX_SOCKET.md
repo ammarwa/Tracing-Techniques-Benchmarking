@@ -377,13 +377,20 @@ Library → Controller:  {enabled: true, hip_events: 42000, hsa_events: 1200, ..
 
 This is particularly useful for `rocprofv3`-style tools that want to display what's being traced and how many events have been collected.
 
-### OpenMP Constraint
+### OpenMP Integration
 
-OMPT does not support late attachment — the shim must be loaded before OpenMP runtime init. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-late-attachment-is-not-supported) for details. The socket control channel can still dynamically toggle tracing, but the shim code must already be resident.
+OMPT is started **enabled at init time** via `OMP_TOOL_LIBRARIES`, but all callbacks are noop by default — each checks the same `local_enabled` atomic flag. When the controller sends `CMD_ENABLE`, OMPT callbacks begin recording alongside HIP/HSA events. The socket protocol's `CMD_ENABLE` payload includes a runtime bitmask that can independently enable/disable OpenMP tracing:
 
-### Third-Party API Plugin Support
+```c
+/* In dispatch_multi_config_t: */
+struct {
+    uint32_t runtime_id;    // HIP=0, HSA=1, RCCL=2, OMPT=3, ...
+    uint32_t enabled;       // Per-runtime enable
+    ...
+} runtimes[];
+```
 
-The socket protocol naturally extends to support plugin registration. External API plugins register via `CMD_REGISTER_PLUGIN`, and the protocol's bidirectional nature allows the controller to discover available plugins and their functions via `CMD_LIST_PLUGINS`. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#third-party-api-tracing-plugin-interface) for the plugin interface design.
+The OMPT tool library ships as `libdispatch_ompt_tool.so` and plugs into the same socket-based control channel. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full noop-shim design.
 
 ## File Layout
 
