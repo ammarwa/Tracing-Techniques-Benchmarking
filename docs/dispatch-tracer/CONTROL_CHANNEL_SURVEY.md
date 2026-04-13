@@ -142,10 +142,12 @@ We applied two hard filters:
 
 | Option | Hot-Path | Auth Model | Config | Filesystem Footprint |
 |--------|----------|------------|--------|---------------------|
-| **B** (mmap regular file) | ~1-5 ns | Directory `0700` + file `0600` | Full struct via mmap | `/run/user/<uid>/...` |
-| **F** (Unix domain socket) | ~1-5 ns (local atomic) | `SO_PEERCRED` (kernel-verified) | Full protocol | None (abstract namespace) |
-| **F+memfd** (Socket + anonymous shm) | ~1-5 ns (mmap'd memfd) | `SO_PEERCRED` | Full struct + protocol | None whatsoever |
-| **Signal + B or F** (Trigger + data channel) | ~1-5 ns | `kill()` UID check + paired channel | Via paired channel | Depends on pair |
+| **B** (mmap regular file) | ~10-20 ns | Directory `0700` + file `0600` | Command + status | `/run/user/<uid>/...` |
+| **F** (Unix domain socket) | ~10-20 ns | `SO_PEERCRED` (kernel-verified) | Full protocol | None (abstract namespace) |
+| **F+memfd** (Socket + anonymous shm) | ~10-20 ns | `SO_PEERCRED` | Command struct + protocol | None whatsoever |
+| **Signal + B or F** (Trigger + data channel) | ~10-20 ns | `kill()` UID check + paired channel | Via paired channel | Depends on pair |
+
+Hot-path overhead is from rocprofiler-sdk's existing `populate_contexts()` (~10-20 ns). The control channel itself adds zero to the hot path — it only toggles `rocprofiler_start_context()` / `rocprofiler_stop_context()` from a background thread or signal handler.
 
 ## Detailed Comparison of Surviving Options
 
@@ -165,18 +167,18 @@ We applied two hard filters:
 |-------|---|---|---------|----------|
 | Init (target side) | ~10 μs (open+mmap) | ~10 μs (socket+bind+listen+thread) | ~15 μs (socket+thread) | ~10 μs (sigaction+paired init) |
 | Attach (controller) | ~5 μs (open+mmap) | ~5 μs (connect+SO_PEERCRED) | ~10 μs (connect+memfd+SCM_RIGHTS) | ~5 μs (paired attach) |
-| Hot-path check | ~1-5 ns (atomic load) | ~1-5 ns (atomic load) | ~1-5 ns (atomic load) | ~1-5 ns (atomic load) |
-| Config update | ~50-100 ns (cache line) | ~1-5 μs (socket send) | ~50-100 ns (cache line) | ~1-5 μs (signal + read) |
+| Hot-path (noop) | ~10-20 ns (existing populate_contexts) | ~10-20 ns | ~10-20 ns | ~10-20 ns |
+| Context toggle | ~1 ms (poll interval) | ~5 μs (socket recv) | ~50-100 ns (mmap write) + ~1 ms (poll) | ~1-5 μs (signal delivery) |
 
 ### Architecture Fit for rocprofiler-sdk
 
 | Aspect | B | F | F+memfd | Signal+B |
 |--------|---|---|---------|----------|
-| Per-function enable (500+ HIP APIs) | Bitmask in mmap'd struct | Bitmask sent via protocol | Bitmask in mmap'd memfd | Bitmask in paired channel |
-| Multi-runtime config | Directory hierarchy | Single protocol session | Single session + shared regions | Complex pairing |
-| Bidirectional (status queries) | No (shared memory is state) | Yes (native) | Yes (socket) + fast state (memfd) | Limited |
-| Graceful detach with flush | Write disable flag | Send DETACH command, get ACK | Send DETACH, get ACK | Signal + paired |
-| Dynamic reconfiguration | Write new config struct | Send CONFIG command | Write to memfd | Signal + write |
+| Per-function enable | Existing `rocprofiler_configure_*` at init | Same | Same | Same |
+| Multi-runtime config | Single ctrl file per process | Single socket per process | Single socket + memfd | Single signal + paired channel |
+| Bidirectional (status queries) | Status fields in mmap | Yes (native) | Yes (socket) + fast status (memfd) | Limited |
+| Graceful detach | CMD_DEACTIVATE in mmap | Send CMD_DISABLE, get ACK | Send CMD_DISABLE, get ACK | Signal + paired |
+| Changes to rocprofiler-sdk | Minimal (tool lib + bg thread) | Same + socket protocol | Same + memfd + SCM_RIGHTS | Same + signal handler |
 
 ## Special Considerations
 
@@ -188,34 +190,14 @@ The OpenMP 5.0/5.1/5.2 spec defines OMPT tool initialization as a **one-shot eve
 - `OMP_TOOL=enabled|disabled` is similarly read once at init time.
 - OpenMP 6.0 does not change this — OMPT remains init-time-only.
 
-**The solution: start OMPT enabled, let the shim control noop behavior inside.** The OMPT tool is always registered and active from process start, but its callbacks are noop by default — they check the same `tracing_enabled` atomic flag as the rest of the dispatch tracer:
-
-```c
-/* OMPT callback registered at init — always present, noop until attach */
-static void on_ompt_parallel_begin(
-    ompt_data_t *encountering_task,
-    const ompt_frame_t *encountering_frame,
-    ompt_data_t *parallel_data,
-    unsigned int requested_parallelism,
-    int flags,
-    const void *codeptr_ra)
-{
-    /* Same noop check as dispatch table hot path */
-    if (!__atomic_load_n(&ctrl->tracing_enabled, __ATOMIC_ACQUIRE))
-        return;  /* noop — ~1-5 ns overhead */
-
-    /* Tracing active: record the event */
-    trace_ompt_parallel_begin(parallel_data, requested_parallelism,
-                              codeptr_ra);
-}
-```
+**The solution: start OMPT enabled, let rocprofiler-sdk's context activation control noop behavior.** The OMPT tool is always registered from process start via `OMP_TOOL_LIBRARIES`. The OMPT callbacks feed into rocprofiler-sdk's existing tracing infrastructure — they register a context with `ROCPROFILER_CALLBACK_TRACING_OMPT` domain. When the context is inactive (controller hasn't attached), `populate_contexts()` finds nothing and the callbacks are effectively noop. When the controller activates the context, callbacks start recording.
 
 This approach means:
 1. **OMPT is registered at process start** via `ompt_start_tool()` / `OMP_TOOL_LIBRARIES`
-2. **All OMPT callbacks are installed** but each checks `ctrl->tracing_enabled` and returns immediately if disabled
-3. **When the controller attaches** and sets `tracing_enabled = 1`, OMPT callbacks start recording — no re-registration needed
-4. **When the controller detaches**, callbacks go back to noop
-5. **Overhead when disabled**: one atomic load per OMPT callback invocation (~1-5 ns) — same as the dispatch table hot path
+2. **OMPT callbacks register a rocprofiler context** with OMPT tracing domain during `tool_initialize`
+3. **Context starts inactive** — `populate_contexts()` returns empty, wrappers noop (~10-20 ns)
+4. **When the controller attaches**, the control channel calls `rocprofiler_start_context()` — OMPT callbacks start recording
+5. **When the controller detaches**, `rocprofiler_stop_context()` — callbacks return to noop
 
 This is fully consistent with the noop-by-default dispatch tracer architecture. The OMPT shim is just another "runtime" alongside HIP, HSA, RCCL, etc., controlled by the same atomic flag and same control channel.
 
@@ -272,7 +254,7 @@ For future cross-platform support, Option B could fall back to a platform-approp
 
 The four surviving options each have distinct strengths:
 
-- **B** is the simplest — minimal code, no threads, no sockets. Best for straightforward enable/disable.
+- **B** is the simplest — minimal code, one background thread, no sockets. Best for straightforward enable/disable.
 - **F** has the strongest authentication — kernel-verified identity on every connection. Best for security-sensitive deployments.
 - **F+memfd** combines F's authentication with mmap-speed config access and zero filesystem footprint. Best overall for production.
 - **Signal+B/F** adds instant notification without polling. Useful as an enhancement to B or F.
@@ -283,3 +265,46 @@ Each option is designed in detail in its own document:
 - [Option F Design: Unix Domain Socket](OPTION_F_UNIX_SOCKET.md)
 - [Option F+memfd Design: Socket + Anonymous Shared Memory](OPTION_F_MEMFD.md)
 - [Option Signal+B/F Design: Signal-Triggered Data Channel](OPTION_SIGNAL.md)
+
+## References
+
+### rocprofiler-sdk Source Code
+
+- [rocprofiler-sdk](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocprofiler-sdk) — AMD's profiling SDK with intercept table architecture
+- `source/lib/rocprofiler-sdk/intercept_table.cpp` — Intercept table registration and notification
+- `source/lib/rocprofiler-sdk/hip/hip.cpp` — HIP API dispatch table interception (`copy_table`, `update_table`, `functor`)
+- `source/lib/rocprofiler-sdk/hsa/hsa.cpp` — HSA API dispatch table interception
+- `source/lib/rocprofiler-sdk/tracing/tracing.hpp` — `populate_contexts`, `context_filter`, callback/buffer dispatch
+- `source/lib/rocprofiler-sdk/registration.cpp` — Tool registration, `rocprofiler_configure`, `atexit` finalization
+- `source/lib/rocprofiler-sdk-rocattach/rocattach.cpp` — Existing ptrace-based attach mechanism
+
+### rocprofiler-register
+
+- [rocprofiler-register](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocprofiler-register) — Library registration coordinator
+- `source/include/rocprofiler-register/rocprofiler-register.h` — Public API: `rocprofiler_register_library_api_table()`
+
+### Linux IPC Mechanisms
+
+- [shm_open(3)](https://man7.org/linux/man-pages/man3/shm_open.3.html) — POSIX shared memory
+- [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html) — Unix domain sockets, `SO_PEERCRED`, abstract namespace
+- [memfd_create(2)](https://man7.org/linux/man-pages/man2/memfd_create.2.html) — Anonymous memory file descriptors
+- [cmsg(3)](https://man7.org/linux/man-pages/man3/cmsg.3.html) — `SCM_RIGHTS` file descriptor passing
+- [sigqueue(3)](https://man7.org/linux/man-pages/man3/sigqueue.3.html) — Real-time signals with data
+- [bpf(2)](https://man7.org/linux/man-pages/man2/bpf.2.html) — BPF maps (evaluated and eliminated)
+- [ptrace(2)](https://man7.org/linux/man-pages/man2/ptrace.2.html) — Process trace (evaluated and eliminated)
+- [process_vm_writev(2)](https://man7.org/linux/man-pages/man2/process_vm_writev.2.html) — Cross-process memory write (evaluated and eliminated)
+
+### OpenMP OMPT
+
+- [OpenMP 5.2 Specification](https://www.openmp.org/spec-html/5.2/openmpch19.html) — OMPT tool interface
+- `ompt_start_tool()` — One-shot init-time tool discovery (no late attachment)
+
+### OpenTelemetry
+
+- [OpenTelemetry C++ SDK](https://github.com/open-telemetry/opentelemetry-cpp) — Potential output format via OTLP export
+
+### Security
+
+- [Yama LSM](https://www.kernel.org/doc/html/latest/admin-guide/LSM/Yama.html) — `ptrace_scope` (reason for eliminating Options L, M, N)
+- [BPF Token](https://docs.ebpf.io/linux/concepts/token/) — Capability delegation (evaluated, eliminated due to kernel 6.9+ requirement)
+- [Pinning](https://docs.ebpf.io/linux/concepts/pinning/) — BPF filesystem pinning

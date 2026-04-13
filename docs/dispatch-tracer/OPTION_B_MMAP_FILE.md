@@ -311,31 +311,38 @@ static void tool_finalize(void* tool_data) {
 
 | Phase | Cost | Detail |
 |-------|------|--------|
-| Library init | ~10-50 μs | `mkdir` + `open` + `ftruncate` + `mmap` |
-| Controller attach | ~5-20 μs | `open` + `mmap` + config write |
-| **Hot-path (noop)** | **~1-5 ns** | Single `__atomic_load_n`, branch-not-taken |
-| **Hot-path (tracing)** | **~50-150 ns** | Atomic load + timestamp + ring buffer |
-| Config change | ~50-100 ns | Cache-line transfer between cores |
-| Controller detach | ~1 μs | Atomic store + munmap |
-| Library cleanup | ~5 μs | munmap + unlink + rmdir |
+| Tool init | ~10-50 μs | `mkdir` + `open` + `ftruncate` + `mmap` + `pthread_create` |
+| Controller attach | ~5-20 μs | `open` + `mmap` + write CMD_ACTIVATE |
+| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — iterates active contexts, finds none |
+| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
+| Context toggle latency | ~1 ms | Background thread poll interval (or futex wake) |
+| Controller detach | ~1 μs | Write CMD_DEACTIVATE + munmap |
+| Tool cleanup | ~5 μs | `rocprofiler_stop_context` + munmap + unlink + rmdir |
 
 ## Multi-Runtime Application (rocprofiler-sdk)
 
-For tracing HIP, HSA, RCCL, OpenMP, rocdecode, rocjpeg simultaneously:
+Since the tool uses rocprofiler-sdk's existing context system, multi-runtime support is straightforward:
+
+```c
+/* In tool_initialize: create one context covering all runtimes */
+rocprofiler_context_id_t ctx;
+rocprofiler_create_context(&ctx);
+
+/* Register interest in all domains (existing APIs) */
+rocprofiler_configure_callback_tracing_service(ctx, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API, ...);
+rocprofiler_configure_callback_tracing_service(ctx, ROCPROFILER_CALLBACK_TRACING_HSA_CORE_API, ...);
+rocprofiler_configure_callback_tracing_service(ctx, ROCPROFILER_CALLBACK_TRACING_RCCL_API, ...);
+rocprofiler_configure_callback_tracing_service(ctx, ROCPROFILER_CALLBACK_TRACING_OMPT, ...);
+/* rocdecode, rocjpeg — when rocprofiler-sdk adds their domains */
+```
+
+A single `rocprofiler_start_context(ctx)` activates tracing for ALL registered domains simultaneously. The control file is just:
 
 ```
-/run/user/1000/dispatch/12345/
-├── ctrl             # Global enable + per-runtime enable bits
-├── hip_funcs        # mmap'd bitmask for 512+ HIP API functions
-├── hsa_funcs        # mmap'd bitmask for 256+ HSA API functions
-├── rccl_funcs       # mmap'd bitmask for RCCL functions
-├── ompt_funcs       # mmap'd bitmask for OpenMP runtime functions
-├── rocdecode_funcs  # mmap'd bitmask for rocdecode functions
-├── rocjpeg_funcs    # mmap'd bitmask for rocjpeg functions
-└── events/          # Directory for trace output
+/run/user/1000/rocprofiler/12345/ctrl   # 64-byte rocp_ctrl_t
 ```
 
-Each runtime's LD_PRELOAD wrapper opens and mmaps only its own control file. The controller can configure each runtime independently or atomically (by writing all configs before setting the global enable flag).
+No per-runtime files needed. Per-function and per-domain configuration is handled by the existing `rocprofiler_configure_*` APIs at init time.
 
 ## File Layout
 

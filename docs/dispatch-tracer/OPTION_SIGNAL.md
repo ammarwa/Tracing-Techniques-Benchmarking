@@ -279,8 +279,8 @@ if (ret < 0) {
 | Signal handler execution | ~0.5-2 μs | Handler sets flag + writes 1 byte to pipe |
 | Background thread wakeup | ~1-3 μs | `poll()` returns + pipe read |
 | Config application | ~10-500 μs | Depends on work (buffer alloc, file open, etc.) |
-| **Hot-path (noop)** | **~1-5 ns** | Same as B/F/F+memfd — signal doesn't affect hot path |
-| **Hot-path (tracing)** | **~50-150 ns** | Same as B/F/F+memfd |
+| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
+| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
 | **Config change notification** | **~1-5 μs** | Signal delivery + thread wakeup (vs polling interval) |
 
 ## Multi-Runtime Application (rocprofiler-sdk)

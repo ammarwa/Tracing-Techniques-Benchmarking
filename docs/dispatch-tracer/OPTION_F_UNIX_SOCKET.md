@@ -22,7 +22,7 @@ This option provides the **strongest authentication model** of all options: the 
 │  │        trace(func_id, args);                              │  │
 │  │    real_fn(args);                                         │  │
 │  │                                                           │  │
-│  │  // No socket I/O here — pure atomic load (~1-5 ns)      │  │
+│  │  // No socket I/O here — existing populate_contexts()    │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
@@ -323,8 +323,8 @@ int main(int argc, char** argv) {
 | Controller connect | ~3-5 μs | `socket` + `connect` |
 | SO_PEERCRED check | ~1 μs | `getsockopt` |
 | Command send/recv | ~1-5 μs | Per command (kernel copies data between socket buffers) |
-| **Hot-path (noop)** | **~1-5 ns** | Atomic load of process-local variable |
-| **Hot-path (tracing)** | **~50-150 ns** | Atomic load + timestamp + ring buffer |
+| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
+| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
 | Config change | ~2-5 μs | Socket recv + apply + atomic store |
 | Thread idle overhead | ~0 | Thread blocked on `accept()`, no CPU |
 

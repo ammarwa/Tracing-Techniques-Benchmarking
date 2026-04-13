@@ -5,7 +5,7 @@
 This design combines the **Unix domain socket** (Option F) for authentication and command/response with **`memfd_create`** for anonymous shared memory passed via `SCM_RIGHTS`. This gives us the best of both worlds:
 
 - `SO_PEERCRED` for kernel-verified authentication (from Option F)
-- mmap-speed (~1-5 ns) config access (from Options A/B)
+- mmap-speed config writes from controller (from Options A/B)
 - **Zero filesystem footprint** — no files in `/dev/shm/`, no files in `/run/`, no socket files. The abstract socket and memfd are both anonymous and vanish on process exit.
 
 This is the **recommended option for production** (e.g., rocprofiler-sdk) as it has the strongest security guarantees and lowest possible hot-path overhead with no cleanup burden.
@@ -40,7 +40,7 @@ This option combines Option F's socket (for authentication + commands) with a me
 │  │    else { orig_fn(); }                                     │  │
 │  │                                                            │  │
 │  │  ctrl points to mmap'd memfd (anonymous shared memory)     │  │
-│  │  ~1-5 ns per check — no syscall, no socket, no file I/O   │  │
+│  │  ~10-20 ns per check (existing populate_contexts)          │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
@@ -100,7 +100,7 @@ This option combines Option F's socket (for authentication + commands) with a me
 └─────────────────────────────────────────────────────────────────┘
 
 Key: After the initial socket handshake + SCM_RIGHTS fd passing,
-     config reads/writes go through mmap'd shared memory (~1-5 ns).
+     controller config writes go through mmap'd shared memory (~50-100 ns).
      The socket is only used for commands that need a response
      (status queries, flush requests, graceful detach).
 ```
@@ -289,8 +289,8 @@ This prevents a compromised controller from extending the memfd to cause the lib
 |-------|------|--------|
 | Library init | ~15-20 μs | `memfd_create` + `mmap` + `socket` + `bind` + `listen` + `pthread_create` |
 | Controller connect + memfd recv | ~10-15 μs | `connect` + `recvmsg(SCM_RIGHTS)` + `mmap` |
-| **Hot-path (noop)** | **~1-5 ns** | Atomic load of mmap'd memfd — identical to Options A/B |
-| **Hot-path (tracing)** | **~50-150 ns** | Atomic load + timestamp + ring buffer |
+| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
+| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
 | Config change (mmap) | ~50-100 ns | Direct write to shared memory (cache-line transfer) |
 | Status query (socket) | ~2-5 μs | Socket round-trip for response |
 | Detach (mmap + socket) | ~5 μs | Atomic store + CMD_FLUSH + close |

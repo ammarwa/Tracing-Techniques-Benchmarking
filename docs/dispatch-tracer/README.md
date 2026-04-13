@@ -1,25 +1,27 @@
 # Dispatch Table Tracer Design Documents
 
-This directory contains the design documentation for a new tracing technique: the **Dispatch Table Tracer**. This technique uses LD_PRELOAD to intercept API calls via a function dispatch table that starts as a noop passthrough and only activates when an external controller process attaches at runtime — inspired by [rocprofiler-sdk](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocprofiler-sdk)'s intercept table architecture.
+This directory contains the design documentation for adding an **external control channel** to rocprofiler-sdk's existing dispatch table tracer. The existing functor wrappers already have a noop fast-path (`populate_contexts()` → empty → call original at ~10-20 ns). The control channel lets an external process toggle context activation at runtime, enabling/disabling tracing without restarting the application.
 
 ## Documents
 
 | Document | Description |
 |----------|-------------|
 | [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) | Survey of all 13 control channel mechanisms evaluated, elimination criteria, and final selection of 4 surviving options |
-| [OPTION_B_MMAP_FILE.md](OPTION_B_MMAP_FILE.md) | Design using memory-mapped regular file under `/run/user/<uid>/` — simplest, no threads |
+| [OPTION_B_MMAP_FILE.md](OPTION_B_MMAP_FILE.md) | Design using memory-mapped regular file under `/run/user/<uid>/` — simplest control channel |
 | [OPTION_F_UNIX_SOCKET.md](OPTION_F_UNIX_SOCKET.md) | Design using Unix domain socket with `SO_PEERCRED` — strongest authentication |
 | [OPTION_F_MEMFD.md](OPTION_F_MEMFD.md) | Design combining Unix socket auth with `memfd_create` anonymous shared memory — best overall for production |
 | [OPTION_SIGNAL.md](OPTION_SIGNAL.md) | Design using real-time signals as instant notification layered on top of B or F+memfd |
 
 ## Quick Comparison
 
-| Option | Hot-Path | Auth Model | Filesystem Footprint | Best For |
-|--------|----------|------------|---------------------|----------|
-| **B** (mmap file) | ~1-5 ns | Dir `0700` + file `0600` | `/run/user/<uid>/dispatch/` | Simplicity |
-| **F** (Unix socket) | ~1-5 ns | `SO_PEERCRED` (kernel-verified) | None (abstract namespace) | Authentication |
-| **F+memfd** | ~1-5 ns | `SO_PEERCRED` + anonymous memory | None whatsoever | Production |
-| **Signal+B/F** | ~1-5 ns | `kill()` UID + paired channel | Depends on pair | Instant notification |
+| Option | Hot-Path (noop) | Auth Model | Filesystem Footprint | Best For |
+|--------|----------------|------------|---------------------|----------|
+| **B** (mmap file) | ~10-20 ns | Dir `0700` + file `0600` | `/run/user/<uid>/rocprofiler/` | Simplicity |
+| **F** (Unix socket) | ~10-20 ns | `SO_PEERCRED` (kernel-verified) | None (abstract namespace) | Authentication |
+| **F+memfd** | ~10-20 ns | `SO_PEERCRED` + anonymous memory | None whatsoever | Production |
+| **Signal+B/F** | ~10-20 ns | `kill()` UID + paired channel | Depends on pair | Instant notification |
+
+Hot-path overhead is ~10-20 ns from rocprofiler-sdk's existing `populate_contexts()` call (iterates active contexts, bitset check). The control channel adds zero overhead to the hot path — it only toggles context activation from a background thread.
 
 All options require **no root, no capabilities, and no specific kernel version**.
 
