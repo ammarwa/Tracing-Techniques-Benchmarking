@@ -5,16 +5,16 @@
 This design combines the **Unix domain socket** (Option F) for authentication and command/response with **`memfd_create`** for anonymous shared memory passed via `SCM_RIGHTS`. This gives us the best of both worlds:
 
 - `SO_PEERCRED` for kernel-verified authentication (from Option F)
-- mmap-speed config writes from controller (from Options A/B)
+- mmap-speed command writes from controller (~50-100 ns cache-line transfer)
 - **Zero filesystem footprint** — no files in `/dev/shm/`, no files in `/run/`, no socket files. The abstract socket and memfd are both anonymous and vanish on process exit.
 
-This is the **recommended option for production** (e.g., rocprofiler-sdk) as it has the strongest security guarantees and lowest possible hot-path overhead with no cleanup burden.
+This is the **recommended option for production** (e.g., rocprofiler-sdk) as it has the strongest security guarantees with no cleanup burden.
 
 ## Integration with rocprofiler-sdk
 
 Same as all options — the tool uses standard rocprofiler-sdk APIs. The existing dispatch table machinery is reused as-is. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
 
-This option combines Option F's socket (for authentication + commands) with a memfd (for the `rocp_ctrl_t` struct shared via `SCM_RIGHTS`). The control struct is the same as Option B but lives in anonymous memory. The background thread uses `rocprofiler_start_context()` / `rocprofiler_stop_context()` — same as all options.
+This option combines Option F's socket (for authentication + status queries) with a memfd containing the same `rocp_ctrl_t` struct as Option B. The difference from Option B: the control struct lives in anonymous memory (no filesystem), and authentication is via `SO_PEERCRED` (not directory permissions). The background thread polls the memfd for commands and calls `rocprofiler_start_context()` / `rocprofiler_stop_context()` — same as Option B.
 
 ## Architecture
 
@@ -22,138 +22,124 @@ This option combines Option F's socket (for authentication + commands) with a me
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Target Process (sample_app)                   │
 │                                                                  │
-│  libmylib.so (runtime):                                         │
-│    init(): dispatch_register_library_api_table("mylib", ...)    │
+│  Existing rocprofiler-sdk flow (unchanged):                     │
+│    Runtime → rocprofiler_set_api_table() → copy_table()         │
+│    → update_table() installs functor wrappers                    │
 │                                                                  │
-│  libdispatch_tool.so (tracer — via DISPATCH_TOOL_LIBRARIES):    │
-│    on_intercept_table_registration():                            │
-│      save orig_table, install shim wrappers                     │
-│      create memfd + socket, spawn bg thread                     │
+│  Tool library (loaded via ROCP_TOOL_LIBRARIES):                 │
+│    rocprofiler_configure():                                      │
+│      create context, register all domains                       │
+│      DO NOT activate context yet                                │
+│    tool_initialize():                                            │
+│      create memfd (rocp_ctrl_t) + socket, spawn bg thread       │
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Main Thread (API calls go through shims in api_table)     │  │
+│  │  Existing functor hot path (NO CHANGES):                   │  │
 │  │                                                            │  │
-│  │  hot path:                                                 │  │
-│  │    enabled = __atomic_load_n(&ctrl->tracing_enabled,       │  │
-│  │                              __ATOMIC_ACQUIRE);            │  │
-│  │    if (enabled) { trace(); orig_fn(); trace_exit(); }      │  │
-│  │    else { orig_fn(); }                                     │  │
-│  │                                                            │  │
-│  │  ctrl points to mmap'd memfd (anonymous shared memory)     │  │
+│  │  hip_api_impl<T,Op>::functor(args...):                     │  │
+│  │    populate_contexts(domain, op,                           │  │
+│  │        callback_ctxs, buffered_ctxs);                      │  │
+│  │    if (callback_ctxs.empty() && buffered_ctxs.empty())     │  │
+│  │        return exec(get_table_func(), args);  // noop       │  │
+│  │    // ... full tracing path                                │  │
 │  │  ~10-20 ns per check (existing populate_contexts)          │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Background Thread (created during registration callback)  │  │
+│  │  Background Thread (NEW — polls memfd + listens on socket) │  │
 │  │                                                            │  │
-│  │  Phase 1: Create memfd + control struct                   │  │
+│  │  Phase 1: Create memfd + control struct (rocp_ctrl_t)     │  │
 │  │    memfd = memfd_create("ctrl", MFD_CLOEXEC |             │  │
 │  │                              MFD_ALLOW_SEALING)           │  │
-│  │    ftruncate(memfd, sizeof(dispatch_ctrl_t))               │  │
+│  │    ftruncate(memfd, sizeof(rocp_ctrl_t))                   │  │
 │  │    ctrl = mmap(memfd, PROT_READ|PROT_WRITE, MAP_SHARED)   │  │
-│  │    ctrl->tracing_enabled = 0                               │  │
+│  │    ctrl->command = CMD_NONE                                │  │
 │  │                                                            │  │
 │  │  Phase 2: Listen for controller connection                 │  │
 │  │    sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)  │  │
-│  │    bind(sock, "\0dispatch_<pid>")                          │  │
+│  │    bind(sock, "\0rocprofiler_<pid>")                       │  │
 │  │    listen(sock, 1)                                         │  │
 │  │                                                            │  │
 │  │  Phase 3: On accept, authenticate + share memfd            │  │
 │  │    client = accept(sock)                                   │  │
 │  │    getsockopt(client, SO_PEERCRED, &cred)                 │  │
 │  │    if (cred.uid != getuid()) reject                       │  │
-│  │    sendmsg(client, memfd via SCM_RIGHTS)  ← fd passing    │  │
+│  │    sendmsg(client, memfd via SCM_RIGHTS)                  │  │
 │  │                                                            │  │
-│  │  Phase 4: Process commands via socket                      │  │
-│  │    recv(client, &cmd) → apply config → send response      │  │
+│  │  Phase 4: Poll memfd for commands + listen for socket cmds │  │
+│  │    if (ctrl->command == CMD_ACTIVATE)                      │  │
+│  │      rocprofiler_start_context(ctx);                      │  │
+│  │    if (ctrl->command == CMD_DEACTIVATE)                    │  │
+│  │      rocprofiler_stop_context(ctx);                       │  │
+│  │    // Also handles socket-based CMD_STATUS queries         │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └──────────────────────┬──────────────────────────────────────────┘
                        │ Abstract Unix socket + SCM_RIGHTS fd pass
 ┌──────────────────────▼──────────────────────────────────────────┐
-│                    Controller (dispatch_ctrl_memfd)               │
+│                    Controller                                    │
 │                                                                  │
 │  Phase 1: Connect and authenticate                              │
-│    sock = connect("\0dispatch_<pid>")                            │
-│    // Library checks our SO_PEERCRED automatically              │
+│    sock = connect("\0rocprofiler_<pid>")                         │
+│    // Tool checks our SO_PEERCRED automatically                 │
 │                                                                  │
 │  Phase 2: Receive memfd via SCM_RIGHTS                          │
-│    recvmsg(sock, &msg)  → extract memfd_fd from ancillary      │
-│    ctrl = mmap(memfd_fd, PROT_READ|PROT_WRITE, MAP_SHARED)     │
+│    recvmsg(sock, &msg) → extract memfd_fd from ancillary       │
+│    ctrl = mmap(memfd_fd, PROT_READ|PROT_WRITE, MAP_SHARED)    │
 │                                                                  │
-│  Phase 3: Write config directly to shared memory                │
-│    ctrl->output_format = OUTPUT_JSON;                           │
-│    ctrl->ring_buffer_size = 4 * 1024 * 1024;                   │
-│    memset(ctrl->func_enable_mask, 0xFF, ...);                   │
-│    __atomic_store_n(&ctrl->tracing_enabled, 1,                  │
-│                     __ATOMIC_RELEASE);                           │
+│  Phase 3: Write commands directly to shared memory              │
+│    ctrl->command = CMD_ACTIVATE;                                │
+│    atomic_store(&ctrl->version, v+1, RELEASE);                 │
+│    // Context activates within ~1 ms (bg thread poll)           │
 │                                                                  │
-│  // Config changes now take effect in ~50-100 ns               │
-│  // (cache-line transfer, no socket round-trip needed!)         │
+│  Phase 4: Use socket for queries needing responses              │
+│    send(sock, CMD_STATUS) → recv response                      │
 │                                                                  │
-│  Phase 4: Use socket for commands (flush, status, detach)       │
-│    send(sock, CMD_STATUS) → recv response                       │
-│    send(sock, CMD_DISABLE) → recv response                      │
-│                                                                  │
-│  // Detach: write enabled=0 to memfd, then close socket         │
-│  __atomic_store_n(&ctrl->tracing_enabled, 0, __ATOMIC_RELEASE);│
-│  close(sock);                                                    │
+│  Phase 5: Deactivate via mmap                                   │
+│    ctrl->command = CMD_DEACTIVATE;                              │
+│    atomic_store(&ctrl->version, v+1, RELEASE);                 │
 └─────────────────────────────────────────────────────────────────┘
 
 Key: After the initial socket handshake + SCM_RIGHTS fd passing,
-     controller config writes go through mmap'd shared memory (~50-100 ns).
-     The socket is only used for commands that need a response
-     (status queries, flush requests, graceful detach).
+     activate/deactivate commands go through mmap (~50-100 ns write).
+     The socket is only used for queries needing a response.
 ```
 
-## Bootstrap Sequence (Detailed)
+## Control Structure
 
-```
-Controller                               Library (bg thread)
-    │                                        │
-    │  1. connect("\0dispatch_<pid>")         │
-    ├───────────────────────────────────────>│
-    │                                        │ accept()
-    │                                        │ SO_PEERCRED → verify UID
-    │                                        │
-    │  2. Library sends memfd via SCM_RIGHTS │
-    │<───────────────────────────────────────┤ sendmsg(cmsg=SCM_RIGHTS,
-    │                                        │         fd=memfd)
-    │  recvmsg() → extract memfd fd          │
-    │  mmap(memfd_fd) → ctrl pointer         │
-    │                                        │
-    │  3. Write config to shared memory      │
-    │  (direct mmap write, no socket needed) │
-    │     ctrl->output_format = JSON         │
-    │     ctrl->func_enable_mask = 0xFF...   │
-    │     atomic_store(enabled, 1)           │
-    │ - - - - - - - - - - - - - - - - - - ->│ atomic_load sees enabled=1
-    │                                        │ tracing begins
-    │                                        │
-    │  4. (later) Status query via socket    │
-    │  CMD_STATUS                             │
-    ├───────────────────────────────────────>│
-    │  {enabled:1, events:42000}             │
-    │<───────────────────────────────────────┤
-    │                                        │
-    │  5. Disable via shared memory          │
-    │     atomic_store(enabled, 0)           │
-    │ - - - - - - - - - - - - - - - - - - ->│ tracing stops
-    │                                        │
-    │  6. Request flush via socket           │
-    │  CMD_FLUSH                              │
-    ├───────────────────────────────────────>│
-    │  {OK, events_flushed: 42500}           │
-    │<───────────────────────────────────────┤
-    │                                        │
-    │  7. close()                             │
-    ├───────────────────────────────────────>│
+Same as Option B — the `rocp_ctrl_t` struct is minimal because per-function configuration is handled by existing `rocprofiler_configure_*` APIs:
+
+```c
+#define ROCP_CTRL_MAGIC   0xD15EA7C0  // Same as Option B for interoperability
+#define ROCP_CTRL_VERSION 1
+
+enum rocp_ctrl_command {
+    CMD_NONE       = 0,
+    CMD_ACTIVATE   = 1,
+    CMD_DEACTIVATE = 2,
+};
+
+typedef struct {
+    uint32_t magic;
+    uint32_t struct_version;
+
+    _Atomic uint32_t command;
+    _Atomic uint32_t version;
+
+    _Atomic uint32_t context_active;
+    _Atomic uint32_t context_id;
+    _Atomic uint64_t events_traced;
+    _Atomic uint64_t events_dropped;
+
+    uint32_t pid;
+    uint64_t start_time;
+} __attribute__((aligned(64))) rocp_ctrl_t;
 ```
 
 ## SCM_RIGHTS File Descriptor Passing
 
 This is the core mechanism that makes F+memfd work. `SCM_RIGHTS` allows one process to send a file descriptor to another over a Unix domain socket. The kernel duplicates the fd into the receiver's fd table.
 
-### Library side (sender):
+### Tool side (sender):
 
 ```c
 static int send_fd(int sock, int fd_to_send) {
@@ -212,48 +198,12 @@ static int recv_fd(int sock) {
 }
 ```
 
-## Control Structure
-
-Same as Option B, but lives in anonymous memory (memfd) rather than a file:
-
-```c
-#define DISPATCH_MAGIC 0xD15EFD00
-#define MAX_TRACED_FUNCTIONS 2048  // HIP ~1300, HSA ~400, RCCL ~300
-#define DISPATCH_STRUCT_VERSION 1  // Bump on layout changes
-
-typedef struct {
-    uint32_t magic;
-    uint32_t struct_version;         // Detects library/controller version mismatch
-    uint32_t config_version;         // Bumped on every config change
-
-    _Atomic uint32_t tracing_enabled;
-
-    /* Double-buffered config for race-free reconfiguration.
-     * Controller writes to inactive slot, then atomically swaps active_config_slot. */
-    _Atomic uint32_t active_config_slot; // 0 or 1
-    _Atomic uint32_t func_enable_mask[2][MAX_TRACED_FUNCTIONS / 32];
-
-    struct {
-        uint32_t output_format;      // TEXT=0, JSON=1, PERFETTO=2
-        uint32_t ring_buffer_size;   // Bytes, must be power of 2
-        char output_path[256];
-        char filter_pattern[256];
-        char exclude_pattern[256];
-    } config_slots[2];
-
-    _Atomic uint64_t events_traced;
-    _Atomic uint64_t events_dropped;
-} __attribute__((aligned(64))) dispatch_ctrl_t;
-```
-
 ## memfd Sealing (Optional Hardening)
-
-After the controller receives the memfd and before tracing begins, the library can apply **seals** to prevent unexpected modifications:
 
 ```c
 // The memfd MUST be created with MFD_ALLOW_SEALING for sealing to work.
 // Without it, fcntl(F_ADD_SEALS) returns EPERM.
-int memfd = memfd_create("dispatch_ctrl", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+int memfd = memfd_create("ctrl", MFD_CLOEXEC | MFD_ALLOW_SEALING);
 
 // After setup, seal against size changes:
 fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
@@ -261,7 +211,7 @@ fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
 // Both sides can still read/write the content (F_SEAL_WRITE is NOT set).
 ```
 
-This prevents a compromised controller from extending the memfd to cause the library to read out-of-bounds. Note that sealing only prevents size manipulation, not content corruption — the library should validate all fields read from shared memory (bounds-check strings, validate enum ranges, etc.).
+Sealing only prevents size manipulation, not content corruption. The tool should validate command values read from shared memory.
 
 ## Security Analysis
 
@@ -270,111 +220,74 @@ This prevents a compromised controller from extending the memfd to cause the lib
 | **Authentication** | `SO_PEERCRED` — kernel-verified effective UID/GID at connect time. PID accurate at connect time, may become stale on peer exit |
 | **Filesystem footprint** | **None** — abstract socket + memfd are both anonymous |
 | **Race/pre-creation attack** | **Impossible** — no filesystem paths to race on |
-| **Other-user access** | Blocked by SO_PEERCRED check in library |
+| **Other-user access** | Blocked by SO_PEERCRED check in tool |
 | **Stale artifacts** | **None** — both abstract socket and memfd vanish on process exit |
 | **memfd integrity** | Sealing prevents size tampering (`F_SEAL_SHRINK | F_SEAL_GROW`) |
 | **Container isolation** | Abstract sockets scoped to network namespace |
 | **Socket probing** | Any process in the same network namespace can attempt to connect, revealing socket existence. SO_PEERCRED check rejects unauthorized connections, but tracer-loaded PIDs are discoverable |
 
-### Why F+memfd is more secure than A (POSIX shm):
+### Why F+memfd is more secure than Option B (mmap file):
 
-1. **No predictable name** in `/dev/shm/` — the memfd has no filesystem entry at all
-2. **No race window** — the memfd is created by the library, not discovered by name
+1. **No predictable path** — the memfd has no filesystem entry at all
+2. **No race window** — the memfd is created by the tool, not discovered by name
 3. **Authenticated handoff** — the controller only gets the memfd fd after passing SO_PEERCRED
-4. **Sealable** — the library can prevent size manipulation
+4. **Sealable** — the tool can prevent size manipulation
 
 ## Overhead Profile
 
 | Phase | Cost | Detail |
 |-------|------|--------|
-| Library init | ~15-20 μs | `memfd_create` + `mmap` + `socket` + `bind` + `listen` + `pthread_create` |
+| Tool init | ~15-20 μs | `memfd_create` + `mmap` + `socket` + `bind` + `listen` + `pthread_create` |
 | Controller connect + memfd recv | ~10-15 μs | `connect` + `recvmsg(SCM_RIGHTS)` + `mmap` |
 | **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
 | **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
-| Config change (mmap) | ~50-100 ns | Direct write to shared memory (cache-line transfer) |
+| Command write (mmap) | ~50-100 ns | Direct write to shared memory (cache-line transfer) |
+| Context toggle latency | ~1 ms | Background thread poll interval (or futex wake) |
 | Status query (socket) | ~2-5 μs | Socket round-trip for response |
-| Detach (mmap + socket) | ~5 μs | Atomic store + CMD_FLUSH + close |
 
 ## Multi-Runtime Application (rocprofiler-sdk)
 
-For tracing HIP, HSA, RCCL, OpenMP, rocdecode, rocjpeg:
+Since the tool uses rocprofiler-sdk's context system, multi-runtime support is the same as Option B: a single context covers all registered domains. A single `rocprofiler_start_context(ctx)` activates tracing for HIP, HSA, RCCL, OMPT, etc. simultaneously.
 
-The library creates **one memfd per runtime** and shares all of them during the socket handshake:
+The memfd carries only the `rocp_ctrl_t` command/status struct — no per-runtime control needed. The controller writes `CMD_ACTIVATE` to the memfd; the tool's background thread calls `rocprofiler_start_context()` and all registered domains begin tracing.
 
-```
-Bootstrap:
-  Controller connects → SO_PEERCRED verified
-  Library sends 6 memfds via SCM_RIGHTS:
-    fd[0] = hip_ctrl     (mmap'd by HIP dispatch wrapper)
-    fd[1] = hsa_ctrl     (mmap'd by HSA dispatch wrapper)
-    fd[2] = rccl_ctrl    (mmap'd by RCCL dispatch wrapper)
-    fd[3] = ompt_ctrl    (mmap'd by OpenMP dispatch wrapper)
-    fd[4] = rocdecode_ctrl
-    fd[5] = rocjpeg_ctrl
+**Advantage over Option B**: The memfd has no filesystem path, so there's nothing to clean up on crash and no PID-reuse stale file problem.
 
-Runtime:
-  Controller writes to hip_ctrl->tracing_enabled = 1   (~50 ns)
-  Controller writes to hsa_ctrl->tracing_enabled = 1   (~50 ns)
-  // Each runtime's wrapper reads its own ctrl independently
-  // No socket I/O for enable/disable — just mmap writes
-
-  Controller sends CMD_STATUS via socket → gets aggregated stats
-  Controller sends CMD_FLUSH via socket → all runtimes flush
-```
-
-This scales cleanly to any number of runtimes without protocol changes.
+**Advantage over Option F (pure socket)**: Commands go through mmap (~50-100 ns) instead of socket send (~1-5 μs). The socket is reserved for status queries that need responses.
 
 ### OpenMP Integration
 
-OMPT is started **enabled at init time** — the OMPT tool library (`libdispatch_ompt_tool.so`) is loaded via `OMP_TOOL_LIBRARIES` before the OpenMP runtime initializes. All OMPT callbacks are registered immediately but behave as **noops by default** — each checks the same `ctrl->tracing_enabled` atomic flag that the dispatch table hot path uses. When the controller attaches and sets `tracing_enabled = 1`, OMPT callbacks begin recording events through the same memfd-backed ring buffer as HIP/HSA events. This makes OpenMP tracing a peer of other runtimes, controlled by the same memfd control region.
-
-The OMPT tool's memfd is included in the bootstrap handshake alongside the other runtimes:
-
-```
-Bootstrap (updated):
-  Library sends 7 memfds via SCM_RIGHTS:
-    fd[0] = hip_ctrl
-    fd[1] = hsa_ctrl
-    fd[2] = rccl_ctrl
-    fd[3] = ompt_ctrl    ← OpenMP OMPT control
-    fd[4] = rocdecode_ctrl
-    fd[5] = rocjpeg_ctrl
-    fd[6] = global_ctrl  ← master enable + aggregated stats
-```
-
-See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full OMPT noop-shim design and callback examples.
+OMPT is registered at init time via `OMP_TOOL_LIBRARIES`. OMPT callbacks register a rocprofiler context with `ROCPROFILER_CALLBACK_TRACING_OMPT` domain. When the controller activates the context, `populate_contexts()` starts finding it — OMPT callbacks begin recording alongside HIP/HSA events. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full design.
 
 ### OpenTelemetry Export
 
-The output format can be extended with `OUTPUT_OTLP` to export trace events as OpenTelemetry spans via OTLP. Each intercepted API call maps to an OTel span with attributes like `hip.function`, `hip.stream`, `gpu.device_id`, `memory.size_bytes`. This enables integration with Jaeger, Grafana Tempo, and other OTel-compatible backends.
+The output format can be extended with `OUTPUT_OTLP` to export trace events as OpenTelemetry spans via OTLP. This is configured at init time via the tool library, not through the control channel.
 
 ## File Layout
 
 ```
-src/tools/dispatch_tracer_memfd/
-├── dispatch_memfd.h            # Shared structs, constants
-├── dispatch_memfd_wrapper.c    # LD_PRELOAD library + bg thread + memfd
-├── dispatch_memfd_trace.c      # Tracing logic
-├── dispatch_memfd_fdpass.c     # SCM_RIGHTS helper functions
-└── dispatch_memfd_controller.c # CLI controller tool
+src/tools/rocprofiler_tool_memfd/
+├── rocp_memfd.h            # Shared structs (rocp_ctrl_t), constants
+├── rocp_memfd_tool.c       # rocprofiler tool library (configure + initialize + memfd + socket)
+├── rocp_memfd_fdpass.c     # SCM_RIGHTS helper functions
+└── rocp_memfd_controller.c # CLI controller tool
 ```
 
 ## Build Integration
 
 ```cmake
-option(BUILD_DISPATCH_MEMFD "Build dispatch table tracer (memfd)" ON)
+option(BUILD_ROCP_TOOL_MEMFD "Build rocprofiler tool with memfd control channel" ON)
 
-if(BUILD_DISPATCH_MEMFD)
-    add_library(mylib_dispatch_memfd SHARED
-        src/tools/dispatch_tracer_memfd/dispatch_memfd_wrapper.c
-        src/tools/dispatch_tracer_memfd/dispatch_memfd_trace.c
-        src/tools/dispatch_tracer_memfd/dispatch_memfd_fdpass.c
+if(BUILD_ROCP_TOOL_MEMFD)
+    add_library(rocprofiler_tool_memfd SHARED
+        src/tools/rocprofiler_tool_memfd/rocp_memfd_tool.c
+        src/tools/rocprofiler_tool_memfd/rocp_memfd_fdpass.c
     )
-    target_link_libraries(mylib_dispatch_memfd PRIVATE dl pthread)
-    target_compile_options(mylib_dispatch_memfd PRIVATE -O2 -fPIC)
+    target_link_libraries(rocprofiler_tool_memfd PRIVATE pthread)
+    target_compile_options(rocprofiler_tool_memfd PRIVATE -O2 -fPIC)
 
-    add_executable(dispatch_ctrl_memfd
-        src/tools/dispatch_tracer_memfd/dispatch_memfd_controller.c
+    add_executable(rocp_ctrl_memfd
+        src/tools/rocprofiler_tool_memfd/rocp_memfd_controller.c
     )
 endif()
 ```
@@ -382,28 +295,28 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead:
-LD_PRELOAD=build/lib/libmylib_dispatch_memfd.so \
+# Noop overhead (tool loaded, context not activated):
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_memfd.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
 # With tracing:
 # Terminal 1:
-LD_PRELOAD=build/lib/libmylib_dispatch_memfd.so \
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_memfd.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
 # Terminal 2:
-build/bin/dispatch_ctrl_memfd --pid $! enable
-build/bin/dispatch_ctrl_memfd --pid $! status
-build/bin/dispatch_ctrl_memfd --pid $! disable
+build/bin/rocp_ctrl_memfd --pid $! activate
+build/bin/rocp_ctrl_memfd --pid $! status
+build/bin/rocp_ctrl_memfd --pid $! deactivate
 ```
 
 ## Limitations
 
-1. **Background thread** — Default pthread stack is ~2 MB. Thread must be joinable so `tool_finalize()` (called via `atexit()`) can close the listen fd and `pthread_join()` it. No `__attribute__((destructor))` — cleanup is driven by the registration library's atexit handler, matching rocprofiler-sdk.
-2. **fork() handling** — After `fork()`, the child inherits the socket fd but the background thread is gone. A `pthread_atfork()` child handler must: close the listen fd, set `tracing_enabled = 0`, and optionally re-create the control socket.
+1. **Background thread** — Default pthread stack is ~2 MB. Thread must be joinable so `tool_finalize()` (called via `atexit()`) can shut it down cleanly. Finalization is driven by the registration library's atexit handler, matching rocprofiler-sdk.
+2. **fork() handling** — After `fork()`, the child inherits the socket fd but the background thread is gone. A `pthread_atfork()` child handler must close the listen fd and set `finalize_status = 1`.
 3. **Socket/memfd on exec()** — Listen socket must use `SOCK_CLOEXEC`, memfd must use `MFD_CLOEXEC`, to prevent fd leak after `execve()`.
 4. **`memfd_create` availability** — Requires kernel 3.17+ (2014). Sealing requires `MFD_ALLOW_SEALING` flag at creation.
 5. **SCM_RIGHTS complexity** — The fd-passing code is ~50 lines of boilerplate.
-6. **Single controller** — Only one controller at a time. Limits multi-tool scenarios in rocprofiler-sdk.
+6. **Single controller** — Only one controller at a time. Limits multi-tool scenarios.
 7. **memfd not inspectable** — Contents not viewable with standard tools. Debugging requires the controller.
 8. **Overhead estimates are pre-implementation** — Timing figures should be validated after implementation.

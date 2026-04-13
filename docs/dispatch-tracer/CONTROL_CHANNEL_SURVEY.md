@@ -32,10 +32,11 @@ The designs in this document minimize changes to rocprofiler-sdk:
 The control channel's job is narrow: **toggle a `rocprofiler_context_id_t` between active and inactive.** Everything else (wrappers, callbacks, buffers, correlation IDs) is already implemented.
 
 **Changes required to rocprofiler-sdk:**
-- `rocprofiler_context_activate_external()` / `rocprofiler_context_deactivate_external()` API callable from a control channel handler
 - Control channel setup in the tool's `initialize` callback (shm/socket/memfd)
-- Background thread or signal handler to receive commands and call activate/deactivate
+- Background thread or signal handler to receive commands and call `rocprofiler_start_context()` / `rocprofiler_stop_context()` (existing public APIs)
 - Optionally: extend `rocprofiler_configure_attach()` to support new channels alongside ptrace
+
+Note: No new SDK APIs are needed. The existing `rocprofiler_start_context()` / `rocprofiler_stop_context()` are sufficient — they are public APIs designed to be called from any thread.
 
 **What the control channel does NOT need to do:**
 - No custom dispatch table or function pointer management (rocprofiler-sdk already handles this)
@@ -62,8 +63,10 @@ We evaluated 13 control channel mechanisms across 6 categories.
 
 ### Category 1: Shared Memory
 
-| ID | Mechanism | Hot-Path Cost | Requires | Security |
-|----|-----------|---------------|----------|----------|
+The "Hot-Path Cost" column below shows the **raw IPC mechanism cost** (atomic load from mmap'd memory). In the rocprofiler-sdk integration, the actual hot-path overhead is ~10-20 ns from `populate_contexts()` — the IPC mechanism adds zero to the hot path since it only toggles context activation from a background thread.
+
+| ID | Mechanism | IPC Check Cost | Requires | Security |
+|----|-----------|----------------|----------|----------|
 | A | POSIX shared memory (`shm_open` + `mmap`) | ~1-5 ns | Nothing | File mode `0600` on `/dev/shm/` |
 | B | mmap on regular file | ~1-5 ns | Nothing | Dir `0700` + file `0600` |
 
@@ -71,7 +74,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 
 ### Category 2: BPF-Based
 
-| ID | Mechanism | Hot-Path Cost | Requires | Security |
+| ID | Mechanism | IPC Check Cost | Requires | Security |
 |----|-----------|---------------|----------|----------|
 | C | BPF array map + `BPF_F_MMAPABLE` | ~1-5 ns | `CAP_BPF`, kernel 5.5+ | Capability-gated |
 | O | BPF map (syscall access, no mmap) | ~150-300 ns | `CAP_BPF` | Capability-gated |
@@ -82,7 +85,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 
 ### Category 3: Socket-Based
 
-| ID | Mechanism | Hot-Path Cost | Requires | Security |
+| ID | Mechanism | IPC Check Cost | Requires | Security |
 |----|-----------|---------------|----------|----------|
 | F | Unix domain socket | ~1-5 ns (local atomic) | Nothing | `SO_PEERCRED` (kernel-verified effective UID/PID) |
 | F+memfd | Unix socket + `memfd_create` | ~1-5 ns (mmap'd memfd) | Nothing | `SO_PEERCRED` + no filesystem entry |
@@ -91,7 +94,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 
 ### Category 4: Direct Memory Access
 
-| ID | Mechanism | Hot-Path Cost | Requires | Security |
+| ID | Mechanism | IPC Check Cost | Requires | Security |
 |----|-----------|---------------|----------|----------|
 | L | `/proc/<pid>/mem` direct write | ~1-5 ns (target side) | ptrace permissions | `ptrace_scope` + UID |
 | M | `process_vm_writev` | ~1-5 ns (target side) | ptrace permissions | `ptrace_scope` + UID |
@@ -100,7 +103,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 
 ### Category 5: Signal-Based
 
-| ID | Mechanism | Hot-Path Cost | Requires | Security |
+| ID | Mechanism | IPC Check Cost | Requires | Security |
 |----|-----------|---------------|----------|----------|
 | J | SIGUSR1/SIGUSR2 | ~1-5 ns (`sig_atomic_t`) | Nothing | `kill()` UID check |
 | K | Real-time signal (SIGRTMIN+n) | ~1-5 ns | Nothing | `kill()` UID check |
@@ -109,7 +112,7 @@ We evaluated 13 control channel mechanisms across 6 categories.
 
 ### Category 6: Code Injection
 
-| ID | Mechanism | Hot-Path Cost | Requires | Security |
+| ID | Mechanism | IPC Check Cost | Requires | Security |
 |----|-----------|---------------|----------|----------|
 | N | ptrace inject (rocprofiler-sdk approach) | ~50-200 ns | ptrace permissions, x86-64 | `ptrace_scope` + UID |
 

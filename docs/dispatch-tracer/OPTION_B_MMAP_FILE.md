@@ -304,7 +304,7 @@ static void tool_finalize(void* tool_data) {
 | **Root access** | Root can always access (unavoidable on any Unix system) |
 | **Same-user interference** | Possible — any process running as the same user can write to the file. Mitigated by the magic cookie and version counter |
 | **Race condition** | Protected — `/run/user/<uid>/` is created by `pam_systemd` with correct ownership. PID-specific subdirectory created with `mkdir` + `O_NOFOLLOW` on file open to prevent symlink attacks by same-user processes |
-| **PID reuse** | After crash, a stale control file with valid magic may match a new unrelated process with the same PID. Controller should verify `/proc/<pid>/stat` start time or check that the LD_PRELOAD library is loaded via `/proc/<pid>/maps` |
+| **PID reuse** | After crash, a stale control file with valid magic may match a new unrelated process with the same PID. Controller should verify `/proc/<pid>/stat` start time matches `ctrl->start_time`, or check that the tool library is loaded via `/proc/<pid>/maps` |
 | **Stale artifacts** | Control file persists in tmpfs on crash. Cleaned up on user logout (tmpfs). The controller can detect stale entries by checking if the PID is still alive |
 
 ## Overhead Profile
@@ -347,28 +347,26 @@ No per-runtime files needed. Per-function and per-domain configuration is handle
 ## File Layout
 
 ```
-src/tools/dispatch_tracer_mmap/
-├── dispatch_mmap.h          # dispatch_ctrl_t, constants, shared definitions
-├── dispatch_mmap_wrapper.c  # LD_PRELOAD library
-├── dispatch_mmap_trace.c    # Tracing logic (timestamps, ring buffer output)
-└── dispatch_mmap_controller.c  # CLI controller tool
+src/tools/rocprofiler_tool_mmap/
+├── rocp_mmap.h              # rocp_ctrl_t, constants, shared definitions
+├── rocp_mmap_tool.c         # rocprofiler tool library (configure + initialize + mmap)
+└── rocp_mmap_controller.c   # CLI controller tool
 ```
 
 ## Build Integration (CMakeLists.txt additions)
 
 ```cmake
-option(BUILD_DISPATCH_MMAP "Build dispatch table tracer (mmap)" ON)
+option(BUILD_ROCP_TOOL_MMAP "Build rocprofiler tool with mmap control channel" ON)
 
-if(BUILD_DISPATCH_MMAP)
-    add_library(mylib_dispatch_mmap SHARED
-        src/tools/dispatch_tracer_mmap/dispatch_mmap_wrapper.c
-        src/tools/dispatch_tracer_mmap/dispatch_mmap_trace.c
+if(BUILD_ROCP_TOOL_MMAP)
+    add_library(rocprofiler_tool_mmap SHARED
+        src/tools/rocprofiler_tool_mmap/rocp_mmap_tool.c
     )
-    target_link_libraries(mylib_dispatch_mmap PRIVATE dl)
-    target_compile_options(mylib_dispatch_mmap PRIVATE -O2 -fPIC)
+    target_link_libraries(rocprofiler_tool_mmap PRIVATE pthread)
+    target_compile_options(rocprofiler_tool_mmap PRIVATE -O2 -fPIC)
 
-    add_executable(dispatch_ctrl_mmap
-        src/tools/dispatch_tracer_mmap/dispatch_mmap_controller.c
+    add_executable(rocp_ctrl_mmap
+        src/tools/rocprofiler_tool_mmap/rocp_mmap_controller.c
     )
 endif()
 ```
@@ -376,27 +374,25 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead (loaded but not attached):
-LD_PRELOAD=build/lib/libmylib_dispatch_mmap.so \
+# Noop overhead (tool loaded, context not activated):
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_mmap.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
-# With tracing enabled:
+# With tracing:
 # Terminal 1:
-LD_PRELOAD=build/lib/libmylib_dispatch_mmap.so \
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_mmap.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
 # Terminal 2:
-build/bin/dispatch_ctrl_mmap --pid $! --enable
-# Press Enter to detach
-
-# Noop vs attached comparison measures the dispatch table overhead alone
+build/bin/rocp_ctrl_mmap --pid $! activate
+# ... tracing active ...
+build/bin/rocp_ctrl_mmap --pid $! deactivate
 ```
 
 ## Limitations
 
-1. **No notification** — The library must poll the `tracing_enabled` flag on every call. There is no way for the controller to "wake up" the library. For the dispatch tracer this is fine since the check is on every call anyway.
+1. **No notification** — The background thread polls the mmap'd control file on a timer (~1 ms). There is no instant wake mechanism (see Option Signal for that enhancement). The hot path itself (`populate_contexts()`) runs on every intercepted call and does not involve the mmap.
 2. **Depends on `/run/user/<uid>/`** — Requires systemd's `pam_systemd` or equivalent to create the per-user tmpfs directory. If unavailable, a fallback to `/tmp/` is possible but requires extra care: `/tmp/` is world-writable, so the implementation must use `mkdtemp`-style randomization and `O_NOFOLLOW` to prevent symlink attacks.
 3. **No bidirectional communication** — The controller cannot query the library's state (e.g., "how many functions were discovered?"). It can only read the statistics counters.
-4. **Config struct size fixed at compile time** — `MAX_TRACED_FUNCTIONS=2048` is sufficient for all current ROCm APIs (HIP around 1300, HSA around 400, RCCL around 300). If new runtimes exceed this, bump the constant and `DISPATCH_STRUCT_VERSION`.
-5. **fork() behavior** — After `fork()`, the child inherits the mmap'd control region but has a different PID. A `pthread_atfork()` child handler should reset `ctrl->tracing_enabled = 0` and set `finalize_status = 1` (already-finalized) so the child's atexit handler skips cleanup for the parent's control file.
+4. **fork() behavior** — After `fork()`, the child inherits the mmap'd control region but has a different PID. A `pthread_atfork()` child handler should call `rocprofiler_stop_context()` and set `finalize_status = 1` so the child's atexit handler skips cleanup for the parent's control file.
 6. **Overhead estimates are pre-implementation** — All timing figures are projected from known syscall/memory-access costs and should be validated with benchmarks after implementation.

@@ -8,7 +8,7 @@ This is not a standalone option — it's an **enhancement** layered on top of B 
 
 ## Why Signals?
 
-In Options B, F, and F+memfd, the hot-path already checks `tracing_enabled` on every call. So for the enable/disable toggle, signals add no value — the flag is checked every ~100 ns anyway.
+In Options B, F, and F+memfd, the existing `populate_contexts()` already checks active contexts on every call (~10-20 ns). So for the enable/disable toggle, signals add no value — the context check happens every call anyway.
 
 Signals become valuable when:
 
@@ -22,16 +22,15 @@ Signals become valuable when:
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Target Process (sample_app)                   │
 │                                                                  │
-│  LD_PRELOAD=libmylib_dispatch_signal.so                         │
+│  Tool loaded via ROCP_TOOL_LIBRARIES                            │
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │  Main Thread (application code)                            │  │
 │  │                                                            │  │
-│  │  hot path:                                                 │  │
-│  │    if (__atomic_load_n(&ctrl->tracing_enabled,             │  │
-│  │                        __ATOMIC_ACQUIRE))                  │  │
-│  │        trace(func_id, args);                               │  │
-│  │    real_fn(args);                                          │  │
+│  │  hot path (existing, NO CHANGES):                          │  │
+│  │    populate_contexts(domain, op, cb_ctxs, buf_ctxs);      │  │
+│  │    if (empty) → call original;  // noop ~10-20 ns         │  │
+│  │    else → callbacks + original + buffers                   │  │
 │  │                                                            │  │
 │  │  // Same as B or F+memfd — signal does not affect this     │  │
 │  └───────────────────────────────────────────────────────────┘  │
@@ -40,7 +39,7 @@ Signals become valuable when:
 │  │  Signal Handler (SIGRTMIN+7)                               │  │
 │  │                                                            │  │
 │  │  // Async-signal-safe: only sets a flag                    │  │
-│  │  static uid_t cached_uid;  // set once in constructor     │  │
+│  │  static uid_t cached_uid;  // set in tool_initialize       │  │
 │  │  static void sig_handler(int sig, siginfo_t *info, ...) { │  │
 │  │      // Defense-in-depth: kernel already checked UID on    │  │
 │  │      // sigqueue(), but verify anyway using cached UID     │  │
@@ -64,9 +63,8 @@ Signals become valuable when:
 │  │    new_version = ctrl->version;                            │  │
 │  │    if (new_version > last_version) {                       │  │
 │  │        apply_config(ctrl);                                 │  │
-│  │        // Allocate ring buffers, open output files, etc.   │  │
-│  │        __atomic_store_n(&ctrl->tracing_enabled, 1,         │  │
-│  │                         __ATOMIC_RELEASE);                 │  │
+│  │        // Heavy setup if needed, then activate context     │  │
+│  │        rocprofiler_start_context(saved_ctx);               │  │
 │  │        last_version = new_version;                         │  │
 │  │    }                                                       │  │
 │  └───────────────────────────────────────────────────────────┘  │
@@ -78,18 +76,16 @@ Signals become valuable when:
 ┌──────────────────────▼──────────────────────────────────────────┐
 │                    Controller                                    │
 │                                                                  │
-│  // Step 1: Write config to data channel                        │
-│  ctrl->output_format = OUTPUT_JSON;                             │
-│  ctrl->ring_buffer_size = 4 * 1024 * 1024;                     │
-│  memset(ctrl->func_enable_mask, 0xFF, ...);                     │
+│  // Step 1: Write command to data channel (mmap or memfd)       │
+│  ctrl->command = CMD_ACTIVATE;                                  │
 │  __atomic_store_n(&ctrl->version, v+1, __ATOMIC_RELEASE);      │
 │                                                                  │
-│  // Step 2: Signal the target to apply config                   │
+│  // Step 2: Signal the target to apply command immediately      │
 │  union sigval val = { .sival_int = ctrl->version };             │
 │  sigqueue(target_pid, SIGRTMIN + 7, val);                       │
 │                                                                  │
-│  // The library's bg thread wakes up within ~1-5 μs,           │
-│  // reads the new config, and enables tracing.                  │
+│  // The tool's bg thread wakes within ~1-5 μs,                 │
+│  // calls rocprofiler_start_context(ctx).                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -172,18 +168,12 @@ The signal handler's job is simple: when woken, the background thread calls `roc
 ```c
 static int wakeup_pipe[2];
 
-/* Called during registration — NOT a constructor */
-static void on_intercept_table_registration(
-    const char* lib_name,
-    void** api_table,
-    size_t func_count)
-{
-    // Save originals and install shim wrappers (same as other options)
-    memcpy(&orig_table, api_table, func_count * sizeof(void*));
-    ((mylib_api_table_t*)api_table)->my_traced_function =
-        shim_my_traced_function;
+/* Called during tool_initialize — context and domains already registered
+ * by rocprofiler_configure. This only sets up the signal control channel. */
+static void setup_signal_control(rocprofiler_context_id_t ctx) {
+    saved_ctx = ctx;
 
-    // Cache UID for signal handler (avoids calling getuid() in handler)
+    // Cache UID for signal handler
     cached_uid = getuid();
 
     // Create self-pipe for signal→thread notification
@@ -294,7 +284,7 @@ Library bg thread wakes and:
   1. Reads HIP config → enables HIP tracing
   2. Reads HSA config → enables HSA tracing
   3. Reads RCCL config → enables RCCL tracing
-  4. Sets master tracing_enabled = 1
+  4. Calls rocprofiler_start_context(ctx)
 All runtimes activated in a single wake cycle
 ```
 
@@ -303,30 +293,28 @@ This avoids per-runtime socket round-trips and ensures all runtimes activate sim
 ## File Layout
 
 ```
-src/tools/dispatch_tracer_signal/
-├── dispatch_signal.h            # Signal number, shared structs
-├── dispatch_signal_wrapper.c    # LD_PRELOAD lib + signal handler + bg thread
-├── dispatch_signal_trace.c      # Tracing logic
-├── dispatch_signal_data.c       # Data channel integration (B or F+memfd)
-└── dispatch_signal_controller.c # CLI controller
+src/tools/rocprofiler_tool_signal/
+├── rocp_signal.h              # Signal number, rocp_ctrl_t (same as Option B)
+├── rocp_signal_tool.c         # rocprofiler tool library (configure + signal setup)
+├── rocp_signal_data.c         # Data channel integration (B or F+memfd)
+└── rocp_signal_controller.c   # CLI controller
 ```
 
 ## Build Integration
 
 ```cmake
-option(BUILD_DISPATCH_SIGNAL "Build dispatch table tracer (signal)" ON)
+option(BUILD_ROCP_TOOL_SIGNAL "Build rocprofiler tool with signal control channel" ON)
 
-if(BUILD_DISPATCH_SIGNAL)
-    add_library(mylib_dispatch_signal SHARED
-        src/tools/dispatch_tracer_signal/dispatch_signal_wrapper.c
-        src/tools/dispatch_tracer_signal/dispatch_signal_trace.c
-        src/tools/dispatch_tracer_signal/dispatch_signal_data.c
+if(BUILD_ROCP_TOOL_SIGNAL)
+    add_library(rocprofiler_tool_signal SHARED
+        src/tools/rocprofiler_tool_signal/rocp_signal_tool.c
+        src/tools/rocprofiler_tool_signal/rocp_signal_data.c
     )
-    target_link_libraries(mylib_dispatch_signal PRIVATE dl pthread)
-    target_compile_options(mylib_dispatch_signal PRIVATE -O2 -fPIC)
+    target_link_libraries(rocprofiler_tool_signal PRIVATE pthread)
+    target_compile_options(rocprofiler_tool_signal PRIVATE -O2 -fPIC)
 
-    add_executable(dispatch_ctrl_signal
-        src/tools/dispatch_tracer_signal/dispatch_signal_controller.c
+    add_executable(rocp_ctrl_signal
+        src/tools/rocprofiler_tool_signal/rocp_signal_controller.c
     )
 endif()
 ```
@@ -334,18 +322,18 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead:
-LD_PRELOAD=build/lib/libmylib_dispatch_signal.so \
+# Noop overhead (tool loaded, context not activated):
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_signal.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
 # With tracing:
 # Terminal 1:
-LD_PRELOAD=build/lib/libmylib_dispatch_signal.so \
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_signal.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
 # Terminal 2:
-build/bin/dispatch_ctrl_signal --pid $! enable
-build/bin/dispatch_ctrl_signal --pid $! disable
+build/bin/rocp_ctrl_signal --pid $! activate
+build/bin/rocp_ctrl_signal --pid $! deactivate
 ```
 
 ## Limitations

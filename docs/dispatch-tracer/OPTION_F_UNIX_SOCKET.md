@@ -2,7 +2,7 @@
 
 ## Overview
 
-This design uses a **Unix domain socket** (abstract namespace) as the control channel. The LD_PRELOAD library creates a listener socket and a background thread. The controller connects, is authenticated via `SO_PEERCRED` (kernel-verified, unforgeable UID/GID/PID), and sends structured commands (enable, disable, configure, query status). The hot path uses a **process-local atomic variable** — no socket I/O per intercepted call.
+This design uses a **Unix domain socket** (abstract namespace) as the control channel. The tool library creates a listener socket and a background thread during its `initialize` callback. The controller connects, is authenticated via `SO_PEERCRED` (kernel-verified, unforgeable UID/GID), and sends structured commands (activate, deactivate, query status). The hot path is entirely within rocprofiler-sdk's existing `populate_contexts()` — no socket I/O per intercepted call.
 
 This option provides the **strongest authentication model** of all options: the kernel verifies the connecting process's identity, and this verification cannot be forged.
 
@@ -12,89 +12,72 @@ This option provides the **strongest authentication model** of all options: the 
 ┌────────────────────────────────────────────────────────────────┐
 │                    Target Process (sample_app)                  │
 │                                                                 │
-│  LD_PRELOAD=libmylib_dispatch_sock.so                          │
+│  Existing rocprofiler-sdk flow (unchanged):                    │
+│    Runtime → rocprofiler_set_api_table() → copy_table()        │
+│    → update_table() installs functor wrappers                   │
+│                                                                 │
+│  Tool library (loaded via ROCP_TOOL_LIBRARIES):                │
+│    rocprofiler_configure():                                     │
+│      create context, register all domains                      │
+│      DO NOT activate context yet                               │
+│    tool_initialize():                                           │
+│      setup_socket_control(ctx)                                 │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Main Thread (application code)                           │  │
+│  │  Existing functor hot path (NO CHANGES):                  │  │
 │  │                                                           │  │
-│  │  hot path:                                                │  │
-│  │    if (__atomic_load_n(&local_enabled, __ATOMIC_ACQUIRE)) │  │
-│  │        trace(func_id, args);                              │  │
-│  │    real_fn(args);                                         │  │
-│  │                                                           │  │
-│  │  // No socket I/O here — existing populate_contexts()    │  │
+│  │  hip_api_impl<T,Op>::functor(args...):                    │  │
+│  │    populate_contexts(domain, op,                          │  │
+│  │        callback_ctxs, buffered_ctxs);                     │  │
+│  │    if (callback_ctxs.empty() && buffered_ctxs.empty())    │  │
+│  │        return exec(get_table_func(), args);  // noop      │  │
+│  │    // ... full tracing path                               │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Background Thread (control plane)                        │  │
-│  │                                                           │  │
-│  │  sock = socket(AF_UNIX, SOCK_STREAM, 0)                  │  │
-│  │  bind(sock, "\0dispatch_<pid>")  // abstract namespace    │  │
-│  │  listen(sock, 1)                                          │  │
+│  │  Background Thread (NEW — listens on abstract socket):    │  │
 │  │                                                           │  │
 │  │  loop:                                                    │  │
 │  │    client = accept(sock)                                  │  │
-│  │    getsockopt(client, SO_PEERCRED, &cred)                │  │
-│  │    if (cred.uid != getuid()) { close(client); continue; }│  │
-│  │                                                           │  │
+│  │    SO_PEERCRED → verify UID                               │  │
 │  │    recv(client, &cmd)                                     │  │
 │  │    switch (cmd.type):                                     │  │
-│  │      CMD_ENABLE:                                          │  │
-│  │        apply_config(cmd.config);                          │  │
-│  │        atomic_store(&local_enabled, 1);                   │  │
-│  │        send(client, {status: OK, apis_traced: N});        │  │
-│  │      CMD_DISABLE:                                         │  │
-│  │        atomic_store(&local_enabled, 0);                   │  │
-│  │        flush_buffers();                                   │  │
-│  │        send(client, {status: OK, events: count});         │  │
+│  │      CMD_ACTIVATE:                                        │  │
+│  │        rocprofiler_start_context(ctx);  // existing API   │  │
+│  │        send(client, {OK});                                │  │
+│  │      CMD_DEACTIVATE:                                      │  │
+│  │        rocprofiler_stop_context(ctx);   // existing API   │  │
+│  │        send(client, {OK, events_count});                  │  │
 │  │      CMD_STATUS:                                          │  │
-│  │        send(client, {enabled, event_count, ...});         │  │
-│  │      CMD_CONFIGURE:                                       │  │
-│  │        update_filters(cmd.config);                        │  │
-│  │        send(client, {status: OK});                        │  │
+│  │        send(client, {active, events, ...});               │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  Abstract socket: \0dispatch_12345 (no filesystem entry)       │
+│  Abstract socket: \0rocprofiler_12345 (no filesystem entry)    │
 └──────────────────────┬─────────────────────────────────────────┘
                        │ Unix domain socket (abstract namespace)
 ┌──────────────────────▼─────────────────────────────────────────┐
-│                    Controller (dispatch_ctrl_sock)               │
+│                    Controller                                   │
 │                                                                 │
-│  sock = socket(AF_UNIX, SOCK_STREAM, 0)                        │
-│  connect(sock, "\0dispatch_<pid>")                              │
-│                                                                 │
-│  // Send enable command with configuration:                     │
-│  cmd = {                                                        │
-│    .type = CMD_ENABLE,                                          │
-│    .config = {                                                  │
-│      .filter = "my_traced_*",                                   │
-│      .output_format = OUTPUT_JSON,                              │
-│      .ring_buffer_size = 4 * 1024 * 1024,                      │
-│    }                                                            │
-│  };                                                             │
-│  send(sock, &cmd, sizeof(cmd), 0);                             │
-│  recv(sock, &response, sizeof(response), 0);                   │
-│  printf("Attached: %d APIs traced\n", response.apis_traced);   │
-│                                                                 │
-│  // Wait, then detach:                                          │
-│  cmd.type = CMD_DISABLE;                                        │
-│  send(sock, &cmd, sizeof(cmd), 0);                             │
-│  recv(sock, &response, sizeof(response), 0);                   │
-│  printf("Events: %lu\n", response.events_traced);              │
+│  sock = connect("\0rocprofiler_<pid>")                          │
+│  send(sock, {CMD_ACTIVATE})                                    │
+│  recv(sock, {OK})                                              │
+│  // ... tracing active ...                                     │
+│  send(sock, {CMD_DEACTIVATE})                                  │
+│  recv(sock, {OK, events: 42500})                               │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Protocol Design
 
+Since per-function configuration and output format are handled by existing `rocprofiler_configure_*` APIs at init time, the socket protocol only needs to carry **context activation commands** and **status queries**:
+
 ### Command Types
 
 ```c
-enum dispatch_cmd_type {
-    CMD_ENABLE     = 1,   // Enable tracing with config
-    CMD_DISABLE    = 2,   // Disable tracing, flush buffers
-    CMD_CONFIGURE  = 3,   // Update config without restart
-    CMD_STATUS     = 4,   // Query current state
-    CMD_LIST_FUNCS = 5,   // List discovered functions
+enum rocp_cmd_type {
+    CMD_ACTIVATE   = 1,   // Activate context (start tracing)
+    CMD_DEACTIVATE = 2,   // Deactivate context (stop tracing)
+    CMD_STATUS     = 3,   // Query current state
 };
 ```
 
@@ -102,70 +85,42 @@ enum dispatch_cmd_type {
 
 ```c
 typedef struct {
-    uint32_t type;          // dispatch_cmd_type
-    uint32_t payload_len;   // Length of payload in bytes
-    /* Variable-length payload follows */
-} dispatch_cmd_header_t;
+    uint32_t type;          // rocp_cmd_type
+    uint32_t flags;         // Reserved for future use
+} rocp_cmd_t;
 
-/* CMD_ENABLE / CMD_CONFIGURE payload */
 typedef struct {
-    uint32_t output_format;              // TEXT=0, JSON=1, PERFETTO=2
-    uint32_t ring_buffer_size;           // Bytes
-    uint32_t func_enable_mask[16];       // 512-bit mask
-    char filter_pattern[256];            // Glob include
-    char exclude_pattern[256];           // Glob exclude
-    char output_path[256];
-} dispatch_config_payload_t;
-
-/* Response from library to controller */
-typedef struct {
-    uint32_t status;         // OK=0, ERROR=1, PARTIAL=2
-    uint32_t payload_len;
-    /* Variable-length payload follows */
-} dispatch_response_header_t;
-
-/* CMD_ENABLE response payload */
-typedef struct {
-    uint32_t functions_discovered;
-    uint32_t functions_enabled;
-} dispatch_enable_response_t;
-
-/* CMD_STATUS response payload */
-typedef struct {
-    uint32_t tracing_enabled;
-    uint32_t functions_enabled;
+    uint32_t status;         // OK=0, ERROR=1
+    uint32_t context_active; // 0 = inactive, 1 = active
     uint64_t events_traced;
     uint64_t events_dropped;
-    uint64_t uptime_ns;
-} dispatch_status_response_t;
+} rocp_response_t;
 ```
 
 ### Protocol Flow
 
 ```
-Controller                      Library (bg thread)
+Controller                      Tool (bg thread)
     │                               │
-    │  connect("\0dispatch_<pid>")  │
+    │  connect("\0rocprofiler_<pid>")│
     ├──────────────────────────────>│
     │                               │ accept() + SO_PEERCRED check
     │                               │
-    │  CMD_ENABLE + config          │
+    │  CMD_ACTIVATE                 │
     ├──────────────────────────────>│
-    │                               │ apply config
-    │                               │ atomic_store(&local_enabled, 1)
-    │     {OK, funcs_enabled: 1}   │
+    │                               │ rocprofiler_start_context(ctx)
+    │     {OK, active: 1}          │
     │<──────────────────────────────┤
     │                               │
     │  CMD_STATUS                   │
     ├──────────────────────────────>│
-    │  {enabled:1, events:42000}   │
+    │  {OK, active:1, events:42000}│
     │<──────────────────────────────┤
     │                               │
-    │  CMD_DISABLE                  │
+    │  CMD_DEACTIVATE               │
     ├──────────────────────────────>│
-    │                               │ atomic_store(&local_enabled, 0)
-    │                               │ flush ring buffers
-    │  {OK, events_flushed: 42500} │
+    │                               │ rocprofiler_stop_context(ctx)
+    │  {OK, events: 42500}         │
     │<──────────────────────────────┤
     │                               │
     │  close()                      │
@@ -174,9 +129,11 @@ Controller                      Library (bg thread)
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool uses standard rocprofiler-sdk APIs (`rocprofiler_configure`, `rocprofiler_create_context`, `rocprofiler_configure_callback_tracing_service`, `rocprofiler_start_context` / `rocprofiler_stop_context`). The existing dispatch table machinery (`copy_table`/`update_table`/`functor`) is reused as-is. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
+Same as all options — the tool uses standard rocprofiler-sdk APIs. The existing dispatch table machinery is reused as-is. See [Option B](OPTION_B_MMAP_FILE.md#what-reuses-existing-rocprofiler-sdk-code-no-changes) for the full list of reused vs new code.
 
-The **only difference from Option B** is the IPC mechanism: instead of an mmap'd file, this option uses a Unix domain socket. The tool's `initialize` callback sets up the socket instead of the mmap file.
+The **only difference from Option B** is the IPC mechanism: instead of an mmap'd file polled by a background thread, this option uses a Unix domain socket where the background thread blocks on `accept()`/`recv()` and responds to commands directly.
+
+**Advantage over Option B**: the socket is inherently bidirectional, so the controller can query status and receive acknowledgments. Option B's mmap only supports one-way commands with status fields.
 
 ## Components
 
@@ -225,21 +182,26 @@ static void* control_loop(void* arg) {
         if (cred.uid != getuid()) { close(client); continue; }
 
         // Process commands
-        dispatch_cmd_header_t cmd;
+        rocp_cmd_t cmd;
         while (recv(client, &cmd, sizeof(cmd), 0) > 0) {
+            rocp_response_t resp = {0};
             switch (cmd.type) {
-            case CMD_ENABLE:
+            case CMD_ACTIVATE:
                 rocprofiler_start_context(saved_ctx);  // EXISTING API
-                send_response(client, STATUS_OK);
+                resp.status = 0;
+                resp.context_active = 1;
                 break;
-            case CMD_DISABLE:
+            case CMD_DEACTIVATE:
                 rocprofiler_stop_context(saved_ctx);   // EXISTING API
-                send_response(client, STATUS_OK);
+                resp.status = 0;
+                resp.context_active = 0;
                 break;
             case CMD_STATUS:
-                send_status(client, saved_ctx);
+                resp.status = 0;
+                /* read stats from context */
                 break;
             }
+            send(client, &resp, sizeof(resp), 0);
         }
         close(client);
     }
@@ -264,42 +226,61 @@ struct ucred {
 // connection time but may become stale if the peer exits and the PID is reused.
 ```
 
-### 4. Controller (`dispatch_ctrl_sock.c`)
+### 4. Controller
 
 ```c
 int main(int argc, char** argv) {
     pid_t target_pid = parse_args(argc, argv);
-    const char* action = parse_action(argc, argv);
+    const char* action = parse_action(argc, argv);  // "activate" or "deactivate"
 
-    // Connect to target's abstract socket
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     addr.sun_path[0] = '\0';
     snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1,
-             "dispatch_%d", target_pid);
+             "rocprofiler_%d", target_pid);
 
     if (connect(sock, (struct sockaddr*)&addr, ...) < 0) {
-        fprintf(stderr, "Cannot connect to PID %d "
-                "(is the dispatch tracer loaded?)\n", target_pid);
+        fprintf(stderr, "Cannot connect to PID %d\n", target_pid);
         return 1;
     }
 
-    if (strcmp(action, "enable") == 0) {
-        dispatch_cmd_header_t cmd = { .type = CMD_ENABLE };
-        dispatch_config_payload_t config = {
-            .output_format = OUTPUT_TEXT,
-            .ring_buffer_size = 4 * 1024 * 1024,
-        };
-        memset(config.func_enable_mask, 0xFF, sizeof(config.func_enable_mask));
-        cmd.payload_len = sizeof(config);
-        send(sock, &cmd, sizeof(cmd), 0);
-        send(sock, &config, sizeof(config), 0);
+    rocp_cmd_t cmd = {0};
+    if (strcmp(action, "activate") == 0)
+        cmd.type = CMD_ACTIVATE;
+    else if (strcmp(action, "deactivate") == 0)
+        cmd.type = CMD_DEACTIVATE;
+    else
+        cmd.type = CMD_STATUS;
 
-        dispatch_response_header_t resp;
-        recv(sock, &resp, sizeof(resp), 0);
-        // ...
+    send(sock, &cmd, sizeof(cmd), 0);
+    rocp_response_t resp;
+    recv(sock, &resp, sizeof(resp), 0);
+    printf("Context active: %u, events: %lu\n",
+           resp.context_active, resp.events_traced);
+    return 0;
+}
+```
+
+### 5. Finalization (atexit, rocprofiler-sdk pattern)
+
+```c
+static _Atomic int finalize_status = 0;
+
+static void tool_finalize(void* tool_data) {
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&finalize_status, &expected, -1,
+                                     0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;
+
+    rocprofiler_stop_context(saved_ctx);
+
+    if (listen_fd_global >= 0) {
+        close(listen_fd_global);
+        listen_fd_global = -1;
     }
-    // ... handle other actions
+    pthread_join(control_thread, NULL);
+
+    __atomic_store_n(&finalize_status, 1, __ATOMIC_SEQ_CST);
 }
 ```
 
@@ -309,99 +290,67 @@ int main(int argc, char** argv) {
 |----------|------------|
 | **Authentication** | Strongest of all options — `SO_PEERCRED` provides kernel-verified effective UID, GID, PID at connect time |
 | **Identity forging** | UID/GID are unforgeable. PID is accurate at connect time but may become stale on peer exit |
-| **Other-user access** | Blocked — library rejects connections where `cred.uid != getuid()` |
+| **Other-user access** | Blocked — tool rejects connections where `cred.uid != getuid()` |
 | **Abstract namespace** | No filesystem entry — nothing to race, nothing to pre-create, nothing to symlink. However, any process in the same network namespace can *attempt* to connect (probing for socket existence). The SO_PEERCRED check in accept rejects unauthorized connections, but socket existence is discoverable |
 | **Auto-cleanup** | Abstract sockets vanish when the last fd closes (process exit) |
 | **Container isolation** | Abstract sockets are scoped to the network namespace |
-| **PID allowlisting** | Optional: library can also check `cred.pid` against an expected controller PID |
+| **PID allowlisting** | Optional: tool can also check `cred.pid` against an expected controller PID |
 
 ## Overhead Profile
 
 | Phase | Cost | Detail |
 |-------|------|--------|
-| Library init | ~10-15 μs | `socket` + `bind` + `listen` + `pthread_create` |
+| Tool init | ~10-15 μs | `socket` + `bind` + `listen` + `pthread_create` |
 | Controller connect | ~3-5 μs | `socket` + `connect` |
 | SO_PEERCRED check | ~1 μs | `getsockopt` |
 | Command send/recv | ~1-5 μs | Per command (kernel copies data between socket buffers) |
 | **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
 | **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
-| Config change | ~2-5 μs | Socket recv + apply + atomic store |
+| Context toggle | ~5 μs | Socket recv + `rocprofiler_start/stop_context()` |
 | Thread idle overhead | ~0 | Thread blocked on `accept()`, no CPU |
 
 ## Multi-Runtime Application (rocprofiler-sdk)
 
-The socket protocol naturally supports multi-runtime configuration in a single session:
+Since the tool uses rocprofiler-sdk's context system, multi-runtime support is the same as Option B: a single context covers all registered domains. A single `rocprofiler_start_context(ctx)` activates tracing for HIP, HSA, RCCL, OMPT, etc. simultaneously.
 
-```c
-/* CMD_ENABLE payload for multi-runtime */
-typedef struct {
-    uint32_t runtime_count;
-    struct {
-        uint32_t runtime_id;    // HIP=0, HSA=1, RCCL=2, OMPT=3, ...
-        uint32_t enabled;
-        uint32_t func_mask[16]; // 512-bit per-function mask
-        char filter[256];
-        char exclude[256];
-    } runtimes[];
-} dispatch_multi_config_t;
+The socket's bidirectional nature adds value for status queries:
+
 ```
-
-The controller sends one `CMD_ENABLE` with all runtime configurations. The library applies them atomically (all configs written before the master enable flag is set).
+Controller → Tool:  CMD_STATUS
+Tool → Controller:  {active: true, events_traced: 42000, ...}
+```
 
 ### Bidirectional Queries
 
-Unlike Options A/B (shared memory), the socket naturally supports rich queries:
-
-```
-Controller → Library:  CMD_LIST_FUNCS {runtime: HIP}
-Library → Controller:  {count: 512, funcs: ["hipMalloc", "hipMemcpy", ...]}
-
-Controller → Library:  CMD_STATUS
-Library → Controller:  {enabled: true, hip_events: 42000, hsa_events: 1200, ...}
-```
-
-This is particularly useful for `rocprofv3`-style tools that want to display what's being traced and how many events have been collected.
+Unlike Option B (shared memory status fields), the socket naturally supports rich queries with structured responses. This is useful for `rocprofv3`-style tools that want to display what's being traced and how many events have been collected.
 
 ### OpenMP Integration
 
-OMPT is started **enabled at init time** via `OMP_TOOL_LIBRARIES`, but all callbacks are noop by default — each checks the same `local_enabled` atomic flag. When the controller sends `CMD_ENABLE`, OMPT callbacks begin recording alongside HIP/HSA events. The socket protocol's `CMD_ENABLE` payload includes a runtime bitmask that can independently enable/disable OpenMP tracing:
-
-```c
-/* In dispatch_multi_config_t: */
-struct {
-    uint32_t runtime_id;    // HIP=0, HSA=1, RCCL=2, OMPT=3, ...
-    uint32_t enabled;       // Per-runtime enable
-    ...
-} runtimes[];
-```
-
-The OMPT tool library ships as `libdispatch_ompt_tool.so` and plugs into the same socket-based control channel. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full noop-shim design.
+OMPT is registered at init time via `OMP_TOOL_LIBRARIES`. OMPT callbacks register a rocprofiler context with `ROCPROFILER_CALLBACK_TRACING_OMPT` domain. When the controller sends `CMD_ACTIVATE`, `rocprofiler_start_context()` activates the context and `populate_contexts()` starts finding it — OMPT callbacks begin recording alongside HIP/HSA events. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full design.
 
 ## File Layout
 
 ```
-src/tools/dispatch_tracer_sock/
-├── dispatch_sock_protocol.h    # Command types, message structs
-├── dispatch_sock_wrapper.c     # LD_PRELOAD library + control thread
-├── dispatch_sock_trace.c       # Tracing logic (timestamps, ring buffer)
-└── dispatch_sock_controller.c  # CLI controller tool
+src/tools/rocprofiler_tool_sock/
+├── rocp_sock_protocol.h    # Command types, message structs (rocp_cmd_t, rocp_response_t)
+├── rocp_sock_tool.c        # rocprofiler tool library (configure + initialize + socket setup)
+└── rocp_sock_controller.c  # CLI controller tool
 ```
 
 ## Build Integration
 
 ```cmake
-option(BUILD_DISPATCH_SOCK "Build dispatch table tracer (unix socket)" ON)
+option(BUILD_ROCP_TOOL_SOCK "Build rocprofiler tool with socket control channel" ON)
 
-if(BUILD_DISPATCH_SOCK)
-    add_library(mylib_dispatch_sock SHARED
-        src/tools/dispatch_tracer_sock/dispatch_sock_wrapper.c
-        src/tools/dispatch_tracer_sock/dispatch_sock_trace.c
+if(BUILD_ROCP_TOOL_SOCK)
+    add_library(rocprofiler_tool_sock SHARED
+        src/tools/rocprofiler_tool_sock/rocp_sock_tool.c
     )
-    target_link_libraries(mylib_dispatch_sock PRIVATE dl pthread)
-    target_compile_options(mylib_dispatch_sock PRIVATE -O2 -fPIC)
+    target_link_libraries(rocprofiler_tool_sock PRIVATE pthread)
+    target_compile_options(rocprofiler_tool_sock PRIVATE -O2 -fPIC)
 
-    add_executable(dispatch_ctrl_sock
-        src/tools/dispatch_tracer_sock/dispatch_sock_controller.c
+    add_executable(rocp_ctrl_sock
+        src/tools/rocprofiler_tool_sock/rocp_sock_controller.c
     )
 endif()
 ```
@@ -409,28 +358,28 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead:
-LD_PRELOAD=build/lib/libmylib_dispatch_sock.so \
+# Noop overhead (tool loaded, context not activated):
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_sock.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
 # With tracing:
 # Terminal 1:
-LD_PRELOAD=build/lib/libmylib_dispatch_sock.so \
+ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_sock.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
 # Terminal 2:
-build/bin/dispatch_ctrl_sock --pid $! enable
+build/bin/rocp_ctrl_sock --pid $! activate
 # ... tracing active ...
-build/bin/dispatch_ctrl_sock --pid $! disable
-build/bin/dispatch_ctrl_sock --pid $! status
+build/bin/rocp_ctrl_sock --pid $! status
+build/bin/rocp_ctrl_sock --pid $! deactivate
 ```
 
 ## Limitations
 
 1. **Background thread** — Default pthread stack is ~2 MB (configurable). Thread must be joinable so `tool_finalize` can `pthread_join()` it.
-2. **fork() handling** — After `fork()`, the background thread is gone. `pthread_atfork()` child handler must close the listen fd, reset `local_enabled = 0`, and set `finalize_status = 1` so the child's atexit handler skips cleanup.
-5. **Socket buffer limits** — Large config payloads may require multiple `send()`/`recv()` calls with framing.
-6. **Abstract namespace portability** — Abstract Unix sockets are Linux-specific (not available on macOS/BSD). For cross-platform, fall back to filesystem sockets.
-7. **Config update latency** — ~2-5 μs per config change (socket round-trip) vs ~50-100 ns for mmap-based options. Irrelevant for attach/detach but noticeable for high-frequency config updates.
-8. **Single controller** — `listen(sock, 1)` with serial `handle_client()` means only one controller can be connected at a time. A second connection attempt will queue (backlog=1) or be refused. This is intentional for simplicity but limits multi-tool scenarios.
-9. **Overhead estimates are pre-implementation** — All timing figures are projected from known syscall costs and should be validated with benchmarks after implementation.
+2. **fork() handling** — After `fork()`, the background thread is gone. `pthread_atfork()` child handler must close the listen fd and set `finalize_status = 1` so the child's atexit handler skips cleanup.
+3. **Socket buffer limits** — Large response payloads may require multiple `send()`/`recv()` calls with framing.
+4. **Abstract namespace portability** — Abstract Unix sockets are Linux-specific (not available on macOS/BSD). For cross-platform, fall back to filesystem sockets.
+5. **Context toggle latency** — ~5 μs per activate/deactivate (socket round-trip) vs ~1 ms (poll interval) for Option B. Socket is faster for toggle but has higher per-command overhead.
+6. **Single controller** — `listen(sock, 1)` with serial `handle_client()` means only one controller at a time. Limits multi-tool scenarios.
+7. **Overhead estimates are pre-implementation** — All timing figures are projected from known syscall costs and should be validated with benchmarks.
