@@ -76,6 +76,11 @@ set_target_properties(sample_app PROPERTIES
 message("${Green}  ✓ sample_app${ColorReset}")
 
 # ============================================================================
+# Dispatch Tracer (mock rocprofiler-register/SDK + mylib_dispatch)
+# ============================================================================
+add_subdirectory(src/dispatch_tracer)
+
+# ============================================================================
 # 3. LTTng Tracer (Optional)
 # ============================================================================
 if(BUILD_LTTNG)
