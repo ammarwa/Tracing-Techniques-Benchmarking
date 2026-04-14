@@ -129,11 +129,15 @@ Controller                      Tool (bg thread)
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool uses standard rocprofiler-sdk APIs and follows the **single-phase design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal). The tool registers all domains at init time, the context starts inactive, and the control channel handles activate/deactivate/reconfigure (runtime filtering via tool callbacks). True addition of new domains post-init requires the existing `rocprofv3 --attach --pid` ptrace mechanism — `rocprofiler_force_configure()` is locked after SDK init starts.
+Same as all options — uses the **late-load design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture):
 
-The **only difference from Option B** is the IPC mechanism: instead of an mmap'd file polled by a background thread, this option uses a Unix domain socket where the background thread blocks on `accept()`/`recv()` and responds to commands directly. The protocol carries `CMD_ACTIVATE` (with optional filter config), `CMD_DEACTIVATE`, `CMD_RECONFIGURE`, and `CMD_STATUS`.
+- A small **stub library** is preloaded (via `LD_PRELOAD`) that does NOT export `rocprofiler_configure`, so rocprofiler-register doesn't load rocprofiler-sdk → 0 ns hot path before any attach
+- On `CMD_CONFIGURE`, the stub `dlopen`s the tool library and calls `rocprofiler_force_configure()` (succeeds because SDK init_status is still 0)
+- SDK initializes with the controller-specified domains, propagation runs, wrappers install only for the requested operations
 
-**Advantage over Option B**: the socket is inherently bidirectional, so the controller can synchronously wait for an ACK from the tool's background thread and receive event counters in the response.
+The **only difference from Option B** is the IPC mechanism: a Unix domain socket where the stub's background thread blocks on `accept()`/`recv()` and responds to commands directly. The protocol carries `CMD_CONFIGURE` (full config payload), `CMD_ACTIVATE`, `CMD_DEACTIVATE`, `CMD_RECONFIGURE`, and `CMD_STATUS`.
+
+**Advantage over Option B**: the socket is inherently bidirectional, so the controller can synchronously wait for `CMD_CONFIGURE` to complete (including dlopen + force_configure + propagation, ~5-50 ms) and receive a confirmation ACK with event counters.
 
 ## Components
 
@@ -304,8 +308,8 @@ static void tool_finalize(void* tool_data) {
 | Controller connect | ~3-5 μs | `socket` + `connect` |
 | SO_PEERCRED check | ~1 μs | `getsockopt` |
 | Command send/recv | ~1-5 μs | Per command (kernel copies data between socket buffers) |
-| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
-| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
+| **Hot-path (no attach)** | **0 ns** | Stub loaded but rocprofiler-sdk not loaded — original function pointers |
+| **Hot-path (active)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
 | Context toggle | ~5 μs | Socket recv + `rocprofiler_start/stop_context()` |
 | Thread idle overhead | ~0 | Thread blocked on `accept()`, no CPU |
 
@@ -358,18 +362,18 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead (tool loaded, context not activated):
-ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_sock.so \
+# Stub preloaded, no SDK loaded — 0 ns hot-path overhead:
+LD_PRELOAD=build/lib/librocp_stub_sock.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
-# With tracing:
+# Late attach with full configuration:
 # Terminal 1:
-ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_sock.so \
+LD_PRELOAD=build/lib/librocp_stub_sock.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
 # Terminal 2:
-build/bin/rocp_ctrl_sock --pid $! activate
-# ... tracing active ...
+build/bin/rocp_ctrl_sock --pid $! configure --hip --hsa --output json
+# ... tracing now active ...
 build/bin/rocp_ctrl_sock --pid $! status
 build/bin/rocp_ctrl_sock --pid $! deactivate
 ```

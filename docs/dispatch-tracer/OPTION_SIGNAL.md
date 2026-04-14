@@ -157,9 +157,9 @@ Phase 3 (queries): Controller uses socket for CMD_STATUS, CMD_FLUSH
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool follows the **single-phase design** in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal): registers all domains at init, context starts inactive, control channel toggles activation and updates a runtime filter.
+Same as all options — uses the **late-load design** in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): stub preloaded (no `rocprofiler_configure` symbol, 0 ns hot path), SDK `dlopen`'d at attach via `rocprofiler_force_configure()`.
 
-The signal serves as an instant wake mechanism for the background thread. When woken, the thread reads the paired data channel (mmap or memfd) and dispatches the command: `CMD_ACTIVATE` → `rocprofiler_start_context()`, `CMD_DEACTIVATE` → `rocprofiler_stop_context()`, `CMD_RECONFIGURE` → atomic update of the runtime filter struct. The signal handler itself only writes a wake byte to a pipe — all SDK calls happen in the background thread, never in the signal context.
+The signal serves as an instant wake mechanism for the stub's background thread. When woken, the thread reads the paired data channel (mmap or memfd) and dispatches: `CMD_CONFIGURE` → dlopen SDK + force_configure (first attach only), `CMD_ACTIVATE` → `rocprofiler_start_context()`, `CMD_DEACTIVATE` → `rocprofiler_stop_context()`, `CMD_RECONFIGURE` → atomic update of the runtime filter. The signal handler itself only writes a wake byte to a pipe — all SDK/dlopen work happens in the background thread.
 
 ## Components
 
@@ -269,8 +269,8 @@ if (ret < 0) {
 | Signal handler execution | ~0.5-2 μs | Handler sets flag + writes 1 byte to pipe |
 | Background thread wakeup | ~1-3 μs | `poll()` returns + pipe read |
 | Config application | ~10-500 μs | Depends on work (buffer alloc, file open, etc.) |
-| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
-| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
+| **Hot-path (no attach)** | **0 ns** | Stub loaded but rocprofiler-sdk not loaded — original function pointers |
+| **Hot-path (active)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
 | **Config change notification** | **~1-5 μs** | Signal delivery + thread wakeup (vs polling interval) |
 
 ## Multi-Runtime Application (rocprofiler-sdk)
@@ -322,17 +322,17 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead (tool loaded, context not activated):
-ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_signal.so \
+# Stub preloaded, no SDK loaded — 0 ns hot-path overhead:
+LD_PRELOAD=build/lib/librocp_stub_signal.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
-# With tracing:
+# Late attach with full configuration:
 # Terminal 1:
-ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_signal.so \
+LD_PRELOAD=build/lib/librocp_stub_signal.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
 # Terminal 2:
-build/bin/rocp_ctrl_signal --pid $! activate
+build/bin/rocp_ctrl_signal --pid $! configure --hip --hsa --output json
 build/bin/rocp_ctrl_signal --pid $! deactivate
 ```
 

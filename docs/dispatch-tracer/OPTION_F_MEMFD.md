@@ -12,9 +12,9 @@ This is the **recommended option for production** (e.g., rocprofiler-sdk) as it 
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool uses standard rocprofiler-sdk APIs and follows the **single-phase design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal): tool registers all domains at init, context starts inactive, control channel handles activate/deactivate/reconfigure. `rocprofiler_force_configure()` is locked after init so adding new domains post-init requires ptrace.
+Same as all options — uses the **late-load design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path), and `rocprofiler-sdk` is `dlopen`'d at attach via `CMD_CONFIGURE`, which triggers `rocprofiler_force_configure()` to install wrappers for the controller-specified domains.
 
-This option combines Option F's socket (for authentication + bootstrap) with a memfd containing the same `rocp_ctrl_t` struct as Option B (including the `rocp_config_t` payload). The differences from Option B: the control struct lives in anonymous memory (no filesystem) and authentication is via `SO_PEERCRED`. The background thread polls the memfd for `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE` and calls `rocprofiler_start_context()` / `rocprofiler_stop_context()` or updates the runtime filter — same as Option B.
+This option combines Option F's socket (for `SO_PEERCRED` authentication + bootstrap) with a memfd containing the `rocp_ctrl_t` struct (same layout as Option B). The differences from Option B: the control struct lives in anonymous memory (no filesystem) and authentication is via `SO_PEERCRED`.
 
 ## Architecture
 
@@ -239,8 +239,8 @@ Sealing only prevents size manipulation, not content corruption. The tool should
 |-------|------|--------|
 | Tool init | ~15-20 μs | `memfd_create` + `mmap` + `socket` + `bind` + `listen` + `pthread_create` |
 | Controller connect + memfd recv | ~10-15 μs | `connect` + `recvmsg(SCM_RIGHTS)` + `mmap` |
-| **Hot-path (noop)** | **~10-20 ns** | Existing `populate_contexts()` — context inactive |
-| **Hot-path (tracing)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
+| **Hot-path (no attach)** | **0 ns** | Stub loaded but rocprofiler-sdk not loaded — original function pointers |
+| **Hot-path (active)** | **~50-200 ns** | `populate_contexts()` + callbacks + buffer emplace |
 | Command write (mmap) | ~50-100 ns | Direct write to shared memory (cache-line transfer) |
 | Context toggle latency | ~1 ms | Background thread poll interval (or futex wake) |
 | Status query (socket) | ~2-5 μs | Socket round-trip for response |
@@ -295,17 +295,17 @@ endif()
 ## Benchmark Usage
 
 ```bash
-# Noop overhead (tool loaded, context not activated):
-ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_memfd.so \
+# Stub preloaded, no SDK loaded — 0 ns hot-path overhead:
+LD_PRELOAD=build/lib/librocp_stub_memfd.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 1000000
 
-# With tracing:
+# Late attach with full configuration:
 # Terminal 1:
-ROCP_TOOL_LIBRARIES=build/lib/librocprofiler_tool_memfd.so \
+LD_PRELOAD=build/lib/librocp_stub_memfd.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
 # Terminal 2:
-build/bin/rocp_ctrl_memfd --pid $! activate
+build/bin/rocp_ctrl_memfd --pid $! configure --hip --hsa --output json
 build/bin/rocp_ctrl_memfd --pid $! status
 build/bin/rocp_ctrl_memfd --pid $! deactivate
 ```
