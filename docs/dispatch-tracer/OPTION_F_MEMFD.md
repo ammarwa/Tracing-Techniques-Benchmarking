@@ -12,9 +12,9 @@ This is the **recommended option for production** (e.g., rocprofiler-sdk) as it 
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — the tool uses standard rocprofiler-sdk APIs including `rocprofiler_force_configure()` for **late configuration**. See [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal) for the full late-configuration design.
+Same as all options — the tool uses standard rocprofiler-sdk APIs and follows the **single-phase design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal): tool registers all domains at init, context starts inactive, control channel handles activate/deactivate/reconfigure. `rocprofiler_force_configure()` is locked after init so adding new domains post-init requires ptrace.
 
-This option combines Option F's socket (for authentication + bootstrap) with a memfd containing the same `rocp_ctrl_t` struct as Option B (including the `rocp_config_t` payload for late configuration). The differences from Option B: the control struct lives in anonymous memory (no filesystem) and authentication is via `SO_PEERCRED`. The background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` and calls `rocprofiler_force_configure()` / `rocprofiler_start_context()` / `rocprofiler_stop_context()` — same as Option B.
+This option combines Option F's socket (for authentication + bootstrap) with a memfd containing the same `rocp_ctrl_t` struct as Option B (including the `rocp_config_t` payload). The differences from Option B: the control struct lives in anonymous memory (no filesystem) and authentication is via `SO_PEERCRED`. The background thread polls the memfd for `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE` and calls `rocprofiler_start_context()` / `rocprofiler_stop_context()` or updates the runtime filter — same as Option B.
 
 ## Architecture
 

@@ -14,14 +14,16 @@ This directory contains the design documentation for adding an **external contro
 
 ## Quick Comparison
 
-| Option | Hot-Path (no attach) | Hot-Path (attached, inactive) | Auth Model | Best For |
-|--------|----------------------|-------------------------------|------------|----------|
-| **B** (mmap file) | **0 ns** | ~10-20 ns | Dir `0700` + file `0600` | Simplicity |
-| **F** (Unix socket) | **0 ns** | ~10-20 ns | `SO_PEERCRED` (kernel-verified) | Authentication |
-| **F+memfd** | **0 ns** | ~10-20 ns | `SO_PEERCRED` + anonymous memory | Production |
-| **Signal+B/F** | **0 ns** | ~10-20 ns | `kill()` UID + paired channel | Instant attach |
+| Option | Hot-Path (loaded, inactive) | Hot-Path (active) | Auth Model | Best For |
+|--------|-----------------------------|-------------------|------------|----------|
+| **B** (mmap file) | ~10-20 ns | ~50-200 ns | Dir `0700` + file `0600` | Simplicity |
+| **F** (Unix socket) | ~10-20 ns | ~50-200 ns | `SO_PEERCRED` (kernel-verified) | Authentication |
+| **F+memfd** | ~10-20 ns | ~50-200 ns | `SO_PEERCRED` + anonymous memory | Production |
+| **Signal+B/F** | ~10-20 ns | ~50-200 ns | `kill()` UID + paired channel | Instant attach |
 
-When no controller has ever attached, the tool registers no contexts, `update_table()` installs zero wrappers, and the original function pointers stay in the dispatch table — **true zero overhead**. After the controller attaches via `CMD_CONFIGURE`, the tool calls `rocprofiler_force_configure()` which re-propagates runtime API tables and installs wrappers for the requested domains. The hot path then becomes ~10-20 ns when the context is inactive (existing `populate_contexts()`) or ~50-200 ns when active (full tracing pipeline).
+The tool registers all domains it might ever trace at init time, so `update_table()` installs wrappers for all those operations. The wrappers' `populate_contexts()` check noops at ~10-20 ns when the context is inactive. When the controller activates the context via the control channel, callbacks fire and emit events according to a runtime filter. The control channel adds zero overhead to the hot path itself.
+
+**Note**: rocprofiler-sdk's `rocprofiler_force_configure()` only works before SDK init starts, so the control channel cannot add new domains post-init. To genuinely add domains after process start (e.g., enable OMPT in a tool that didn't request it at init), use the existing `rocprofv3 --attach --pid` ptrace mechanism.
 
 All options require **no root, no capabilities, and no specific kernel version**.
 

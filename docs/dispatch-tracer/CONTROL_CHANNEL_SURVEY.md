@@ -20,70 +20,78 @@ The existing rocprofiler-sdk already implements a dispatch table with a two-leve
 
 **The noop overhead today** (wrapper installed but no active context): ~10-20 ns per call. `populate_contexts()` iterates active contexts (bitset check), finds none, returns.
 
-### Late Configuration Strategy
+### Single-Phase Design With Runtime Filtering
 
-The designs in this document achieve **true late configuration** — the tool can be loaded at process start with NO contexts pre-registered, and the controller specifies the entire configuration (which APIs to trace, output format, buffer sizes, etc.) at attach time. Wrappers install only for the operations the controller specifies, all without ptrace.
+The original two-phase design intent was "true late configuration" — register no domains at init, then create contexts with controller-specified domains at attach time via `rocprofiler_force_configure()`. **This does not work**: `rocprofiler_force_configure()` returns `ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED` once `get_init_status() != 0` (i.e., after init starts). It's designed for late-loading the SDK itself, not for reconfiguring an already-initialized tool.
 
-The key enabler is `rocprofiler_force_configure()` combined with `rocprofiler_register_invoke_all_registrations()`, which together allow the tool to:
+**The honest constraint:** rocprofiler-sdk's `update_table()` runs at init and installs wrappers based on contexts registered before init completes. After init, the dispatch table cannot grow new wrappers. The only ways to add wrappers post-init are:
 
-1. Re-trigger configuration with new tool functions that create contexts
-2. Re-propagate registered runtime API tables through `update_table()` so wrappers install for newly-interested operations
+1. **ptrace attach** (existing `rocprofv3 --attach --pid`) — dlopens a fresh tool inside the target, which goes through normal init from scratch. Requires `CAP_SYS_PTRACE`, x86-64 only.
+2. **Don't add wrappers post-init** — register interest in everything at init time, control which ones actually emit events at runtime.
 
-**Two-phase tool design:**
+This document picks option #2 since the design constraint is "no ptrace, no special privileges."
 
-**Phase 1 (process start, before any attach):**
+**Single-phase tool design:**
+
+**Init time (process start):**
 - Tool library loaded via `ROCP_TOOL_LIBRARIES`
-- `rocprofiler_configure()` returns a "placeholder" tool that does NOTHING — no context created, no domains registered
-- `tool_initialize()` only sets up the control channel (shm/socket/memfd) and spawns a background thread
-- **Result**: `update_table()` runs at init but installs ZERO wrappers (no contexts interested). Original function pointers stay in the dispatch table — true Level 1 noop, **zero overhead** when no controller attaches.
+- `rocprofiler_configure()` returns a tool that creates ONE context and registers callback/buffer services for **all domains the tool might ever trace** (HIP, HSA, RCCL, OMPT, rocdecode, rocjpeg)
+- The context starts **inactive** (`rocprofiler_start_context` not called)
+- `tool_initialize()` also sets up the control channel (shm/socket/memfd) and spawns a background thread
+- **Result**: `update_table()` installs wrappers for all registered operations across all domains. The wrappers exist but `populate_contexts()` finds the inactive context and returns empty. Hot path: **~10-20 ns Level 2 noop**.
 
-**Phase 2 (controller attaches via control channel):**
-- Controller sends a `CMD_CONFIGURE` with full config: which domains, which operations, output format, buffer sizes, filters
-- Tool's background thread:
-  1. Stashes the config in a static struct readable by the new configure callback
-  2. Calls `rocprofiler_force_configure(real_tool_configure_func)` — this is the public API for late configuration
-  3. The new configure callback creates contexts and registers services per the stashed config
-  4. `rocprofiler-sdk` internally calls `rocprofiler_register_invoke_all_registrations()` which re-calls `rocprofiler_set_api_table()` for every previously-registered runtime
-  5. `update_table()` re-runs and installs wrappers for the newly-interested operations
-  6. Background thread calls `rocprofiler_start_context(ctx)` to activate
-- **Result**: Wrappers exist only for operations the controller actually wants. Other APIs keep zero overhead. Tracing begins immediately.
+**Attach (controller sends CMD_ACTIVATE with optional filter config):**
+- Controller writes filter config to the control channel (which domains to actually emit, output format, filter patterns) and sends `CMD_ACTIVATE`
+- Background thread:
+  1. Updates `g_runtime_filter` (atomic, read by callbacks)
+  2. Calls `rocprofiler_start_context(ctx)`
+- The wrappers' `populate_contexts()` now finds the active context. Callbacks fire. The tool's callbacks read `g_runtime_filter` and decide whether to emit/record this event.
 
-**Phase 3 (controller detaches):**
-- `CMD_DEACTIVATE` → `rocprofiler_stop_context(ctx)` — wrappers stay installed but Level 2 noop kicks in (~10-20 ns)
-- `CMD_RECONFIGURE` → tool can call `rocprofiler_force_configure()` again with new config to add more domains
+**Detach (controller sends CMD_DEACTIVATE):**
+- Background thread calls `rocprofiler_stop_context(ctx)` — wrappers stay installed but `populate_contexts()` returns empty again (~10-20 ns noop)
 
-**What this gives us:**
+**Reconfigure (controller updates filter at runtime):**
+- Controller writes new filter config and sends `CMD_RECONFIGURE`
+- Tool callbacks pick up the new filter on the next event (~few ns extra atomic load per event)
+- No SDK calls needed — context stays active, only the tool-side filter changes
 
-| Property | Achieved? |
+**What this gives us (honest accounting):**
+
+| Property | Status |
 |---|---|
-| Zero overhead when no controller attaches | ✅ Yes — wrappers not installed for any operation |
-| Late attach without ptrace | ✅ Yes — `rocprofiler_force_configure()` is the mechanism |
-| Late configuration of which APIs to trace | ✅ Yes — controller specifies at attach |
-| Late configuration of output format / buffer settings | ✅ Yes — passed via control channel to the new configure callback |
-| Add new domains after attach | ✅ Yes — re-call `rocprofiler_force_configure()` |
-| Multi-runtime (HIP, HSA, RCCL, OMPT) | ✅ Yes — propagation re-triggers for all registered runtimes |
-| Works on any architecture (no x86-64 ptrace assembly) | ✅ Yes — pure C API calls |
+| Late attach without ptrace | ✅ Yes — `rocprofiler_start_context()` works from any thread |
+| Late filtering of which APIs to emit events for | ✅ Yes — tool callbacks check runtime filter |
+| Late change of output format / buffer destination | ✅ Yes — tool callbacks read runtime config |
+| Multi-runtime control | ✅ Yes — single context covers all registered domains |
+| Works on any architecture | ✅ Yes — pure C API calls |
+| Zero overhead when no controller ever attaches | ❌ No — ~10-20 ns per intercepted call (Level 2 noop) |
+| Add a domain not registered at init | ❌ No — only ptrace attach can do this |
+| Change correlation ID strategy at runtime | ❌ No — locked at init |
+
+**The trade-off**: this design accepts ~10-20 ns per intercepted API call always (whether controller attaches or not) in exchange for: no ptrace, no init-time configuration of which APIs to enable, ability to filter at runtime via the control channel. For ROCm API tracing where APIs already cost microseconds, ~10-20 ns of overhead is negligible.
+
+**For true zero-overhead-when-not-attached**, the only mechanism is ptrace attach (existing `rocprofv3 --attach --pid`). The control channels in this document are intended to coexist with ptrace attach, not replace it.
 
 **What this reuses from rocprofiler-sdk (no changes):**
 
 - `copy_table`/`update_table`/`functor` machinery
 - `context`, `callback_tracing_service`, `buffer_tracing_service`
 - `populate_contexts`, `context_filter`
-- `rocprofiler_force_configure()` — public API for late configure
-- `rocprofiler_register_invoke_all_registrations()` — internally triggered by force_configure to re-propagate
-- `rocprofiler_create_context`, `rocprofiler_start_context`, `rocprofiler_stop_context`
+- `rocprofiler_create_context`
 - `rocprofiler_configure_callback_tracing_service`, `rocprofiler_configure_buffer_tracing_service`
+- `rocprofiler_start_context`, `rocprofiler_stop_context` — public APIs, callable from any thread post-init
 
 **What needs to be added:**
 
-- Tool library with placeholder `rocprofiler_configure` (Phase 1) + real configure callback (Phase 2)
-- Control channel setup (shm/socket/memfd) in the tool's `tool_initialize`
-- Background thread that receives controller commands and invokes `rocprofiler_force_configure()`
-- Controller binary that sends configuration over the control channel
+- Tool library with `rocprofiler_configure` that registers all domains and creates an inactive context
+- Control channel setup (shm/socket/memfd) in `tool_initialize`
+- Background thread that reads commands and calls `rocprofiler_start_context()` / `rocprofiler_stop_context()`
+- Tool callbacks that check a runtime-updated filter struct before emitting events
+- Controller binary that writes filter config and sends commands
 
-**No new SDK APIs are needed.** All the public APIs already exist in rocprofiler-sdk.
+**No new SDK APIs are needed.** All the public APIs already exist.
 
-The key design question remains: **what IPC mechanism does the external controller use to send the configuration to the tool's background thread?**
+The key design question remains: **what IPC mechanism does the external controller use to communicate with the tool's background thread?**
 
 ## Requirements
 
@@ -282,132 +290,125 @@ However, OTel is valuable as the **output and transport layer**, not the instrum
 
 This pattern — custom dispatch-table instrumentation feeding OTel export — provides the best of both worlds: low-overhead interception with industry-standard trace output. The output format choice (`OUTPUT_TEXT`, `OUTPUT_JSON`, `OUTPUT_PERFETTO`) in the control structure could be extended with `OUTPUT_OTLP` for OTel export.
 
-### Late Configuration: Full Support via `rocprofiler_force_configure()`
+### Late Activation + Runtime Filtering: What the Control Channel Provides
 
-Both this control channel design and the existing ptrace attach support **full late configuration** — they differ only in mechanism, not capability:
+The control channel design provides **late activation** and **runtime filtering**, but NOT late addition of traced API domains. Here is the honest comparison with ptrace attach:
 
 | Capability | Control channel | ptrace attach |
 |---|---|---|
 | Tool loaded at process start | Required (via `ROCP_TOOL_LIBRARIES`) | Not required (dlopen at attach) |
-| Configure which APIs to trace at attach | Yes | Yes |
-| Configure output format / buffers at attach | Yes | Yes |
-| Add new domains after first attach | Yes (re-call `rocprofiler_force_configure()`) | Yes |
+| Activate/deactivate tracing at runtime | Yes (`rocprofiler_start/stop_context`) | Yes |
+| Filter which pre-registered APIs emit events | Yes (tool-side callback filter) | Yes |
+| Change output format / buffer destination at runtime | Yes (tool-side callback config) | Yes |
+| **Add a domain not registered at init** | **No** | **Yes** |
 | Privileges required | None | `CAP_SYS_PTRACE` (or appropriate ptrace_scope) |
 | Architecture | Any | x86-64 only |
-| Attach latency | ~5-50 ms (force_configure + propagation) | ~10-50 ms (ptrace + injection) |
-| Zero overhead when no controller attaches | Yes — no wrappers installed | N/A — tool not loaded |
+| Attach latency (activate) | ~5 μs - 1 ms | ~10-50 ms |
+| Hot-path overhead before any attach | ~10-20 ns (wrappers installed, Level 2 noop) | 0 ns (tool not loaded) |
 
-**The mechanism for late configuration in the control channel design:**
+**Why "add a domain not registered at init" is impossible without ptrace:**
+
+`rocprofiler_force_configure()` exists but its source code shows:
 
 ```c
-/* Background thread, on receiving CMD_CONFIGURE from controller: */
-static void on_configure_command(const rocp_config_t* cfg) {
-    /* Stash config so the new configure callback can read it */
-    g_pending_config = *cfg;
-
-    /* Trigger late configuration. The SDK will:
-     *   1. Call our real_tool_configure() function below
-     *   2. Re-call rocprofiler_register_invoke_all_registrations()
-     *      which re-propagates all runtime API tables (HIP, HSA, etc.)
-     *      through update_table(), installing wrappers for the
-     *      operations the new context cares about.
-     */
-    rocprofiler_force_configure(real_tool_configure);
-}
-
-/* Called by the SDK during force_configure */
-static rocprofiler_tool_configure_result_t*
-real_tool_configure(uint32_t version, const char* runtime_version,
-                    uint32_t priority, rocprofiler_client_id_t* id)
-{
-    static rocprofiler_tool_configure_result_t result = {
-        .size = sizeof(result),
-        .initialize = real_tool_initialize,
-        .finalize   = real_tool_finalize,
-    };
-    return &result;
-}
-
-/* Called by the SDK after force_configure completes the configure call */
-static void real_tool_initialize(rocprofiler_client_finalize_t fini, void* data) {
-    /* Read controller's config from g_pending_config */
-    rocprofiler_context_id_t ctx;
-    rocprofiler_create_context(&ctx);
-
-    /* Register only the domains the controller asked for */
-    if (g_pending_config.enable_hip)
-        rocprofiler_configure_callback_tracing_service(
-            ctx, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
-            NULL, 0, my_callback, NULL);
-    if (g_pending_config.enable_hsa)
-        rocprofiler_configure_callback_tracing_service(
-            ctx, ROCPROFILER_CALLBACK_TRACING_HSA_CORE_API,
-            NULL, 0, my_callback, NULL);
-    /* ... RCCL, OMPT, rocdecode, rocjpeg per controller config ... */
-
-    saved_ctx = ctx;
-    rocprofiler_start_context(ctx);
-}
+if (rocprofiler::registration::get_init_status() != 0)
+    return ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED;
+if (forced_config) return ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED;
 ```
 
-**Why this works:**
+It only works when init has not yet started, AND it can only be called once. By the time a controller attaches via the control channel, the tool is already loaded and init has completed. `force_configure` will return `ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED`.
 
-`rocprofiler_force_configure()` triggers the SDK's late-init path which calls `rocprofiler_register_invoke_all_registrations()`. This re-invokes `rocprofiler_set_api_table()` for every previously-registered runtime (HIP, HSA, etc.). For each table, `copy_table()` and `update_table()` run — and `update_table` checks `should_wrap_functor()` for every operation against the now-registered context. Operations the new context cares about get wrappers installed. Operations no context cares about keep their original pointers (zero overhead).
+**The practical implication:**
+
+The tool MUST register interest in all domains it might ever need at init time. The control channel cannot expand the set of traced domains post-init without ptrace.
+
+**What the control channel CAN do at attach time:**
+
+| Late operation | How it works |
+|---|---|
+| Activate / deactivate tracing | `rocprofiler_start/stop_context()` (callable from background thread post-init) |
+| Filter which APIs emit events | Tool callback reads `g_runtime_filter` (atomic) before emitting |
+| Change output format (TEXT/JSON/OTLP) | Callback writes to per-config destination |
+| Change output destination path | Callback opens new output on config change |
+| Adjust filter patterns (glob include/exclude) | Callback applies pattern check |
+
+**Tool-side filtering pattern:**
+
+```c
+/* Updated by background thread when controller sends CMD_RECONFIGURE */
+static struct {
+    _Atomic uint32_t enabled_domain_mask;  // which domains actually emit
+    _Atomic uint32_t output_format;
+    char output_path[256];
+    char filter_pattern[256];
+} g_runtime_filter;
+
+/* Tool callback fires for EVERY traced operation in registered domains.
+ * Cheap atomic read decides whether to actually emit. */
+static void my_callback(rocprofiler_callback_tracing_record_t record,
+                        rocprofiler_user_data_t* user_data,
+                        void* callback_data)
+{
+    uint32_t mask = __atomic_load_n(&g_runtime_filter.enabled_domain_mask,
+                                    __ATOMIC_ACQUIRE);
+    if (!(mask & (1u << record.kind))) return;  // domain disabled by controller
+
+    /* Optional name filter */
+    if (g_runtime_filter.filter_pattern[0] &&
+        !glob_match(g_runtime_filter.filter_pattern, get_op_name(record)))
+        return;
+
+    /* Emit per output_format */
+    emit_event(&record);
+}
+```
 
 **Sequence diagram:**
 
 ```
-Process start (no controller):
-  Tool init → placeholder configure (no context) → tool_initialize
-    → setup control channel only
+Process start:
+  Tool's rocprofiler_configure runs during normal SDK init
+    → creates ONE context
+    → registers callback service for ALL domains
+       (HIP, HSA, RCCL, OMPT, rocdecode, rocjpeg)
+    → does NOT call rocprofiler_start_context (context inactive)
+  tool_initialize():
+    → setup control channel (mmap/socket/memfd)
+    → spawn background thread
   Runtime init → rocprofiler_set_api_table → copy_table → update_table
-    → should_wrap_functor returns FALSE for all ops (no contexts interested)
-    → ZERO wrappers installed
-  Application runs at 100% native speed.
+    → wrappers installed for all operations across all domains
+  Application runs.
+  Hot path: ~10-20 ns per intercepted API call (populate_contexts finds inactive context).
 
 Controller attaches:
-  Controller sends CMD_CONFIGURE {enable_hip=true, enable_hsa=true, ...}
+  Controller writes runtime filter config to control channel and sends CMD_ACTIVATE.
   Background thread:
-    1. Stash config in g_pending_config
-    2. rocprofiler_force_configure(real_tool_configure)
-       → SDK calls real_tool_configure → returns initialize callback
-       → SDK calls real_tool_initialize
-         → creates context with HIP+HSA services
-       → SDK calls rocprofiler_register_invoke_all_registrations()
-         → re-invokes rocprofiler_set_api_table() for HIP runtime
-           → copy_table + update_table installs HIP wrappers
-         → re-invokes rocprofiler_set_api_table() for HSA runtime
-           → copy_table + update_table installs HSA wrappers
-    3. rocprofiler_start_context(ctx)
-  Tracing now active for HIP+HSA only.
+    1. Update g_runtime_filter (atomic stores)
+    2. rocprofiler_start_context(ctx)
+  Now populate_contexts finds active context, callback fires.
+  Callback checks g_runtime_filter, emits only enabled domains/operations.
+  Hot path: ~50-200 ns when callback emits, ~30-50 ns when callback filters out.
 
-Controller sends additional config:
-  CMD_CONFIGURE {enable_rccl=true}
-  Background thread:
-    1. rocprofiler_stop_context(saved_ctx)
-    2. rocprofiler_force_configure(real_tool_configure)
-       → re-runs initialize with new g_pending_config (HIP+HSA+RCCL)
-       → propagation re-runs update_table → adds RCCL wrappers
-    3. rocprofiler_start_context(new_ctx)
-  Tracing now active for HIP+HSA+RCCL.
+Controller reconfigures (change which APIs are emitted):
+  CMD_RECONFIGURE → bg thread updates g_runtime_filter atomically
+  Effect is immediate on next call (no SDK re-config needed).
 
 Controller detaches:
-  CMD_DEACTIVATE → rocprofiler_stop_context
-  Wrappers stay installed but Level 2 noop (~10-20 ns per call).
+  CMD_DEACTIVATE → bg thread calls rocprofiler_stop_context(ctx)
+  Hot path returns to ~10-20 ns (Level 2 noop).
 ```
 
-**Recommendation: control channel is the preferred attach mechanism going forward.**
-
-The control channel design provides full late configuration without any of ptrace's downsides:
+**Recommendation: control channel for activation/filtering, ptrace for adding domains.**
 
 | Use case | Recommended mechanism |
 |---|---|
-| App was launched with ROCP_TOOL_LIBRARIES, attach later with full config | **Control channel** |
-| Need to add/remove traced domains during a profiling session | **Control channel** (re-call `force_configure`) |
-| Fast on/off toggle without re-configuration | **Control channel** (`rocprofiler_start/stop_context`) |
-| App did NOT have ROCP_TOOL_LIBRARIES at launch | ptrace attach (only option) |
-| Container without `CAP_SYS_PTRACE` | **Control channel** (only option) |
-| ARM64 / non-x86_64 platforms | **Control channel** (only option — ptrace attach is x86-64) |
+| App launched with `ROCP_TOOL_LIBRARIES`, toggle tracing on/off | **Control channel** (~5 μs) |
+| Filter which pre-registered APIs are emitted | **Control channel** (runtime filter) |
+| Change output format/destination mid-run | **Control channel** |
+| App did NOT have `ROCP_TOOL_LIBRARIES` at launch | ptrace attach (only option) |
+| Need to add a domain not pre-registered (e.g., add OMPT after start) | ptrace attach (only option) |
+| Container without `CAP_SYS_PTRACE` | **Control channel** (only option, with all-domains pre-registered) |
+| ARM64 or other non-x86_64 platforms | **Control channel** (only option — ptrace attach is x86-64) |
 
 ### Cross-Platform Considerations
 
