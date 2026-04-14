@@ -1,22 +1,37 @@
-# memfd: Dispatch Tracer with Socket + Anonymous Shared Memory
+# memfd: Dispatch Tracer with Socket-Bootstrapped Anonymous Shared Memory
 
-## Overview
+> **This is a hybrid channel — not "just memfd."** A `memfd` is an *anonymous* file descriptor with no name; no other process can open it directly. The only no-sudo, no-filesystem way to hand it to the controller is via a Unix domain socket with `SCM_RIGHTS`. So this channel combines **two** mechanisms: a Unix abstract-namespace socket used *once* for authenticated fd handoff, and a sealed `memfd_create` region used for all subsequent control traffic.
+>
+> It is listed separately from the pure [SOCKET](SOCKET.md) channel because the post-bootstrap behavior is fundamentally different: after the one-time handshake, the controller writes commands directly into mmap'd memory (~50 ns cache-line transfer) instead of sending socket messages (~5 µs round-trip). The socket in this design is vestigial after connection setup — it exists solely to satisfy the "how does the controller learn about the memfd" rendezvous problem.
 
-This design combines the **Unix domain socket** (socket) for authentication and command/response with **`memfd_create`** for anonymous shared memory passed via `SCM_RIGHTS`. This gives us the best of both worlds:
+## Why combine them?
 
-- `SO_PEERCRED` for kernel-verified authentication (from socket)
-- mmap-speed command writes from controller (~50-100 ns cache-line transfer)
-- **Zero filesystem footprint** — no files in `/dev/shm/`, no files in `/run/`, no socket files. The abstract socket and memfd are both anonymous and vanish on process exit.
+| Constraint | Pure socket | Pure memfd | Socket + memfd (this doc) |
+|---|---|---|---|
+| No sudo / no ptrace | ✓ | ✗ — needs `pidfd_getfd` (`CAP_SYS_PTRACE`) | ✓ |
+| No filesystem footprint | ✓ (abstract) | ✓ (anonymous) | ✓ |
+| Kernel-verified peer auth | ✓ (`SO_PEERCRED`) | N/A (no rendezvous primitive) | ✓ (inherited from socket) |
+| Cache-line-speed command delivery | ✗ (per-command `sendmsg`/`recvmsg`) | ✓ (mmap store) | ✓ (mmap store after bootstrap) |
+| Shared-state integrity seal | N/A | ✓ (`F_SEAL_SHRINK \| F_SEAL_GROW`) | ✓ (inherited from memfd) |
 
-This is the **recommended option for production** (e.g., rocprofiler-sdk) as it has the strongest security guarantees with no cleanup burden.
+The socket is doing exactly one job: *hand an anonymous fd across a process boundary with authentication*. The memfd is doing exactly one job: *hold shared control state at mmap speed*. Neither can do the other's job without losing a key property, so both are present.
+
+## At a glance
+
+- Controller ↔ stub rendezvous: **abstract Unix socket** `\0rocprofiler_<pid>` (one `accept` per controller invocation).
+- Authentication: **`SO_PEERCRED`** — kernel-verified `uid == geteuid()` before handing over anything.
+- Shared-state fd: **`memfd_create(..., MFD_CLOEXEC | MFD_ALLOW_SEALING)`** sized to `sizeof(rocp_ctrl_t)`, passed to controller via `sendmsg(..., SCM_RIGHTS)`.
+- Post-handoff integrity: **`fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW)`** — size is frozen after the controller has its fd, so neither side can resize under the other.
+- Command delivery: controller writes `rocp_cmd_t` fields into its mmap of the memfd, bumps `ctrl->version`, and (optionally) `close()`s the socket. Stub polls `ctrl->version` at 1 ms intervals and dispatches.
+- Filesystem footprint: **zero.** Abstract socket lives in the kernel net namespace; memfd lives in anonymous memory. Both die with the process — no stale files on crash.
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — uses the **late-load design** described in [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path), and `rocprofiler-sdk` is `dlopen`'d at attach via `CMD_CONFIGURE`, which triggers `rocprofiler_force_configure()` to install wrappers for the controller-specified domains.
+> **Precise reading of "preloaded":** `LD_PRELOAD=librocp_stub_memfd.so` — only the stub. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL (auto-loaded); rocprofiler-sdk is neither preloaded nor linked and is only `dlopen`'d at attach. OMPT is handled via a silent `ompt_start_tool` in the stub. See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not) and [§ OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
 
-This channel combines a Unix domain socket (for `SO_PEERCRED` authentication + bootstrap) with a memfd containing the `rocp_ctrl_t` struct (same layout as mmap). The differences from mmap: the control struct lives in anonymous memory (no filesystem), authentication is via `SO_PEERCRED`, and the memfd is handed off via `SCM_RIGHTS` rather than discovered by filesystem path.
+Same late-load architecture as every channel in this design (see [MMAP.md](MMAP.md#what-changes-minimal--late-load-architecture) for the canonical description): the stub library is preloaded with no `rocprofiler_configure` symbol, so rocprofiler-register's startup scan finds no tool and never `dlopen`s the SDK — hot path stays at 0 ns. The controller later sends `CMD_CONFIGURE`; the stub `dlopen`s `libmock_sdk_tool_memfd.so` (which *does* export `rocprofiler_configure`), which calls `rocprofiler_force_configure()` to install wrappers for the controller-specified domains.
 
-The background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE`.
+The background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE` / `CMD_STATUS`.
 
 ## Architecture
 
@@ -105,7 +120,7 @@ The background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CM
 │    ctrl->config.enable_hip = 1; /* ...domains... */              │
 │    ctrl->command = CMD_CONFIGURE;                                │
 │    atomic_store(&ctrl->version, v+1, RELEASE);                   │
-│    /* bg thread dlopens SDK, force_configure, start_context */   │
+│    /* bg thread dlopens the tool library, force_configure, start_context */   │
 │                                                                  │
 │  Phase 4: Subsequent commands via mmap (~50-100 ns)              │
 │    ctrl->command = CMD_DEACTIVATE;                               │
@@ -121,7 +136,7 @@ Key: After the initial socket handshake + SCM_RIGHTS fd passing,
      needing a response.
 ```
 
-Uses the same **late-load design** as [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path); `rocprofiler-sdk` is `dlopen`'d on the first `CMD_CONFIGURE` and `rocprofiler_force_configure()` installs wrappers for the controller-specified domains. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#late-load-design-defer-rocprofiler-sdk-loading-until-attach) for the full mechanism explanation.
+Uses the same **late-load design** as [mmap](MMAP.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path); `rocprofiler-sdk` is `dlopen`'d on the first `CMD_CONFIGURE` and `rocprofiler_force_configure()` installs wrappers for the controller-specified domains. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#late-load-design-defer-rocprofiler-sdk-loading-until-attach) for the full mechanism explanation.
 
 ## Control Structure
 
@@ -134,7 +149,7 @@ Same as mmap — the `rocp_ctrl_t` struct carries commands, the controller's per
 /* See CONTROL_CHANNEL_SURVEY.md for the canonical enum. */
 enum rocp_ctrl_command {
     CMD_NONE        = 0,
-    CMD_CONFIGURE   = 1,  // First attach: dlopen SDK + force_configure
+    CMD_CONFIGURE   = 1,  // First attach: dlopen tool library (brings rocprofiler-sdk via link dep) + force_configure
     CMD_ACTIVATE    = 2,  // rocprofiler_start_context()
     CMD_DEACTIVATE  = 3,  // rocprofiler_stop_context()
     CMD_RECONFIGURE = 4,  // Update runtime filter without toggling context
@@ -155,7 +170,7 @@ typedef struct {
     uint32_t enable_kernel_dispatch : 1;
     uint32_t reserved         : 25;
 
-    uint32_t output_format;   // TEXT=0, JSON=1, OTLP=2, PERFETTO=3
+    uint32_t output_format;   // TEXT=0, JSON=1, PERFETTO=2
     uint32_t buffer_size_kb;
     char output_path[256];
     char filter_pattern[256];
@@ -253,7 +268,7 @@ static void setup_memfd_and_socket(void) {
 }
 ```
 
-### 2. Background Thread (socket bootstrap + memfd poll + dlopen SDK on first attach)
+### 2. Background Thread (socket bootstrap + memfd poll + dlopen the tool library on first attach)
 
 ```c
 /* On first CMD_CONFIGURE: dlopen rocprofiler-sdk-tool, force_configure.
@@ -339,7 +354,7 @@ static void* control_loop(void* arg) {
 
 ### 3. Tool Library (`librocprofiler-sdk-tool.so` — dlopen'd at first attach)
 
-Same as mmap. The tool exports `rocprofiler_configure`, and its `tool_initialize` calls the stub's `rocp_stub_get_state()` accessor to read the pending config and write the created `rocprofiler_context_id_t` back for the bg thread to toggle. See [mmap § Tool Library](OPTION_B_MMAP_FILE.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach) for the full `tool_initialize` body and the stub↔tool accessor contract — the only difference under memfd is that the control struct is backed by the memfd instead of a `/run/user/<uid>/` file.
+Same as mmap. The tool exports `rocprofiler_configure`, and its `tool_initialize` calls the stub's `rocp_stub_get_state()` accessor to read the pending config and write the created `rocprofiler_context_id_t` back for the bg thread to toggle. See [mmap § Tool Library](MMAP.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach) for the full `tool_initialize` body and the stub↔tool accessor contract — the only difference under memfd is that the control struct is backed by the memfd instead of a `/run/user/<uid>/` file.
 
 ### 4. Controller
 
@@ -465,21 +480,13 @@ The memfd carries only the `rocp_ctrl_t` command/status struct — no per-runtim
 
 **Advantage over socket**: Commands go through mmap (~50-100 ns) instead of socket send (~1-5 μs). The socket is reserved for status queries that need responses.
 
-### OpenMP Integration
-
-OMPT is registered at init time via `OMP_TOOL_LIBRARIES`. OMPT callbacks register a rocprofiler context with `ROCPROFILER_CALLBACK_TRACING_OMPT` domain. When the controller activates the context, `populate_contexts()` starts finding it — OMPT callbacks begin recording alongside HIP/HSA events. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full design.
-
-### OpenTelemetry Export
-
-The output format can be extended with `OUTPUT_OTLP` to export trace events as OpenTelemetry spans via OTLP. This is configured at init time via the tool library, not through the control channel.
-
 ## File Layout
 
 ```
 src/tools/rocprofiler_tool_memfd/
 ├── rocp_memfd.h             # Shared structs (rocp_ctrl_t, rocp_config_t, rocp_stub_state_t), constants
 ├── rocp_stub_memfd.c        # Stub library (preloaded via LD_PRELOAD, no rocprofiler_configure,
-│                            #   creates memfd + abstract socket, spawns bg thread, dlopens SDK on CMD_CONFIGURE)
+│                            #   creates memfd + abstract socket, spawns bg thread, dlopens the tool library on CMD_CONFIGURE)
 ├── rocp_memfd_tool.c        # SDK tool library (dlopen'd at attach, exports rocprofiler_configure)
 ├── rocp_memfd_fdpass.c      # SCM_RIGHTS helper functions (shared by stub + controller)
 └── rocp_memfd_controller.c  # CLI controller tool

@@ -1,7 +1,7 @@
 /*
  * tool_memfd.c - libmock_sdk_tool_memfd.so
  *
- * Option F+memfd tool library. dlopen'd by the stub on the first
+ * memfd channel tool library. dlopen'd by the stub on the first
  * CMD_CONFIGURE. Exports rocprofiler_configure so the mock SDK's
  * rocprofiler_force_configure() can drive tool_initialize().
  *

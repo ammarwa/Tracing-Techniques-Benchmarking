@@ -1,7 +1,7 @@
 /*
  * ctrl_signal.c - rocp_ctrl_signal
  *
- * Same as Option B's controller, but after writing the command + bumping
+ * Same as the mmap channel's controller, but after writing the command + bumping
  * the version counter it sends SIGRTMIN+7 to the target via sigqueue()
  * so the stub's background thread is woken instantly instead of waiting
  * on a poll() timeout.

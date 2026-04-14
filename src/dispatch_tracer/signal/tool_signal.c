@@ -1,7 +1,7 @@
 /*
  * tool_signal.c - libmock_sdk_tool_signal.so
  *
- * Identical in behavior to Option B's tool_mmap.c. The signal in Option
+ * Identical in behavior to the mmap channel's tool_mmap.c. The signal in Option
  * Signal is just a wake mechanism used by the stub — the tool library
  * itself is oblivious to how the stub got woken up. It still:
  *   - exports rocprofiler_configure

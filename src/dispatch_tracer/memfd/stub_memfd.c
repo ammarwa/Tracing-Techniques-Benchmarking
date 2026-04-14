@@ -1,7 +1,7 @@
 /*
  * stub_memfd.c - librocp_stub_memfd.so
  *
- * Option F+memfd stub library. Preloaded via LD_PRELOAD. Does NOT export
+ * memfd channel stub library. Preloaded via LD_PRELOAD. Does NOT export
  * rocprofiler_configure — so mock_register's symbol scan finds no tool
  * and leaves libmylib_dispatch's api_table untouched (0 ns hot-path).
  *

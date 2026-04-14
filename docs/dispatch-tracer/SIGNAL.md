@@ -6,9 +6,11 @@ This design uses a **real-time signal** (`SIGRTMIN+n`) as an instant notificatio
 
 This is not a standalone channel — it's an **enhancement** layered on top of mmap (file) or memfd (socket + anonymous shm) to add instant, zero-CPU-cost notification for configuration changes.
 
+> **Precise reading of "preloaded":** `LD_PRELOAD=librocp_stub_signal.so` — only the stub. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL (auto-loaded); rocprofiler-sdk is neither preloaded nor linked and is only `dlopen`'d at attach. OMPT is handled via a silent `ompt_start_tool` in the stub. See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not) and [§ OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
+
 ## Why Signals?
 
-Under the late-load architecture (see [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture)), **before any controller attaches, no wrappers exist** — rocprofiler-sdk is not loaded, the dispatch tables still point at original function pointers, and the hot path cost is **0 ns**. There is no `populate_contexts()` check happening per call yet, because the SDK has not been configured.
+Under the late-load architecture (see [mmap](MMAP.md#what-changes-minimal--late-load-architecture)), **before any controller attaches, no wrappers exist** — rocprofiler-sdk is not loaded, the dispatch tables still point at original function pointers, and the hot path cost is **0 ns**. There is no `populate_contexts()` check happening per call yet, because the SDK has not been configured.
 
 Signals become valuable precisely because of this architecture: the first attach (`CMD_CONFIGURE`) triggers heavy one-shot work — `dlopen("librocprofiler-sdk-tool.so")`, symbol resolution, `rocprofiler_force_configure()`, runtime API-table re-propagation, and `update_table()` wrapper installation. This work typically takes **~5-50 ms** and must happen off the hot path on a background thread. A sleeping `poll()`-based background thread costs 0 CPU; a real-time signal wakes it within ~1-5 μs of the controller's `sigqueue()`, so attach latency is dominated by the unavoidable dlopen work, not by polling interval.
 
@@ -97,7 +99,7 @@ Signals are also valuable for:
 │  sigqueue(target_pid, SIGRTMIN + 7, val);                       │
 │                                                                  │
 │  // The stub's bg thread wakes within ~1-5 μs;                 │
-│  // on CMD_CONFIGURE it dlopens SDK + force_configure.          │
+│  // on CMD_CONFIGURE it dlopens the tool library and calls force_configure.          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,9 +171,9 @@ Phase 3 (queries): Controller uses socket for CMD_STATUS, CMD_FLUSH
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — uses the **late-load design** in [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): stub preloaded (no `rocprofiler_configure` symbol, 0 ns hot path), SDK `dlopen`'d at attach via `rocprofiler_force_configure()`.
+Same as all options — uses the **late-load design** in [mmap](MMAP.md#what-changes-minimal--late-load-architecture): stub preloaded (no `rocprofiler_configure` symbol, 0 ns hot path), SDK `dlopen`'d at attach via `rocprofiler_force_configure()`.
 
-The signal serves as an instant wake mechanism for the stub's background thread. When woken, the thread reads the paired data channel (mmap or memfd) and dispatches: `CMD_CONFIGURE` → dlopen SDK + force_configure (first attach only), `CMD_ACTIVATE` → `rocprofiler_start_context()`, `CMD_DEACTIVATE` → `rocprofiler_stop_context()`, `CMD_RECONFIGURE` → atomic update of the runtime filter. The signal handler itself only writes a wake byte to a pipe — all SDK/dlopen work happens in the background thread.
+The signal serves as an instant wake mechanism for the stub's background thread. When woken, the thread reads the paired data channel (mmap or memfd) and dispatches: `CMD_CONFIGURE` → dlopen tool library (brings rocprofiler-sdk via link dep) + force_configure (first attach only), `CMD_ACTIVATE` → `rocprofiler_start_context()`, `CMD_DEACTIVATE` → `rocprofiler_stop_context()`, `CMD_RECONFIGURE` → atomic update of the runtime filter. The signal handler itself only writes a wake byte to a pipe — all SDK/dlopen work happens in the background thread.
 
 ## Control Structure
 
@@ -180,7 +182,7 @@ The control struct, command enum, and `rocp_config_t` layout are identical to mm
 ```c
 enum rocp_ctrl_command {
     CMD_NONE        = 0,   // No pending command
-    CMD_CONFIGURE   = 1,   // First attach: dlopen SDK + force_configure,
+    CMD_CONFIGURE   = 1,   // First attach: dlopen tool library (brings rocprofiler-sdk via link dep) + force_configure,
                            //   OR later: update runtime filter
     CMD_ACTIVATE    = 2,   // rocprofiler_start_context()
     CMD_DEACTIVATE  = 3,   // rocprofiler_stop_context()
@@ -189,7 +191,7 @@ enum rocp_ctrl_command {
 };
 ```
 
-See mmap's [Control Structure section](OPTION_B_MMAP_FILE.md#control-structure) for the full `rocp_ctrl_t` layout and field semantics.
+See mmap's [Control Structure section](MMAP.md#control-structure) for the full `rocp_ctrl_t` layout and field semantics.
 
 ## Components
 
@@ -259,7 +261,7 @@ static void stub_init(void) {
 }
 ```
 
-### 2. Background Thread (signal-woken dispatcher, dlopens SDK on first CMD_CONFIGURE)
+### 2. Background Thread (signal-woken dispatcher, dlopens the tool library on first CMD_CONFIGURE)
 
 The bg thread mirrors mmap's `control_poll_loop` — same command dispatch, same `load_sdk_and_configure()` sequence — but blocks on `poll(wakeup_pipe)` instead of busy-polling a version counter. The signal wakes it within ~1-5 μs.
 
@@ -358,7 +360,7 @@ static void* control_poll_loop(void* arg) {
 
 ### 3. Tool Library (`librocprofiler-sdk-tool.so` — dlopen'd at attach)
 
-Identical to [mmap's tool library](OPTION_B_MMAP_FILE.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach): exports `rocprofiler_configure`, its `tool_initialize` calls `rocp_stub_get_state()` to retrieve the pending config, registers the controller-selected domains, and calls `rocprofiler_start_context()`.
+Identical to [mmap's tool library](MMAP.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach): exports `rocprofiler_configure`, its `tool_initialize` calls `rocp_stub_get_state()` to retrieve the pending config, registers the controller-selected domains, and calls `rocprofiler_start_context()`.
 
 ### 4. Controller
 
@@ -393,7 +395,7 @@ if (ret < 0) {
 | **Hot-path before any attach** | **0 ns** | rocprofiler-sdk not loaded, no wrappers installed, original function pointers in dispatch tables |
 | Signal handler execution | ~0.5-2 μs | Handler writes 1 byte to wakeup pipe (async-signal-safe only) |
 | Background thread wakeup | ~1-3 μs | `poll()` returns + drain pipe |
-| Controller attach + first CMD_CONFIGURE | ~5-50 ms | dlopen rocprofiler-sdk + force_configure + propagation + update_table. Runs on bg thread, NOT in signal handler. |
+| Controller attach + first CMD_CONFIGURE | ~5-50 ms | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table. Runs on bg thread, NOT in signal handler. |
 | **Hot-path (active, callback emits)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
 | **Hot-path (active, runtime filter rejects)** | **~30-50 ns** | `populate_contexts()` + callback fires + atomic load of filter mask + return |
 | Reconfigure (CMD_RECONFIGURE) | ~1 μs + signal wake | Atomic stores to runtime filter — effect immediate on next event |

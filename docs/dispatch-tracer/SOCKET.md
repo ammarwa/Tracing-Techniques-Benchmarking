@@ -8,7 +8,9 @@ This option provides the **strongest authentication model** of all options: the 
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — uses the **late-load design** described in [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture):
+> **Precise reading of "preloaded":** `LD_PRELOAD=librocp_stub_sock.so` — only the stub. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL (auto-loaded); rocprofiler-sdk is neither preloaded nor linked and is only `dlopen`'d at attach. OMPT is handled via a silent `ompt_start_tool` in the stub. See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not) and [§ OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
+
+Same as all options — uses the **late-load design** described in [mmap](MMAP.md#what-changes-minimal--late-load-architecture):
 
 - A small **stub library** is preloaded (via `LD_PRELOAD`) that does NOT export `rocprofiler_configure`, so rocprofiler-register doesn't load rocprofiler-sdk → 0 ns hot path before any attach
 - On `CMD_CONFIGURE`, the stub `dlopen`s the tool library and calls `rocprofiler_force_configure()` (succeeds because SDK `init_status` is still 0)
@@ -62,7 +64,7 @@ The **only difference from mmap** is the IPC mechanism: a Unix domain socket whe
 │  │      switch (cmd.type):                                 │ │
 │  │        CMD_CONFIGURE:                                   │ │
 │  │          if (!sdk_loaded):                              │ │
-│  │            stash config, dlopen SDK tool,               │ │
+│  │            stash config, dlopen tool library,               │ │
 │  │            rocprofiler_force_configure(tool_configure)  │ │
 │  │          else: apply_runtime_filter(cfg)                │ │
 │  │          send {OK, ctx_id, ...}                         │ │
@@ -108,7 +110,7 @@ see [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#late-load-design-defer
 
 ```
 CMD_NONE        = 0   // No pending command / reserved
-CMD_CONFIGURE   = 1   // First attach: dlopen SDK + force_configure with config
+CMD_CONFIGURE   = 1   // First attach: dlopen tool library (brings rocprofiler-sdk via link dep) + force_configure with config
 CMD_ACTIVATE    = 2   // rocprofiler_start_context() (after configure)
 CMD_DEACTIVATE  = 3   // rocprofiler_stop_context() (wrappers stay, Level 2 noop)
 CMD_RECONFIGURE = 4   // Update runtime filter (domains-to-emit, output) without re-arming
@@ -247,7 +249,7 @@ static void setup_socket_control(void) {
 }
 ```
 
-### 2. Background Thread (accepts connections, dlopens SDK on CMD_CONFIGURE)
+### 2. Background Thread (accepts connections, dlopens the tool library on CMD_CONFIGURE)
 
 ```c
 /* On first CMD_CONFIGURE: dlopen rocprofiler-sdk-tool, call force_configure.
@@ -315,7 +317,7 @@ static void* control_loop(void* arg) {
                 if (__atomic_compare_exchange_n(&sdk_loaded, &expected, true,
                                                 false, __ATOMIC_ACQ_REL,
                                                 __ATOMIC_ACQUIRE)) {
-                    /* First attach: stash config and dlopen SDK tool.
+                    /* First attach: stash config and dlopen the tool library.
                      * tool_initialize will read g_pending_config. */
                     memcpy(&g_pending_config, &cmd.config,
                            sizeof(g_pending_config));
@@ -561,7 +563,7 @@ static void tool_finalize(void* tool_data) {
 | Controller connect | ~3-5 μs | `socket` + `connect` |
 | SO_PEERCRED check | ~1 μs | `getsockopt` |
 | Command send/recv | ~1-5 μs | Per command (kernel copies data between socket buffers) |
-| Controller attach + first CMD_CONFIGURE | ~5-50 ms | dlopen rocprofiler-sdk + force_configure + propagation + update_table for all registered runtime API tables |
+| Controller attach + first CMD_CONFIGURE | ~5-50 ms | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table for all registered runtime API tables |
 | **Hot-path (active, callback emits)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
 | **Hot-path (active, runtime filter rejects)** | **~30-50 ns** | `populate_contexts()` + callback fires + atomic load of filter mask + return |
 | Reconfigure (change runtime filter) | ~5 μs | Socket round-trip + atomic stores to `g_runtime_filter` |
@@ -584,10 +586,6 @@ Tool → Controller:  {active: true, events_traced: 42000, ...}
 ### Bidirectional Queries
 
 Unlike mmap (shared memory status fields), the socket naturally supports rich queries with structured responses. This is useful for `rocprofv3`-style tools that want to display what's being traced and how many events have been collected.
-
-### OpenMP Integration
-
-OMPT is registered at init time via `OMP_TOOL_LIBRARIES`. OMPT callbacks register a rocprofiler context with `ROCPROFILER_CALLBACK_TRACING_OMPT` domain. When the controller sends `CMD_ACTIVATE`, `rocprofiler_start_context()` activates the context and `populate_contexts()` starts finding it — OMPT callbacks begin recording alongside HIP/HSA events. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#openmp-ompt-always-enabled-shim-with-noop-control) for the full design.
 
 ## File Layout
 
@@ -637,7 +635,7 @@ LD_PRELOAD=build/lib/librocp_stub_sock.so \
 LD_PRELOAD=build/lib/librocp_stub_sock.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
-# Terminal 2 — first attach: stub dlopens SDK, force_configure runs,
+# Terminal 2 — first attach: stub dlopens the tool library (SDK arrives as its link dependency), force_configure runs,
 # wrappers installed only for the requested domains:
 build/bin/rocp_ctrl_sock --pid $! configure --hip --hsa --output json --out trace.json
 # ... tracing now active ...

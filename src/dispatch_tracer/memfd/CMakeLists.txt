@@ -1,8 +1,8 @@
 # ============================================================================
-# Option F+memfd — Unix socket (abstract) + memfd_create + SCM_RIGHTS
+# memfd channel — abstract Unix socket + memfd_create + SCM_RIGHTS hybrid
 # ============================================================================
 
-message("${Green}[dispatch_tracer/option_f_memfd] Building stub + tool + controller${ColorReset}")
+message("${Green}[dispatch_tracer/memfd] Building stub + tool + controller${ColorReset}")
 
 # ----- librocp_stub_memfd.so ------------------------------------------------
 # Preloaded via LD_PRELOAD. Does NOT export rocprofiler_configure.

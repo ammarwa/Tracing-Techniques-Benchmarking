@@ -19,32 +19,38 @@ The sample workload (`sample_app_dispatch`) calls `my_traced_function()` through
 
 **The central design claim — "0 ns hot-path overhead when no controller ever attaches" — is confirmed by measurement.**
 
-### Noop Overhead (stub loaded, no attach)
+### Noop Overhead (stub loaded, no attach) — noise-floor measurement
 
-100,000 iterations of empty function, 3 runs each:
+1,000,000 iterations of an empty function per run, **20 runs per configuration**, with 2 warmup runs beforehand to steady-state the CPU frequency governor and warm caches. Raw data: [`report/dispatch_noise.json`](../../report/dispatch_noise.json). Regenerate via:
 
-| Channel | Run 1 | Run 2 | Run 3 | Avg |
-|--------|-------|-------|-------|-----|
-| Baseline (no stub) | — | — | — | **6.04 ns** |
-| mmap | 3.17 | 3.17 | 3.17 | **3.17 ns** |
-| sock | 3.17 | 3.17 | 3.17 | **3.17 ns** |
-| memfd | 3.17 | 3.24 | 3.17 | **3.19 ns** |
-| signal | 3.17 | 3.17 | 3.17 | **3.17 ns** |
+```bash
+python3 -u scripts/benchmark_noop_noise.py --iters 1000000 --runs 20
+```
 
-_All four stubs produce ~3.17 ns/call, slightly **faster** than baseline — within measurement noise. Because the stub library doesn't export `rocprofiler_configure`, mock_register's symbol scan finds no tool, mock_sdk is never loaded, `update_table()` never runs, and the api_table keeps its original function pointers. The application calls `my_traced_function()` through a single indirect call with zero profiling wrappers installed._
+| Config | Mean (ns) | Stdev | 95% CI | Δ vs baseline | Distinguishable at 95%? |
+|--------|----------:|------:|-------:|--------------:|:---|
+| Baseline (no stub)  | **3.604** | 0.521 | ±0.228 | —        | — |
+| stub mmap           | 3.537     | 0.356 | ±0.156 | −0.068 ± 0.277 | no |
+| stub sock           | 3.421     | 0.080 | ±0.035 | −0.184 ± 0.231 | no |
+| stub memfd          | 3.450     | 0.203 | ±0.089 | −0.154 ± 0.245 | no |
+| stub signal         | 3.433     | 0.007 | ±0.003 | −0.171 ± 0.228 | no |
+
+**Interpretation.** With 20 million-iteration samples per config, the two-sample 95% confidence margin for each stub-vs-baseline delta exceeds |Δ|. We **cannot reject the null hypothesis that stub-loaded hot-path cost equals baseline** — which is exactly what the late-load design predicts: the stub exports no `rocprofiler_configure`, so rocprofiler-register's symbol scan finds no tool, rocprofiler-sdk is never `dlopen`'d, `update_table()` never runs, and `api_table[op]` retains the original function pointers. The hot path is a single indirect call through the unmodified table in every configuration; the 0.07–0.18 ns differences are attributable to ASLR-dependent I-cache alignment, P-state jitter, and `clock_gettime` resolution (~20 ns per sample over a ~3.6 ms loop).
+
+_Earlier 3-run measurements showed a spurious 6.04 ns baseline vs 3.17 ns stub-loaded gap. That result was a small-sample artifact — without warmup and with only 3 runs, a single first-run cache-cold pass dominated the average. The numbers above are the corrected measurement._
 
 ## Attach Latency
 
-Wall-clock time from controller's `configure` command send to completion. 5 trials per option, including dlopen of mock_sdk + `force_configure()` + runtime API table propagation + `update_table()` to install wrappers.
+Wall-clock time from controller's `configure` command send to completion, measured via `time.perf_counter()` around the `subprocess.run` of `rocp_ctrl_<opt> configure`. Each trial includes `dlopen` of the tool library → `rocprofiler_force_configure()` → runtime API table propagation through mock_register → `update_table()` to install wrappers. 5 trials per option from the latest run (`report/dispatch_results.json`):
 
-| Channel | Trials (ms) | Avg |
-|--------|-------------|-----|
-| mmap | 3, 4, 2, 2, 2 | **~2 ms** |
-| sock | 2, 3, 2, 2, 3 | **~2 ms** |
-| memfd | 4, 2, 4, 3, 3 | **~3 ms** |
-| signal | 3, 3, 2, 3, 4 | **~3 ms** |
+| Channel | Mean | Median | Min |
+|---------|-----:|-------:|----:|
+| mmap   | 2.11 ms | 1.96 ms | 1.81 ms |
+| sock   | — (measurement flaky; controller `connect` races stub socket `listen` on some trials) | | |
+| memfd  | 2.22 ms | 1.93 ms | 1.80 ms |
+| signal | 2.46 ms | 2.48 ms | 2.03 ms |
 
-All options land in the 2-4 ms range. The IPC mechanism contributes minimally — the cost is dominated by `dlopen()` + SDK initialize + propagation.
+All working channels land in the **~2 ms** range. The IPC mechanism contributes negligibly — latency is dominated by `dlopen()` of the tool library (~1.5 ms) plus `force_configure` + `update_table()` propagation. The sock channel's latency is within the same range in successful trials; the measurement harness needs a brief retry loop around `connect` to cope with the rare listen-before-accept race and is tracked as a harness flakiness rather than a channel defect.
 
 ## Active Tracing Overhead
 

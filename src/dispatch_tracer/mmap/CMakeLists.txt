@@ -1,8 +1,8 @@
 # ============================================================================
-# Option B: mmap regular-file control channel
+# mmap regular-file control channel
 # ============================================================================
 
-message("${Green}[dispatch_tracer/option_b_mmap] Building Option B components${ColorReset}")
+message("${Green}[dispatch_tracer/mmap] Building mmap channel components${ColorReset}")
 
 # ----- librocp_stub_mmap.so -----------------------------------------------
 # LD_PRELOAD'd stub. Does NOT export rocprofiler_configure. Uses dlopen

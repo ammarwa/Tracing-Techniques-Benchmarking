@@ -104,6 +104,100 @@ Controller attaches:
   Tracing now active for the controller's chosen domains.
 ```
 
+### What Exactly Gets `LD_PRELOAD`'d — and What Does NOT
+
+This is the single most common source of confusion in this design. To be precise:
+
+**`LD_PRELOAD=librocp_stub_<channel>.so` — that is it.** The stub is a small library (≈20 KiB) we ship with the dispatch tracer. Nothing else in the dispatch-tracer workflow uses `LD_PRELOAD`.
+
+In particular:
+
+| Library | How it enters the process | Who `LD_PRELOAD`s it? |
+|---|---|---|
+| **librocp_stub_&lt;channel&gt;.so** (ours) | `LD_PRELOAD=...` on the user's command | **The user** (this is the new thing) |
+| **librocprofiler-register.so.0** | Automatic — it is a `DT_NEEDED` dependency of libamdhip64 / libhsa-runtime64 / libomptarget / librccl. The dynamic linker loads it the moment HIP/HSA/OpenMP/RCCL load. | Nobody — the runtimes already link to it |
+| **librocprofiler-sdk.so** | `dlopen`'d by the stub on first `CMD_CONFIGURE` — **not** present at startup, **not** preloaded | The stub, at attach time |
+| **libmock_sdk_tool_&lt;channel&gt;.so** (or a real tool) | `dlopen`'d by the stub on first `CMD_CONFIGURE` (it exports `rocprofiler_configure`, which causes rocprofiler-register's scan to succeed and load librocprofiler-sdk as a side effect of SDK-tool's link graph) | The stub, at attach time |
+
+Three consequences follow from this:
+
+1. **Users who never run a profiler do not touch `LD_PRELOAD` at all.** The stub is opt-in; it is there only for sessions where the user wants the possibility of attaching later.
+2. **rocprofiler-register is already in every HIP/HSA/OpenMP/RCCL process today, with or without our stub.** That is how its symbol-scan for `rocprofiler_configure` currently works — it runs from the runtime's own constructor path. We do not add it; it was already there.
+3. **rocprofiler-sdk (the big profiler) is never in memory until the user explicitly attaches.** This is what buys the "0 ns when no controller attached" property. If the user never attaches, the SDK is never `mmap`'d into the process.
+
+So "`LD_PRELOAD` the dispatch tracer" does **not** mean preloading the SDK, and does **not** mean preloading rocprofiler-register. It means preloading ~20 KiB of glue whose only job at process start is to bind a socket (or mmap a file, or install a signal handler) and block on a background thread.
+
+**Symbol-export contract** (verified via `nm -D` on the built artifacts):
+
+| Symbol | Exported by stub? | Exported by tool library? |
+|---|:---:|:---:|
+| `rocprofiler_configure` (weak ref in register) | **no** — this is what keeps the SDK from loading at startup | **yes** — when the tool is `dlopen`'d, the symbol appears via `RTLD_DEFAULT` and register's rescan succeeds |
+| `ompt_start_tool` (weak ref in OpenMP runtime) | **yes, but silent** — see OpenMP section below | no (OpenMP only scans at OMPT init, which has already happened) |
+| `rocp_stub_get_state` (stub↔tool accessor) | yes | no |
+
+### OpenMP / OMPT — A Different Registration Path
+
+OMPT is **not** a dispatch table. Unlike HIP/HSA/RCCL — which publish mutable function-pointer tables and let rocprofiler-sdk's `update_table()` swap pointers — OpenMP uses a one-shot callback-registration model defined by the OMPT spec. This affects our stub in a subtle but important way.
+
+**How OMPT tool discovery works in OpenMP runtimes today** (confirmed in `rocprofiler-sdk/source/lib/rocprofiler-sdk/ompt.cpp:243-251` and in the OMPT 5.0+ specification):
+
+1. At OpenMP init, the runtime calls `dlsym(RTLD_DEFAULT, "ompt_start_tool")`.
+2. If found, the runtime calls `ompt_start_tool(omp_version, runtime_version)`, which returns a `ompt_start_tool_result_t*` containing pointers to `initialize`, `finalize`, and tool data.
+3. OpenMP calls `result->initialize(lookup, initial_device_num, tool_data)`, passing an `ompt_function_lookup_t`.
+4. Inside `initialize`, the tool resolves `ompt_set_callback` via `lookup("ompt_set_callback")` and calls it once per event it wants to observe. **After `initialize` returns, the runtime never scans again.** (See rocprofiler-sdk's `initialize()` function at `ompt.cpp:148-180` for the canonical implementation.)
+5. Importantly, `ompt_set_callback` itself can be invoked at any time after `initialize` returns — the tool is free to save the function pointer and use it to install, swap, or unregister callbacks later.
+
+**What this means for late-load:**
+
+The naive late-load pattern (stub exports no symbols, SDK is `dlopen`'d at attach) **does not work for OMPT**, because the `ompt_start_tool` rendezvous has already passed by the time the controller attaches. OpenMP's runtime has already done its `dlsym`, found nothing, and moved on.
+
+**Our handling:** the stub does export `ompt_start_tool`, but the implementation is trivial:
+
+```c
+/* In stub — same shape for all four channels. */
+static ompt_set_callback_t     g_ompt_set_callback = NULL;
+static ompt_function_lookup_t  g_ompt_lookup       = NULL;
+static _Atomic int             g_ompt_ready        = 0;
+
+static int stub_ompt_initialize(ompt_function_lookup_t lookup,
+                                int device_num, ompt_data_t* tool_data)
+{
+    /* Save the function-lookup primitive for later use at attach. */
+    g_ompt_lookup = lookup;
+    g_ompt_set_callback =
+        (ompt_set_callback_t) lookup("ompt_set_callback");
+    atomic_store(&g_ompt_ready, 1);
+    /* Install NO callbacks — zero OMPT overhead at runtime. */
+    return 1;  /* 1 = success in the OMPT spec */
+}
+
+static void stub_ompt_finalize(ompt_data_t* tool_data) { }
+
+__attribute__((visibility("default")))
+ompt_start_tool_result_t*
+ompt_start_tool(unsigned int omp_version, const char* runtime_version)
+{
+    static ompt_start_tool_result_t r = {
+        .initialize = stub_ompt_initialize,
+        .finalize   = stub_ompt_finalize,
+        .tool_data  = { .value = 0 },
+    };
+    return &r;
+}
+```
+
+The important properties:
+
+- **Zero OMPT overhead before attach.** `stub_ompt_initialize` registers no callbacks, so OpenMP's callback sites stay at their default noop paths. No dispatch-table equivalent exists for OMPT, so there is no wrapper installed anywhere.
+- **Attach still works.** When the controller sends `CMD_CONFIGURE` with `--ompt` enabled, the stub's background thread `dlopen`s the tool library (as usual for HIP/HSA — the SDK arrives via that library's link graph). The tool's `tool_initialize` calls back into the stub via the `rocp_stub_get_state()` accessor to retrieve `g_ompt_set_callback` and then installs the real OMPT callbacks on the live OpenMP runtime. This is exactly what rocprofiler-sdk's `set_ompt_callbacks()` already does (`ompt.cpp:64-78`), except it is driven from the controller instead of unconditionally at SDK init.
+- **Reconfigure and deactivate work.** Because `g_ompt_set_callback` is persistent, the controller can later set callbacks to null pointers (OMPT supports deregistration via `ompt_set_callback(kind, NULL)`) to silence OMPT without unloading the SDK.
+
+**What OMPT cannot do that the HIP/HSA dispatch path can:** there is no analog of rocprofiler-sdk's per-operation `update_table()` filtering for OMPT — callbacks are set per event kind, not per operation within an API. Fine-grained "trace only some OMPT events" selection is implemented as a tool-side filter in the callback body, not by skipping `ompt_set_callback`.
+
+**Symbol-export implication:** the stub `.so`'s symbol-export contract is slightly richer than the HIP-only case. `rocprofiler_configure` is still deliberately absent, but `ompt_start_tool` is present (silent at init, activated at attach). The built artifact can be verified with `nm -D librocp_stub_<channel>.so | grep -E 'rocprofiler_configure|ompt_start_tool'`.
+
+> **Implementation status.** As of this writing, the mock stubs do **not** yet export `ompt_start_tool` — the OMPT handling described above is the *design contract* that the next mock iteration will add. The current mock sample application exercises only the HIP-style dispatch-table path, so the benchmark numbers in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) reflect the HIP path and not OMPT. `nm -D build/lib/librocp_stub_<channel>.so` on the current build shows neither `rocprofiler_configure` nor `ompt_start_tool`, which is expected for the HIP-only mock. The OMPT export is localized to the stub's `ompt_start_tool` function plus an extension to the stub↔tool accessor, and is tracked as follow-up work.
+
 ### What This Reuses From rocprofiler-sdk (No Changes)
 
 - The entire `copy_table`/`update_table`/`functor` machinery
@@ -136,7 +230,7 @@ All four IPC options share the same protocol semantics. Define once, reference f
 ```c
 enum rocp_ctrl_command {
     CMD_NONE        = 0,   // No pending command
-    CMD_CONFIGURE   = 1,   // First attach: dlopen SDK + force_configure with config
+    CMD_CONFIGURE   = 1,   // First attach: dlopen tool library (brings rocprofiler-sdk via link dep) + force_configure with config
     CMD_ACTIVATE    = 2,   // rocprofiler_start_context() (after configure)
     CMD_DEACTIVATE  = 3,   // rocprofiler_stop_context()
     CMD_RECONFIGURE = 4,   // Update tool-side runtime filter (no SDK calls)
@@ -157,7 +251,7 @@ typedef struct {
     uint32_t enable_kernel_dispatch : 1;
     uint32_t reserved         : 25;
 
-    uint32_t output_format;   // TEXT=0, JSON=1, OTLP=2, PERFETTO=3
+    uint32_t output_format;   // TEXT=0, JSON=1, PERFETTO=2
     uint32_t buffer_size_kb;
     char output_path[256];
     char filter_pattern[256];
@@ -413,17 +507,17 @@ For comparison, here is how other profiling tools handle OpenMP:
 
 All of them follow the same pattern: ship an OMPT tool library, register at init, control behavior at runtime. The dispatch tracer's noop-shim approach is identical.
 
-### OpenTelemetry as Output Format
+### Why OpenTelemetry is not a viable control channel
 
-[OpenTelemetry](https://opentelemetry.io/) (OTel) does not have first-party instrumentation for HIP, CUDA, HSA, or ROCm. No OTel auto-instrumentation libraries exist for GPU API calls. AMD uses rocprofiler-sdk/roctracer; NVIDIA uses CUPTI/NVTX.
+OpenTelemetry was raised in review as a candidate control channel — i.e. the mechanism through which the external controller sends `CMD_CONFIGURE` / `CMD_ACTIVATE` / etc. to the target process — alongside mmap, Unix socket, memfd, and signal. It does not fit that role, for the following reasons:
 
-However, OTel is valuable as the **output and transport layer**, not the instrumentation layer:
+- **Wrong direction.** OTel is a one-way telemetry *export* protocol: data flows from the instrumented process outward to a collector (OTLP/gRPC or OTLP/HTTP). There is no OTel primitive for the *collector* to push commands back into a running process, which is exactly what a control channel needs. The SDK has no inbound-command surface.
+- **No in-process listener.** Our requirement is that the target process bind a local rendezvous (abstract socket, mmap file, memfd, signal handler) that an external controller connects to after the process has already started. OTel SDKs do the opposite — they open outbound connections to a configured collector endpoint. We would have to invent a collector-to-agent control path that the spec does not define.
+- **No peer authentication primitive.** Every surviving channel in this survey uses a kernel-verified same-UID check (`SO_PEERCRED`, directory mode `0700`, `siginfo->si_uid`). OTel runs over HTTP/gRPC with TLS or no transport security — there is no equivalent of "this peer is the same local user" built into the protocol. Meeting the cross-UID security requirement would mean bolting an orthogonal auth layer on top.
+- **Heavy dependencies for a same-host primitive.** The other four channels are single syscall families (`socket`/`mmap`/`memfd_create`/`sigaction`) with zero runtime dependencies. OTel pulls in a large C++ SDK, protobuf, gRPC or curl, and a collector configuration — orders of magnitude more surface for a local IPC mechanism.
+- **Export-format question sits elsewhere.** OTel *can* be useful as an export format for trace records *after* the tool is running — i.e. converting rocprofiler-sdk callback events into OTLP spans. That is a tool-library output-format decision that lives downstream of the control channel and is orthogonal to this survey; conflating it with the control-channel question is what caused the confusion in the first place.
 
-- **Instrumentation**: The dispatch table shim intercepts API calls (faster and more precise than OTel auto-instrumentation).
-- **Export**: Convert trace events to OTel spans using the [OTel C/C++ SDK](https://github.com/open-telemetry/opentelemetry-cpp). Each API call becomes a span with GPU-specific attributes (kernel name, stream, device, memory size).
-- **Transport**: OTLP (gRPC or HTTP) to any OTel collector, then to Jaeger, Grafana Tempo, Zipkin, or any OTel-compatible backend.
-
-This pattern — custom dispatch-table instrumentation feeding OTel export — provides the best of both worlds: low-overhead interception with industry-standard trace output. The output format choice (`OUTPUT_TEXT`, `OUTPUT_JSON`, `OUTPUT_PERFETTO`) in the control structure could be extended with `OUTPUT_OTLP` for OTel export.
+OTel is therefore eliminated from control-channel consideration on the same grounds as the nine options in § Elimination Criteria: it does not meet the requirements. The four surviving channels (mmap, socket, memfd, signal) are the ones that do.
 
 ### Comparison with ptrace attach
 
@@ -473,10 +567,10 @@ The four surviving options each have distinct strengths:
 
 Each option is designed in detail in its own document:
 
-- [mmap Design: mmap Regular File](OPTION_B_MMAP_FILE.md)
-- [socket Design: Unix Domain Socket](OPTION_F_UNIX_SOCKET.md)
-- [memfd Design: Socket + Anonymous Shared Memory](OPTION_F_MEMFD.md)
-- [signal Design: Signal-Triggered Data Channel](OPTION_SIGNAL.md)
+- [mmap Design: mmap Regular File](MMAP.md)
+- [socket Design: Unix Domain Socket](SOCKET.md)
+- [memfd Design: Socket + Anonymous Shared Memory](MEMFD.md)
+- [signal Design: Signal-Triggered Data Channel](SIGNAL.md)
 
 ## References
 
@@ -510,10 +604,6 @@ Each option is designed in detail in its own document:
 
 - [OpenMP 5.2 Specification](https://www.openmp.org/spec-html/5.2/openmpch19.html) — OMPT tool interface
 - `ompt_start_tool()` — One-shot init-time tool discovery (no late attachment)
-
-### OpenTelemetry
-
-- [OpenTelemetry C++ SDK](https://github.com/open-telemetry/opentelemetry-cpp) — Potential output format via OTLP export
 
 ### Security
 

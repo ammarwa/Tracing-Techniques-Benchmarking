@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "rocp_protocol.h"
@@ -147,7 +148,18 @@ int main(int argc, char** argv)
                      "rocprofiler_%d", (int)target_pid);
     socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 
-    if (connect(sock, (struct sockaddr*)&addr, addrlen) < 0) {
+    /* Retry connect() briefly on ECONNREFUSED / ENOENT to tolerate the race
+     * where the target process's stub hasn't finished bind()+listen() yet.
+     * Total budget: ~2s (40 * 50 ms). */
+    int conn_rc = -1;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        conn_rc = connect(sock, (struct sockaddr*)&addr, addrlen);
+        if (conn_rc == 0) break;
+        if (errno != ECONNREFUSED && errno != ENOENT) break;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    if (conn_rc < 0) {
         fprintf(stderr, "connect(pid=%d): %s\n", (int)target_pid, strerror(errno));
         close(sock);
         return 1;

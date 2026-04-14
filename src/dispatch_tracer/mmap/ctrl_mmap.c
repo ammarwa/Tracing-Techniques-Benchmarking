@@ -1,7 +1,7 @@
 /*
  * ctrl_mmap.c - rocp_ctrl_mmap
  *
- * CLI controller for Option B. Opens the target process's mmap'd
+ * CLI controller for the mmap channel. Opens the target process's mmap'd
  * control file, writes configuration / commands, bumps the version
  * counter.
  *

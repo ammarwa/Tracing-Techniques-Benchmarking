@@ -19,6 +19,10 @@ The key insight from analyzing rocprofiler-sdk's existing code: **the existing f
 
 ## What Changes (Minimal) — Late-Load Architecture
 
+> **Precise reading of "preloaded":** the user sets `LD_PRELOAD=librocp_stub_mmap.so`. That is the only library preloaded. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL and loads automatically; rocprofiler-sdk is neither preloaded nor linked at startup and is only `dlopen`'d later by the stub at attach. See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not).
+>
+> **OpenMP / OMPT** uses a different registration model; the stub also exports a minimal `ompt_start_tool` that silently saves `ompt_set_callback` at OMPT init and installs real callbacks only at controller attach. See [CONTROL_CHANNEL_SURVEY.md § OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
+
 1. **Stub library** (preloaded via `LD_PRELOAD`): does NOT export `rocprofiler_configure`. Sets up the mmap control file and spawns a background thread. Because no `rocprofiler_configure` symbol exists, rocprofiler-register's symbol scan finds no tool and does NOT `dlopen` rocprofiler-sdk. The dispatch tables keep their original function pointers — **0 ns hot-path overhead**.
 
 2. **Background thread**: polls the mmap. On `CMD_CONFIGURE`:
@@ -118,7 +122,7 @@ Since the existing rocprofiler-sdk context system handles per-operation enable/d
 
 enum rocp_ctrl_command {
     CMD_NONE        = 0,   // No pending command
-    CMD_CONFIGURE   = 1,   // First attach: dlopen SDK + force_configure with config
+    CMD_CONFIGURE   = 1,   // First attach: dlopen tool library (brings rocprofiler-sdk via link dep) + force_configure with config
     CMD_ACTIVATE    = 2,   // rocprofiler_start_context() (after CMD_CONFIGURE)
     CMD_DEACTIVATE  = 3,   // rocprofiler_stop_context() (wrappers stay, Level 2 noop)
     CMD_RECONFIGURE = 4,   // Update runtime filter (output, domains-to-emit, patterns)
@@ -139,7 +143,7 @@ typedef struct {
     uint32_t enable_kernel_dispatch : 1;
     uint32_t reserved         : 25;
 
-    uint32_t output_format;   // TEXT=0, JSON=1, OTLP=2, PERFETTO=3
+    uint32_t output_format;   // TEXT=0, JSON=1, PERFETTO=2
     uint32_t buffer_size_kb;
     char output_path[256];
     char filter_pattern[256];
@@ -234,7 +238,7 @@ static void setup_mmap_control(void) {
 }
 ```
 
-### 2. Background Thread (polls mmap, dlopens SDK on first attach)
+### 2. Background Thread (polls mmap, dlopens the tool library on first attach)
 
 ```c
 /* On first CMD_CONFIGURE: dlopen rocprofiler-sdk-tool, call force_configure.
@@ -288,7 +292,7 @@ static void* control_poll_loop(void* arg) {
         uint32_t cmd = __atomic_load_n(&ctrl->command, __ATOMIC_ACQUIRE);
         switch (cmd) {
         case CMD_CONFIGURE: {
-            /* First attach: dlopen SDK, force_configure with controller's
+            /* First attach: dlopen tool library, force_configure with controller's
              * domain selection. After this, force_configure is locked. */
             memcpy(&g_pending_config, &ctrl->config, sizeof(g_pending_config));
             bool expected = false;
@@ -520,7 +524,7 @@ static void tool_finalize(void* tool_data) {
 |-------|------|--------|
 | Stub init | ~10-50 μs | mkdir + open + ftruncate + mmap + pthread_create. No SDK loaded yet. |
 | **Hot-path before any attach** | **0 ns** | rocprofiler-sdk not loaded, no wrappers installed, original function pointers in dispatch tables |
-| Controller attach + first configure | ~5-50 ms | dlopen rocprofiler-sdk + force_configure + propagation + update_table for all registered runtime API tables |
+| Controller attach + first configure | ~5-50 ms | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table for all registered runtime API tables |
 | **Hot-path (active, callback emits)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
 | **Hot-path (active, runtime filter rejects)** | **~30-50 ns** | `populate_contexts()` + callback fires + atomic load of filter mask + return |
 | Reconfigure (change runtime filter) | ~1 ms | Atomic stores to `g_runtime_filter` — effect immediate on next event |
@@ -602,7 +606,7 @@ LD_PRELOAD=build/lib/librocp_stub_mmap.so \
 LD_PRELOAD=build/lib/librocp_stub_mmap.so \
   SIMULATED_WORK_US=100 build/bin/sample_app 10000000 &
 
-# Terminal 2 — first attach: stub dlopens SDK, force_configure runs,
+# Terminal 2 — first attach: stub dlopens the tool library (SDK arrives as its link dependency), force_configure runs,
 # wrappers installed only for the requested domains:
 build/bin/rocp_ctrl_mmap --pid $! configure --hip --hsa --output json --out trace.json
 # ... tracing now active, only HIP+HSA wrappers exist ...

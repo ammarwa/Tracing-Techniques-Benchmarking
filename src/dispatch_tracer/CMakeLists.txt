@@ -81,20 +81,20 @@ set_target_properties(sample_app_dispatch PROPERTIES
 )
 message("${Green}  ✓ sample_app_dispatch${ColorReset}")
 
-# ----- per-option control-channel subdirectories --------------------------
-option(BUILD_DISPATCH_OPTION_B "Build dispatch-tracer Option B (mmap)" ON)
-if(BUILD_DISPATCH_OPTION_B AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/option_b_mmap/CMakeLists.txt)
-    add_subdirectory(option_b_mmap)
+# ----- per-channel control-channel subdirectories -------------------------
+option(BUILD_DISPATCH_MMAP "Build dispatch-tracer mmap channel" ON)
+if(BUILD_DISPATCH_MMAP AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/mmap/CMakeLists.txt)
+    add_subdirectory(mmap)
 endif()
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/option_f_sock/CMakeLists.txt)
-    add_subdirectory(option_f_sock)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sock/CMakeLists.txt)
+    add_subdirectory(sock)
 endif()
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/option_f_memfd/CMakeLists.txt)
-    add_subdirectory(option_f_memfd)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/memfd/CMakeLists.txt)
+    add_subdirectory(memfd)
 endif()
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/option_signal/CMakeLists.txt)
-    add_subdirectory(option_signal)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/signal/CMakeLists.txt)
+    add_subdirectory(signal)
 endif()

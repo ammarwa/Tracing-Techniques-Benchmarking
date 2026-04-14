@@ -1,7 +1,7 @@
 /*
  * stub_signal.c - librocp_stub_signal.so
  *
- * LD_PRELOAD stub identical in spirit to Option B's stub (mmap'd control
+ * LD_PRELOAD stub identical in spirit to the mmap channel's stub (mmap'd control
  * file + background thread), but woken instantly by SIGRTMIN+7 via
  * sigqueue() from the controller instead of polling a version counter
  * on a 1 ms timer.

@@ -1,5 +1,5 @@
 # ============================================================================
-# Option F — Unix-domain-socket control channel (dispatch-tracer)
+# sock — Unix-domain-socket control channel (dispatch-tracer)
 #
 # Components:
 #   * librocp_stub_sock.so     — preloaded stub, NO rocprofiler_configure
@@ -7,7 +7,7 @@
 #   * rocp_ctrl_sock           — external controller CLI
 # ============================================================================
 
-message("${Green}[dispatch_tracer] Option F (Unix socket)${ColorReset}")
+message("${Green}[dispatch_tracer] sock channel (Unix socket)${ColorReset}")
 
 # ----- librocp_stub_sock.so ------------------------------------------------
 add_library(rocp_stub_sock SHARED

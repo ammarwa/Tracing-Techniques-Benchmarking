@@ -1,8 +1,8 @@
 # ============================================================================
-# Option Signal: real-time signal (SIGRTMIN+7) wake + mmap data channel
+# signal channel — real-time signal (SIGRTMIN+7) wake + mmap data channel
 # ============================================================================
 
-message("${Green}[dispatch_tracer/option_signal] Building Option Signal components${ColorReset}")
+message("${Green}[dispatch_tracer/signal] Building signal channel components${ColorReset}")
 
 # ----- librocp_stub_signal.so ---------------------------------------------
 # LD_PRELOAD'd stub. Does NOT export rocprofiler_configure. Registers an
