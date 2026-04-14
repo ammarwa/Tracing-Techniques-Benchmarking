@@ -35,12 +35,12 @@ from benchmark import BenchmarkResult  # noqa: E402
 
 SCENARIOS = [
     # (name, simulated_work_us, iterations)
+    # Iteration counts tuned so each run takes under ~1s to avoid multi-hour
+    # benchmark runs. For deep noise-floor analysis rerun with --runs 10.
     ("Empty Function",       0,    100000),
-    ("5 μs Function",        5,    100000),
-    ("50 μs Function",       50,   50000),
-    ("100 μs Function",      100,  10000),
-    ("500 μs Function",      500,  5000),
-    ("1000 μs (1ms) Function", 1000, 2000),
+    ("5 μs Function",        5,    50000),
+    ("100 μs Function",      100,  5000),
+    ("1000 μs (1ms) Function", 1000, 500),
 ]
 
 OPTIONS = ["mmap", "sock", "memfd", "signal"]
