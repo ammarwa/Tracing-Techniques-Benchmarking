@@ -14,7 +14,9 @@ This is the **recommended option for production** (e.g., rocprofiler-sdk) as it 
 
 Same as all options — uses the **late-load design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path), and `rocprofiler-sdk` is `dlopen`'d at attach via `CMD_CONFIGURE`, which triggers `rocprofiler_force_configure()` to install wrappers for the controller-specified domains.
 
-This option combines Option F's socket (for `SO_PEERCRED` authentication + bootstrap) with a memfd containing the `rocp_ctrl_t` struct (same layout as Option B). The differences from Option B: the control struct lives in anonymous memory (no filesystem) and authentication is via `SO_PEERCRED`.
+This option combines Option F's socket (for `SO_PEERCRED` authentication + bootstrap) with a memfd containing the `rocp_ctrl_t` struct (same layout as Option B). The differences from Option B: the control struct lives in anonymous memory (no filesystem), authentication is via `SO_PEERCRED`, and the memfd is handed off via `SCM_RIGHTS` rather than discovered by filesystem path.
+
+Line 17 correction: the background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE`.
 
 ## Architecture
 
@@ -22,118 +24,326 @@ This option combines Option F's socket (for `SO_PEERCRED` authentication + boots
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Target Process (sample_app)                   │
 │                                                                  │
-│  Existing rocprofiler-sdk flow (unchanged):                     │
-│    Runtime → rocprofiler_set_api_table() → copy_table()         │
-│    → update_table() installs functor wrappers                    │
+│  Process start (no controller attached):                         │
 │                                                                  │
-│  Tool library (loaded via ROCP_TOOL_LIBRARIES):                 │
-│    rocprofiler_configure():                                      │
-│      create context, register all domains                       │
-│      DO NOT activate context yet                                │
-│    tool_initialize():                                            │
-│      create memfd (rocp_ctrl_t) + socket, spawn bg thread       │
+│  HIP/HSA/RCCL runtimes load → link rocprofiler-register          │
+│  Stub library loaded via LD_PRELOAD                              │
+│    (NO rocprofiler_configure symbol exported)                    │
+│  Stub setup:                                                     │
+│    memfd_create("rocp-ctrl",                                     │
+│        MFD_CLOEXEC | MFD_ALLOW_SEALING)                          │
+│    ftruncate(memfd, sizeof(rocp_ctrl_t))                         │
+│    ctrl = mmap(memfd, PROT_READ|PROT_WRITE, MAP_SHARED)          │
+│    bind abstract socket "\0rocprofiler_<pid>"                    │
+│    spawn background thread (accept + poll memfd)                 │
 │                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Existing functor hot path (NO CHANGES):                   │  │
-│  │                                                            │  │
-│  │  hip_api_impl<T,Op>::functor(args...):                     │  │
-│  │    populate_contexts(domain, op,                           │  │
-│  │        callback_ctxs, buffered_ctxs);                      │  │
-│  │    if (callback_ctxs.empty() && buffered_ctxs.empty())     │  │
-│  │        return exec(get_table_func(), args);  // noop       │  │
-│  │    // ... full tracing path                                │  │
-│  │  ~10-20 ns per check (existing populate_contexts)          │  │
-│  └───────────────────────────────────────────────────────────┘  │
+│  Runtime calls rocprofiler_register_library_api_table(...)       │
+│    rocprofiler-register scans for rocprofiler_configure          │
+│      → not found (only stub is loaded) → does NOT dlopen SDK     │
+│  Original function pointers stay in dispatch tables              │
+│  Hot path: 0 ns (rocprofiler-sdk not loaded, no wrappers)        │
 │                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Background Thread (NEW — polls memfd + listens on socket) │  │
-│  │                                                            │  │
-│  │  Phase 1: Create memfd + control struct (rocp_ctrl_t)     │  │
-│  │    memfd = memfd_create("ctrl", MFD_CLOEXEC |             │  │
-│  │                              MFD_ALLOW_SEALING)           │  │
-│  │    ftruncate(memfd, sizeof(rocp_ctrl_t))                   │  │
-│  │    ctrl = mmap(memfd, PROT_READ|PROT_WRITE, MAP_SHARED)   │  │
-│  │    ctrl->command = CMD_NONE                                │  │
-│  │                                                            │  │
-│  │  Phase 2: Listen for controller connection                 │  │
-│  │    sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)  │  │
-│  │    bind(sock, "\0rocprofiler_<pid>")                       │  │
-│  │    listen(sock, 1)                                         │  │
-│  │                                                            │  │
-│  │  Phase 3: On accept, authenticate + share memfd            │  │
-│  │    client = accept(sock)                                   │  │
-│  │    getsockopt(client, SO_PEERCRED, &cred)                 │  │
-│  │    if (cred.uid != getuid()) reject                       │  │
-│  │    sendmsg(client, memfd via SCM_RIGHTS)                  │  │
-│  │                                                            │  │
-│  │  Phase 4: Poll memfd for commands + listen for socket cmds │  │
-│  │    if (ctrl->command == CMD_ACTIVATE)                      │  │
-│  │      rocprofiler_start_context(ctx);                      │  │
-│  │    if (ctrl->command == CMD_DEACTIVATE)                    │  │
-│  │      rocprofiler_stop_context(ctx);                       │  │
-│  │    // Also handles socket-based CMD_STATUS queries         │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└──────────────────────┬──────────────────────────────────────────┘
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │  Existing functor hot path (NO CHANGES, only present      │   │
+│  │  after SDK is dlopen'd at first attach):                  │   │
+│  │                                                           │   │
+│  │  hip_api_impl<T,Op>::functor(args...):                    │   │
+│  │    populate_contexts(domain, op,                          │   │
+│  │        callback_ctxs, buffered_ctxs);                     │   │
+│  │    if (callback_ctxs.empty() && buffered_ctxs.empty())    │   │
+│  │        return exec(get_table_func(), args);  // noop      │   │
+│  │    // ... full tracing path                               │   │
+│  └───────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │  Background Thread (NEW — socket bootstrap + memfd poll)  │   │
+│  │                                                           │   │
+│  │  Phase 1: Listen for controller connection                │   │
+│  │    accept(listen_sock) → client                           │   │
+│  │    getsockopt(client, SO_PEERCRED, &cred)                 │   │
+│  │    if (cred.uid != geteuid()) close & reject              │   │
+│  │                                                           │   │
+│  │  Phase 2: Hand off memfd via SCM_RIGHTS                   │   │
+│  │    sendmsg(client, memfd via SCM_RIGHTS)                  │   │
+│  │    fcntl(memfd, F_ADD_SEALS,                              │   │
+│  │          F_SEAL_SHRINK | F_SEAL_GROW)                     │   │
+│  │                                                           │   │
+│  │  Phase 3: Poll memfd for commands                         │   │
+│  │    if (ctrl->command == CMD_CONFIGURE && !sdk_loaded) {   │   │
+│  │        memcpy(&g_pending_config, &ctrl->config, ...);     │   │
+│  │        dlopen("librocprofiler-sdk-tool.so",               │   │
+│  │               RTLD_NOW | RTLD_GLOBAL);                    │   │
+│  │        p_force_configure(tool_configure);                 │   │
+│  │        /* tool_initialize registers domains +             │   │
+│  │           calls rocprofiler_start_context() */            │   │
+│  │        ctrl->context_active = 1;                          │   │
+│  │    }                                                      │   │
+│  │    if (ctrl->command == CMD_ACTIVATE)                     │   │
+│  │        p_start_context(saved_ctx);                        │   │
+│  │    if (ctrl->command == CMD_DEACTIVATE)                   │   │
+│  │        p_stop_context(saved_ctx);                         │   │
+│  │    if (ctrl->command == CMD_RECONFIGURE)                  │   │
+│  │        apply_runtime_filter(&ctrl->config);               │   │
+│  └───────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  Filesystem footprint: NONE (abstract socket + memfd only)       │
+└──────────────────────┬───────────────────────────────────────────┘
                        │ Abstract Unix socket + SCM_RIGHTS fd pass
-┌──────────────────────▼──────────────────────────────────────────┐
+┌──────────────────────▼───────────────────────────────────────────┐
 │                    Controller                                    │
 │                                                                  │
-│  Phase 1: Connect and authenticate                              │
+│  Phase 1: Connect and authenticate                               │
 │    sock = connect("\0rocprofiler_<pid>")                         │
-│    // Tool checks our SO_PEERCRED automatically                 │
+│    // Tool validates our SO_PEERCRED on accept                   │
 │                                                                  │
-│  Phase 2: Receive memfd via SCM_RIGHTS                          │
-│    recvmsg(sock, &msg) → extract memfd_fd from ancillary       │
-│    ctrl = mmap(memfd_fd, PROT_READ|PROT_WRITE, MAP_SHARED)    │
+│  Phase 2: Receive memfd via SCM_RIGHTS                           │
+│    recvmsg(sock, &msg) → extract memfd_fd from ancillary         │
+│    ctrl = mmap(memfd_fd, PROT_READ|PROT_WRITE, MAP_SHARED)       │
+│    verify ctrl->magic == ROCP_CTRL_MAGIC                         │
 │                                                                  │
-│  Phase 3: Write commands directly to shared memory              │
-│    ctrl->command = CMD_ACTIVATE;                                │
-│    atomic_store(&ctrl->version, v+1, RELEASE);                 │
-│    // Context activates within ~1 ms (bg thread poll)           │
+│  Phase 3: First attach — write config + CMD_CONFIGURE            │
+│    ctrl->config.enable_hip = 1; /* ...domains... */              │
+│    ctrl->command = CMD_CONFIGURE;                                │
+│    atomic_store(&ctrl->version, v+1, RELEASE);                   │
+│    /* bg thread dlopens SDK, force_configure, start_context */   │
 │                                                                  │
-│  Phase 4: Use socket for queries needing responses              │
-│    send(sock, CMD_STATUS) → recv response                      │
+│  Phase 4: Subsequent commands via mmap (~50-100 ns)              │
+│    ctrl->command = CMD_DEACTIVATE;                               │
+│    atomic_store(&ctrl->version, v+1, RELEASE);                   │
 │                                                                  │
-│  Phase 5: Deactivate via mmap                                   │
-│    ctrl->command = CMD_DEACTIVATE;                              │
-│    atomic_store(&ctrl->version, v+1, RELEASE);                 │
-└─────────────────────────────────────────────────────────────────┘
+│  Phase 5: Use socket for queries needing responses               │
+│    send(sock, CMD_STATUS) → recv response                        │
+└──────────────────────────────────────────────────────────────────┘
 
 Key: After the initial socket handshake + SCM_RIGHTS fd passing,
-     activate/deactivate commands go through mmap (~50-100 ns write).
-     The socket is only used for queries needing a response.
+     configure/activate/deactivate commands go through mmap
+     (~50-100 ns write). The socket is only used for queries
+     needing a response.
 ```
+
+Uses the same **late-load design** as [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path); `rocprofiler-sdk` is `dlopen`'d on the first `CMD_CONFIGURE` and `rocprofiler_force_configure()` installs wrappers for the controller-specified domains. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#late-load-design-defer-rocprofiler-sdk-loading-until-attach) for the full mechanism explanation.
 
 ## Control Structure
 
-Same as Option B — the `rocp_ctrl_t` struct is minimal because per-function configuration is handled by existing `rocprofiler_configure_*` APIs:
+Same as Option B — the `rocp_ctrl_t` struct carries commands, the controller's per-attach `rocp_config_t`, and status counters. The canonical definitions live in [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#canonical-control-struct). Summary:
 
 ```c
 #define ROCP_CTRL_MAGIC   0xD15EA7C0  // Same as Option B for interoperability
 #define ROCP_CTRL_VERSION 1
 
+/* See CONTROL_CHANNEL_SURVEY.md for the canonical enum. */
 enum rocp_ctrl_command {
-    CMD_NONE       = 0,
-    CMD_ACTIVATE   = 1,
-    CMD_DEACTIVATE = 2,
+    CMD_NONE        = 0,
+    CMD_CONFIGURE   = 1,  // First attach: dlopen SDK + force_configure
+    CMD_ACTIVATE    = 2,  // rocprofiler_start_context()
+    CMD_DEACTIVATE  = 3,  // rocprofiler_stop_context()
+    CMD_RECONFIGURE = 4,  // Update runtime filter without toggling context
+    CMD_STATUS      = 5,  // Socket-side query (response via socket)
 };
 
+/* Same layout as Option B's rocp_config_t — see CONTROL_CHANNEL_SURVEY.md.
+ * Carries the domain enable bits, output format, buffer sizing, filter
+ * patterns; the tool's real_tool_initialize reads this to decide which
+ * services to register. */
 typedef struct {
-    uint32_t magic;
-    uint32_t struct_version;
+    uint32_t enable_hip       : 1;
+    uint32_t enable_hsa       : 1;
+    uint32_t enable_rccl      : 1;
+    uint32_t enable_ompt      : 1;
+    uint32_t enable_rocdecode : 1;
+    uint32_t enable_rocjpeg   : 1;
+    uint32_t enable_kernel_dispatch : 1;
+    uint32_t reserved         : 25;
 
-    _Atomic uint32_t command;
-    _Atomic uint32_t version;
+    uint32_t output_format;   // TEXT=0, JSON=1, OTLP=2, PERFETTO=3
+    uint32_t buffer_size_kb;
+    char output_path[256];
+    char filter_pattern[256];
+    char exclude_pattern[256];
+} rocp_config_t;
 
+typedef struct {
+    /* Identification */
+    uint32_t magic;              // Must equal ROCP_CTRL_MAGIC
+    uint32_t struct_version;     // ROCP_CTRL_VERSION
+
+    /* Command channel (controller → tool) */
+    _Atomic uint32_t command;    // rocp_ctrl_command
+    _Atomic uint32_t version;    // Bumped by controller on every command
+
+    /* Configuration (controller writes, tool reads on CMD_CONFIGURE / CMD_RECONFIGURE) */
+    rocp_config_t config;
+
+    /* Status (tool → controller, read-only from controller side) */
     _Atomic uint32_t context_active;
     _Atomic uint32_t context_id;
     _Atomic uint64_t events_traced;
     _Atomic uint64_t events_dropped;
 
+    /* Tool identification */
     uint32_t pid;
     uint64_t start_time;
 } __attribute__((aligned(64))) rocp_ctrl_t;
 ```
+
+## Components
+
+### 1. Stub Library (`librocp_stub_memfd.so` — preloaded, NO `rocprofiler_configure` symbol)
+
+Loaded via `LD_PRELOAD` at process start. Creates the memfd, binds the abstract socket, spawns the background thread. Does NOT link rocprofiler-sdk — only `pthread` and `dl`. Because it never exports `rocprofiler_configure`, rocprofiler-register's symbol scan finds no tool and does NOT `dlopen` rocprofiler-sdk. The dispatch tables keep their original function pointers — **0 ns hot-path overhead**.
+
+```c
+/* Loaded at process start via LD_PRELOAD. */
+__attribute__((constructor))
+static void stub_init(void) {
+    setup_memfd_and_socket();
+}
+
+static rocp_ctrl_t* ctrl       = NULL;
+static int         memfd       = -1;
+static int         listen_sock = -1;
+static pthread_t   bg_thread;
+static rocp_config_t g_pending_config;   /* read by tool_initialize via accessor */
+static rocprofiler_context_id_t saved_ctx;
+static void* sdk_handle = NULL;
+
+/* Exported accessor — tool calls this after being dlopen'd.
+ * Avoids extern cross-DSO globals (see Option B's stub↔tool contract). */
+typedef struct {
+    rocp_ctrl_t* ctrl;
+    rocp_config_t* pending_config;
+    rocprofiler_context_id_t* saved_ctx;
+} rocp_stub_state_t;
+
+__attribute__((visibility("default")))
+const rocp_stub_state_t* rocp_stub_get_state(void) {
+    static rocp_stub_state_t state;
+    state.ctrl           = ctrl;
+    state.pending_config = &g_pending_config;
+    state.saved_ctx      = &saved_ctx;
+    return &state;
+}
+
+/* Resolved after dlopen of rocprofiler-sdk */
+static rocprofiler_status_t (*p_force_configure)(rocprofiler_configure_func_t);
+static rocprofiler_status_t (*p_start_context)(rocprofiler_context_id_t);
+static rocprofiler_status_t (*p_stop_context)(rocprofiler_context_id_t);
+
+static void setup_memfd_and_socket(void) {
+    memfd = memfd_create("rocp-ctrl", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    ftruncate(memfd, sizeof(rocp_ctrl_t));
+    ctrl = mmap(NULL, sizeof(rocp_ctrl_t),
+                PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+    ctrl->magic          = ROCP_CTRL_MAGIC;
+    ctrl->struct_version = ROCP_CTRL_VERSION;
+    ctrl->command        = CMD_NONE;
+    ctrl->pid            = getpid();
+
+    listen_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    /* Abstract namespace: leading NUL, no filesystem entry */
+    snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1,
+             "rocprofiler_%d", getpid());
+    bind(listen_sock, (struct sockaddr*)&addr,
+         offsetof(struct sockaddr_un, sun_path) + 1 +
+         strlen(addr.sun_path + 1));
+    listen(listen_sock, 1);
+
+    pthread_create(&bg_thread, NULL, control_loop, NULL);
+}
+```
+
+### 2. Background Thread (socket bootstrap + memfd poll + dlopen SDK on first attach)
+
+```c
+/* On first CMD_CONFIGURE: dlopen rocprofiler-sdk-tool, force_configure.
+ * See Option B for the shared stub↔tool state contract and rationale
+ * for RTLD_GLOBAL + RTLD_DEFAULT symbol resolution. */
+static void load_sdk_and_configure(void) {
+    sdk_handle = dlopen("librocprofiler-sdk-tool.so",
+                        RTLD_NOW | RTLD_GLOBAL);
+    if (!sdk_handle) return;
+
+    typedef rocprofiler_tool_configure_result_t* (*configure_fn_t)(
+        uint32_t, const char*, uint32_t, rocprofiler_client_id_t*);
+    configure_fn_t tool_configure = dlsym(RTLD_DEFAULT, "rocprofiler_configure");
+    p_force_configure = dlsym(RTLD_DEFAULT, "rocprofiler_force_configure");
+    p_start_context   = dlsym(RTLD_DEFAULT, "rocprofiler_start_context");
+    p_stop_context    = dlsym(RTLD_DEFAULT, "rocprofiler_stop_context");
+
+    if (p_force_configure && tool_configure)
+        p_force_configure(tool_configure);
+}
+
+static _Atomic bool sdk_loaded = false;
+static _Atomic int  shutdown_flag = 0;
+
+static void* control_loop(void* arg) {
+    /* Phase 1: accept + SO_PEERCRED auth */
+    int client = accept(listen_sock, NULL, NULL);
+    if (client < 0) return NULL;
+
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0 ||
+        cred.uid != geteuid()) {
+        close(client); return NULL;
+    }
+
+    /* Phase 2: hand off memfd via SCM_RIGHTS, then seal */
+    send_fd(client, memfd);
+    fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
+
+    /* Phase 3: poll memfd for commands */
+    uint32_t last_version = 0;
+    while (!__atomic_load_n(&shutdown_flag, __ATOMIC_ACQUIRE)) {
+        uint32_t ver = __atomic_load_n(&ctrl->version, __ATOMIC_ACQUIRE);
+        if (ver == last_version) { usleep(1000); continue; }
+
+        uint32_t cmd = __atomic_load_n(&ctrl->command, __ATOMIC_ACQUIRE);
+        switch (cmd) {
+        case CMD_CONFIGURE: {
+            memcpy(&g_pending_config, &ctrl->config, sizeof(g_pending_config));
+            bool expected = false;
+            if (__atomic_compare_exchange_n(&sdk_loaded, &expected, true,
+                                            false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                load_sdk_and_configure();  /* tool_initialize calls start_context */
+                __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
+            } else {
+                apply_runtime_filter(&ctrl->config);
+            }
+            break;
+        }
+        case CMD_ACTIVATE:
+            if (__atomic_load_n(&sdk_loaded, __ATOMIC_ACQUIRE) && p_start_context) {
+                p_start_context(saved_ctx);
+                __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
+            }
+            break;
+        case CMD_DEACTIVATE:
+            if (__atomic_load_n(&sdk_loaded, __ATOMIC_ACQUIRE) && p_stop_context) {
+                p_stop_context(saved_ctx);
+                __atomic_store_n(&ctrl->context_active, 0, __ATOMIC_RELEASE);
+            }
+            break;
+        case CMD_RECONFIGURE:
+            apply_runtime_filter(&ctrl->config);
+            break;
+        }
+        last_version = ver;
+    }
+    return NULL;
+}
+```
+
+### 3. Tool Library (`librocprofiler-sdk-tool.so` — dlopen'd at first attach)
+
+Same as Option B. The tool exports `rocprofiler_configure`, and its `tool_initialize` calls the stub's `rocp_stub_get_state()` accessor to read the pending config and write the created `rocprofiler_context_id_t` back for the bg thread to toggle. See [Option B § Tool Library](OPTION_B_MMAP_FILE.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach) for the full `tool_initialize` body and the stub↔tool accessor contract — the only difference under F+memfd is that the control struct is backed by the memfd instead of a `/run/user/<uid>/` file.
+
+### 4. Controller
+
+The controller connects to the abstract socket, receives the memfd via `SCM_RIGHTS`, mmaps it, and then drives `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE` identically to Option B's controller. `CMD_STATUS` (response-bearing query) goes over the socket instead of mmap.
 
 ## SCM_RIGHTS File Descriptor Passing
 
@@ -267,10 +477,12 @@ The output format can be extended with `OUTPUT_OTLP` to export trace events as O
 
 ```
 src/tools/rocprofiler_tool_memfd/
-├── rocp_memfd.h            # Shared structs (rocp_ctrl_t), constants
-├── rocp_memfd_tool.c       # rocprofiler tool library (configure + initialize + memfd + socket)
-├── rocp_memfd_fdpass.c     # SCM_RIGHTS helper functions
-└── rocp_memfd_controller.c # CLI controller tool
+├── rocp_memfd.h             # Shared structs (rocp_ctrl_t, rocp_config_t, rocp_stub_state_t), constants
+├── rocp_stub_memfd.c        # Stub library (preloaded via LD_PRELOAD, no rocprofiler_configure,
+│                            #   creates memfd + abstract socket, spawns bg thread, dlopens SDK on CMD_CONFIGURE)
+├── rocp_memfd_tool.c        # SDK tool library (dlopen'd at attach, exports rocprofiler_configure)
+├── rocp_memfd_fdpass.c      # SCM_RIGHTS helper functions (shared by stub + controller)
+└── rocp_memfd_controller.c  # CLI controller tool
 ```
 
 ## Build Integration
@@ -279,15 +491,26 @@ src/tools/rocprofiler_tool_memfd/
 option(BUILD_ROCP_TOOL_MEMFD "Build rocprofiler tool with memfd control channel" ON)
 
 if(BUILD_ROCP_TOOL_MEMFD)
-    add_library(rocprofiler_tool_memfd SHARED
-        src/tools/rocprofiler_tool_memfd/rocp_memfd_tool.c
+    # Stub library — preloaded via LD_PRELOAD. No rocprofiler-sdk dependency.
+    # Does NOT export rocprofiler_configure, so rocprofiler-register skips SDK load.
+    add_library(rocp_stub_memfd SHARED
+        src/tools/rocprofiler_tool_memfd/rocp_stub_memfd.c
         src/tools/rocprofiler_tool_memfd/rocp_memfd_fdpass.c
     )
-    target_link_libraries(rocprofiler_tool_memfd PRIVATE pthread)
+    target_link_libraries(rocp_stub_memfd PRIVATE pthread dl)
+    target_compile_options(rocp_stub_memfd PRIVATE -O2 -fPIC)
+
+    # SDK tool library — dlopen'd at attach time. Links rocprofiler-sdk.
+    add_library(rocprofiler_tool_memfd SHARED
+        src/tools/rocprofiler_tool_memfd/rocp_memfd_tool.c
+    )
+    target_link_libraries(rocprofiler_tool_memfd
+        PRIVATE rocprofiler-sdk::rocprofiler-sdk)
     target_compile_options(rocprofiler_tool_memfd PRIVATE -O2 -fPIC)
 
     add_executable(rocp_ctrl_memfd
         src/tools/rocprofiler_tool_memfd/rocp_memfd_controller.c
+        src/tools/rocprofiler_tool_memfd/rocp_memfd_fdpass.c
     )
 endif()
 ```

@@ -1,6 +1,6 @@
 # Dispatch Table Tracer Design Documents
 
-This directory contains the design documentation for adding an **external control channel** to rocprofiler-sdk's existing dispatch table tracer. The existing functor wrappers already have a noop fast-path (`populate_contexts()` → empty → call original at ~10-20 ns). The control channel lets an external process toggle context activation at runtime, enabling/disabling tracing without restarting the application.
+This directory contains the design documentation for adding an **external control channel** to rocprofiler-sdk via a **late-load architecture**. A small stub library is preloaded at process start (no `rocprofiler_configure` symbol → rocprofiler-register sees no tool → does NOT load rocprofiler-sdk → original function pointers stay in dispatch tables → **0 ns hot-path overhead**). When the controller attaches via the control channel, the stub `dlopen`s the SDK tool library and calls `rocprofiler_force_configure()` (which succeeds because SDK init_status is still 0). The SDK initializes with the controller-specified domains, propagation runs, and wrappers install for the requested operations only.
 
 ## Documents
 

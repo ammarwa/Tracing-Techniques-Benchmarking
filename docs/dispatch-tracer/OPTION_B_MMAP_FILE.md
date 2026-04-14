@@ -187,9 +187,19 @@ static void stub_init(void) {
 
 static rocp_ctrl_t* ctrl = NULL;
 static pthread_t bg_thread;
-static rocp_config_t g_pending_config;  /* read by tool_initialize after dlopen */
+static rocp_config_t g_pending_config;  /* read by tool_initialize via accessor */
 static rocprofiler_context_id_t saved_ctx;
 static void* sdk_handle = NULL;
+
+/* Exported accessor — tool calls this after being dlopen'd */
+__attribute__((visibility("default")))
+const rocp_stub_state_t* rocp_stub_get_state(void) {
+    static rocp_stub_state_t state;
+    state.ctrl = ctrl;
+    state.pending_config = &g_pending_config;
+    state.saved_ctx = &saved_ctx;
+    return &state;
+}
 /* Function pointers resolved after dlopen of rocprofiler-sdk */
 static rocprofiler_status_t (*p_force_configure)(rocprofiler_configure_func_t);
 static rocprofiler_status_t (*p_start_context)(rocprofiler_context_id_t);
@@ -228,85 +238,92 @@ static void setup_mmap_control(void) {
 /* On first CMD_CONFIGURE: dlopen rocprofiler-sdk-tool, call force_configure.
  * The tool library exports rocprofiler_configure which the SDK will invoke. */
 static void load_sdk_and_configure(void) {
+    /* RTLD_GLOBAL is REQUIRED so the tool's rocprofiler_configure becomes
+     * visible to the SDK's dlsym(RTLD_DEFAULT, "rocprofiler_configure")
+     * scan during initialize(). Without RTLD_GLOBAL the tool would be
+     * silently ignored. */
     sdk_handle = dlopen("librocprofiler-sdk-tool.so", RTLD_NOW | RTLD_GLOBAL);
     if (!sdk_handle) {
         fprintf(stderr, "Failed to dlopen rocprofiler-sdk-tool: %s\n", dlerror());
         return;
     }
-    /* Resolve the SDK functions we'll need from the bg thread */
-    p_force_configure = dlsym(sdk_handle, "rocprofiler_force_configure");
-    p_start_context   = dlsym(sdk_handle, "rocprofiler_start_context");
-    p_stop_context    = dlsym(sdk_handle, "rocprofiler_stop_context");
 
-    /* The tool library's rocprofiler_configure is now visible.
-     * force_configure triggers SDK init, which calls the tool's configure
-     * callback. The tool reads g_pending_config to decide which domains
-     * to register. SDK then propagates runtime API tables and installs
-     * wrappers. */
-    rocprofiler_status_t st = p_force_configure(/*real_tool_configure*/NULL);
-    /* We pass NULL because the tool library's rocprofiler_configure is
-     * already discoverable via dlsym. force_configure finds it
-     * automatically when configure_func is NULL. (Or pass an explicit
-     * pointer if the SDK requires it.) */
+    /* Resolve symbols via RTLD_DEFAULT (POSIX-portable, searches all
+     * loaded libs) instead of dlsym(sdk_handle, ...) which has
+     * implementation-specific scope rules. */
+    typedef rocprofiler_tool_configure_result_t* (*configure_fn_t)(
+        uint32_t, const char*, uint32_t, rocprofiler_client_id_t*);
+    configure_fn_t tool_configure = dlsym(RTLD_DEFAULT, "rocprofiler_configure");
+    p_force_configure = dlsym(RTLD_DEFAULT, "rocprofiler_force_configure");
+    p_start_context   = dlsym(RTLD_DEFAULT, "rocprofiler_start_context");
+    p_stop_context    = dlsym(RTLD_DEFAULT, "rocprofiler_stop_context");
+
+    if (!p_force_configure || !tool_configure) {
+        fprintf(stderr, "Failed to resolve SDK/tool symbols\n");
+        return;
+    }
+
+    /* Pass an explicit configure_func (NOT NULL). NULL would rely on
+     * an internal symbol scan that may silently miss the tool. */
+    rocprofiler_status_t st = p_force_configure(tool_configure);
     if (st != ROCPROFILER_STATUS_SUCCESS) {
         fprintf(stderr, "rocprofiler_force_configure failed: %d\n", st);
     }
 }
 
+static _Atomic bool sdk_loaded = false;  /* atomic guards double-dlopen */
+
 static void* control_poll_loop(void* arg) {
     uint32_t last_version = 0;
-    bool sdk_loaded = false;
 
     while (!__atomic_load_n(&shutdown_flag, __ATOMIC_ACQUIRE)) {
         uint32_t ver = __atomic_load_n(&ctrl->version, __ATOMIC_ACQUIRE);
-        if (ver != last_version) {
-            uint32_t cmd = __atomic_load_n(&ctrl->command, __ATOMIC_ACQUIRE);
-
-            switch (cmd) {
-            case CMD_CONFIGURE:
-                /* First attach: dlopen SDK, force_configure with controller's
-                 * domain selection. After this, force_configure is locked. */
-                memcpy(&g_pending_config, &ctrl->config, sizeof(g_pending_config));
-                if (!sdk_loaded) {
-                    load_sdk_and_configure();
-                    sdk_loaded = true;
-                    /* Tool's tool_initialize already called start_context,
-                     * so saved_ctx is valid and active. */
-                    __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
-                } else {
-                    /* Already loaded: update runtime filter only.
-                     * Cannot add new domains — SDK init is locked. */
-                    apply_runtime_filter(&ctrl->config);
-                }
-                break;
-
-            case CMD_ACTIVATE:
-                if (sdk_loaded && p_start_context) {
-                    p_start_context(saved_ctx);
-                    __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
-                }
-                break;
-
-            case CMD_DEACTIVATE:
-                if (sdk_loaded && p_stop_context) {
-                    p_stop_context(saved_ctx);
-                __atomic_store_n(&ctrl->context_active, 0, __ATOMIC_RELEASE);
-                break;
-            }
-            last_version = ver;
+        if (ver == last_version) {
+            usleep(1000);  /* 1ms poll (or futex_wait on ctrl->version) */
+            continue;
         }
-                    __atomic_store_n(&ctrl->context_active, 0, __ATOMIC_RELEASE);
-                }
-                break;
 
-            case CMD_RECONFIGURE:
-                /* Tool-side filter only — no SDK calls */
+        uint32_t cmd = __atomic_load_n(&ctrl->command, __ATOMIC_ACQUIRE);
+        switch (cmd) {
+        case CMD_CONFIGURE: {
+            /* First attach: dlopen SDK, force_configure with controller's
+             * domain selection. After this, force_configure is locked. */
+            memcpy(&g_pending_config, &ctrl->config, sizeof(g_pending_config));
+            bool expected = false;
+            if (__atomic_compare_exchange_n(&sdk_loaded, &expected, true,
+                                            false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                load_sdk_and_configure();
+                /* tool_initialize calls start_context, so context is active */
+                __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
+            } else {
+                /* SDK already loaded — update runtime filter only.
+                 * Cannot add new domains; force_configure is locked. */
                 apply_runtime_filter(&ctrl->config);
-                break;
             }
-            last_version = ver;
+            break;
         }
-        usleep(1000);  /* 1ms poll (or futex_wait on ctrl->version) */
+
+        case CMD_ACTIVATE:
+            if (__atomic_load_n(&sdk_loaded, __ATOMIC_ACQUIRE) && p_start_context) {
+                p_start_context(saved_ctx);
+                __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
+            }
+            break;
+
+        case CMD_DEACTIVATE:
+            if (__atomic_load_n(&sdk_loaded, __ATOMIC_ACQUIRE) && p_stop_context) {
+                p_stop_context(saved_ctx);
+                __atomic_store_n(&ctrl->context_active, 0, __ATOMIC_RELEASE);
+            }
+            break;
+
+        case CMD_RECONFIGURE:
+            /* Tool-side filter only — no SDK calls needed */
+            apply_runtime_filter(&ctrl->config);
+            break;
+        }
+        last_version = ver;
     }
     return NULL;
 }
@@ -316,12 +333,22 @@ static void* control_poll_loop(void* arg) {
 
 Loaded by the stub via `dlopen` only when the controller attaches. Exports `rocprofiler_configure` so the SDK can find it.
 
+**Stub↔Tool state-sharing contract**: instead of `extern` cross-DSO globals (which require `RTLD_GLOBAL` and can fail silently if the load order is wrong), the stub exports a single accessor function that the tool calls to get pointers to the shared state:
+
 ```c
-/* Discovered by the SDK during force_configure (called by stub).
- * Extern reference to g_pending_config from the stub library. */
-extern rocp_config_t g_pending_config;
-extern rocp_ctrl_t* ctrl;
-extern rocprofiler_context_id_t saved_ctx;
+/* Exported by the stub library. Tool calls this once during tool_initialize. */
+typedef struct {
+    rocp_ctrl_t* ctrl;             // mmap'd control struct
+    rocp_config_t* pending_config;  // controller's config to apply
+    rocprofiler_context_id_t* saved_ctx;  // tool writes context ID here
+} rocp_stub_state_t;
+
+const rocp_stub_state_t* rocp_stub_get_state(void);
+```
+
+```c
+/* Discovered by the SDK during force_configure (called by stub). */
+static rocprofiler_context_id_t saved_ctx_local;
 
 rocprofiler_tool_configure_result_t*
 rocprofiler_configure(uint32_t version, const char* runtime_version,
@@ -336,29 +363,35 @@ rocprofiler_configure(uint32_t version, const char* runtime_version,
     return &result;
 }
 
-/* Reads g_pending_config, registers the controller-selected domains.
+/* Reads stub's pending_config, registers the controller-selected domains.
  * SDK then propagates runtime API tables and installs wrappers. */
 static int tool_initialize(rocprofiler_client_finalize_t fini, void* tool_data)
 {
-    rocprofiler_create_context(&saved_ctx);
+    /* Get shared state from stub via the exported accessor */
+    const rocp_stub_state_t* state = rocp_stub_get_state();
+    if (!state || !state->pending_config) return -1;
 
-    if (g_pending_config.enable_hip)
+    rocprofiler_create_context(&saved_ctx_local);
+
+    if (state->pending_config->enable_hip)
         rocprofiler_configure_callback_tracing_service(
-            saved_ctx, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
-            NULL, 0, my_callback, NULL);
-    if (g_pending_config.enable_hsa)
+            saved_ctx_local, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
+            NULL, 0, my_callback, (void*)state);
+    if (state->pending_config->enable_hsa)
         rocprofiler_configure_callback_tracing_service(
-            saved_ctx, ROCPROFILER_CALLBACK_TRACING_HSA_CORE_API,
-            NULL, 0, my_callback, NULL);
-    if (g_pending_config.enable_rccl)
+            saved_ctx_local, ROCPROFILER_CALLBACK_TRACING_HSA_CORE_API,
+            NULL, 0, my_callback, (void*)state);
+    if (state->pending_config->enable_rccl)
         rocprofiler_configure_callback_tracing_service(
-            saved_ctx, ROCPROFILER_CALLBACK_TRACING_RCCL_API,
-            NULL, 0, my_callback, NULL);
+            saved_ctx_local, ROCPROFILER_CALLBACK_TRACING_RCCL_API,
+            NULL, 0, my_callback, (void*)state);
     /* ... OMPT, rocdecode, rocjpeg per controller config ... */
 
-    apply_runtime_filter(&g_pending_config);
-    rocprofiler_start_context(saved_ctx);
-    __atomic_store_n(&ctrl->context_id, saved_ctx.handle, __ATOMIC_RELEASE);
+    apply_runtime_filter(state->pending_config);
+    rocprofiler_start_context(saved_ctx_local);
+    *state->saved_ctx = saved_ctx_local;
+    __atomic_store_n(&state->ctrl->context_id, saved_ctx_local.handle,
+                     __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -366,13 +399,14 @@ static void my_callback(rocprofiler_callback_tracing_record_t record,
                         rocprofiler_user_data_t* user_data,
                         void* callback_data)
 {
+    const rocp_stub_state_t* state = callback_data;
     /* Optional runtime filter (set by CMD_RECONFIGURE) */
     uint32_t mask = __atomic_load_n(&g_runtime_filter.enabled_domain_mask,
                                     __ATOMIC_ACQUIRE);
     if (!(mask & (1u << record.kind))) return;
 
     emit_event_to_output(&record);
-    __atomic_fetch_add(&ctrl->events_traced, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->ctrl->events_traced, 1, __ATOMIC_RELAXED);
 }
 ```
 

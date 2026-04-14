@@ -127,65 +127,103 @@ Controller attaches:
 
 **No changes to rocprofiler-sdk source code.** All public APIs already exist; we just need to time the dlopen correctly.
 
-**Single-phase tool design:**
+## Canonical Control Protocol
 
-**Init time (process start):**
-- Tool library loaded via `ROCP_TOOL_LIBRARIES`
-- `rocprofiler_configure()` returns a tool that creates ONE context and registers callback/buffer services for **all domains the tool might ever trace** (HIP, HSA, RCCL, OMPT, rocdecode, rocjpeg)
-- The context starts **inactive** (`rocprofiler_start_context` not called)
-- `tool_initialize()` also sets up the control channel (shm/socket/memfd) and spawns a background thread
-- **Result**: `update_table()` installs wrappers for all registered operations across all domains. The wrappers exist but `populate_contexts()` finds the inactive context and returns empty. Hot path: **~10-20 ns Level 2 noop**.
+All four IPC options share the same protocol semantics. Define once, reference from each option doc.
 
-**Attach (controller sends CMD_ACTIVATE with optional filter config):**
-- Controller writes filter config to the control channel (which domains to actually emit, output format, filter patterns) and sends `CMD_ACTIVATE`
-- Background thread:
-  1. Updates `g_runtime_filter` (atomic, read by callbacks)
-  2. Calls `rocprofiler_start_context(ctx)`
-- The wrappers' `populate_contexts()` now finds the active context. Callbacks fire. The tool's callbacks read `g_runtime_filter` and decide whether to emit/record this event.
+### Commands (controller → tool)
 
-**Detach (controller sends CMD_DEACTIVATE):**
-- Background thread calls `rocprofiler_stop_context(ctx)` — wrappers stay installed but `populate_contexts()` returns empty again (~10-20 ns noop)
+```c
+enum rocp_ctrl_command {
+    CMD_NONE        = 0,   // No pending command
+    CMD_CONFIGURE   = 1,   // First attach: dlopen SDK + force_configure with config
+    CMD_ACTIVATE    = 2,   // rocprofiler_start_context() (after configure)
+    CMD_DEACTIVATE  = 3,   // rocprofiler_stop_context()
+    CMD_RECONFIGURE = 4,   // Update tool-side runtime filter (no SDK calls)
+    CMD_STATUS      = 5,   // Query current state (where bidirectional channel exists)
+};
+```
 
-**Reconfigure (controller updates filter at runtime):**
-- Controller writes new filter config and sends `CMD_RECONFIGURE`
-- Tool callbacks pick up the new filter on the next event (~few ns extra atomic load per event)
-- No SDK calls needed — context stays active, only the tool-side filter changes
+### Configuration payload (`rocp_config_t`)
 
-**What this gives us (honest accounting):**
+```c
+typedef struct {
+    uint32_t enable_hip       : 1;
+    uint32_t enable_hsa       : 1;
+    uint32_t enable_rccl      : 1;
+    uint32_t enable_ompt      : 1;
+    uint32_t enable_rocdecode : 1;
+    uint32_t enable_rocjpeg   : 1;
+    uint32_t enable_kernel_dispatch : 1;
+    uint32_t reserved         : 25;
 
-| Property | Status |
-|---|---|
-| Late attach without ptrace | ✅ Yes — `rocprofiler_start_context()` works from any thread |
-| Late filtering of which APIs to emit events for | ✅ Yes — tool callbacks check runtime filter |
-| Late change of output format / buffer destination | ✅ Yes — tool callbacks read runtime config |
-| Multi-runtime control | ✅ Yes — single context covers all registered domains |
-| Works on any architecture | ✅ Yes — pure C API calls |
-| Zero overhead when no controller ever attaches | ❌ No — ~10-20 ns per intercepted call (Level 2 noop) |
-| Add a domain not registered at init | ❌ No — only ptrace attach can do this |
-| Change correlation ID strategy at runtime | ❌ No — locked at init |
+    uint32_t output_format;   // TEXT=0, JSON=1, OTLP=2, PERFETTO=3
+    uint32_t buffer_size_kb;
+    char output_path[256];
+    char filter_pattern[256];
+    char exclude_pattern[256];
+} rocp_config_t;
+```
 
-**The trade-off**: this design accepts ~10-20 ns per intercepted API call always (whether controller attaches or not) in exchange for: no ptrace, no init-time configuration of which APIs to enable, ability to filter at runtime via the control channel. For ROCm API tracing where APIs already cost microseconds, ~10-20 ns of overhead is negligible.
+### Control struct (`rocp_ctrl_t`)
 
-**For true zero-overhead-when-not-attached**, the only mechanism is ptrace attach (existing `rocprofv3 --attach --pid`). The control channels in this document are intended to coexist with ptrace attach, not replace it.
+```c
+#define ROCP_CTRL_MAGIC   0xD15EA7C0
+#define ROCP_CTRL_VERSION 1
 
-**What this reuses from rocprofiler-sdk (no changes):**
+typedef struct {
+    uint32_t magic;
+    uint32_t struct_version;
 
-- `copy_table`/`update_table`/`functor` machinery
+    _Atomic uint32_t command;        // rocp_ctrl_command
+    _Atomic uint32_t version;        // bumped on every command
+
+    rocp_config_t config;            // controller writes, tool reads on CMD_*
+
+    _Atomic uint32_t context_active; // tool writes status
+    _Atomic uint64_t context_id;     // rocprofiler_context_id_t.handle (uint64_t)
+    _Atomic uint64_t events_traced;
+    _Atomic uint64_t events_dropped;
+
+    uint32_t pid;
+    uint64_t start_time;             // /proc/<pid>/stat field 22 — for stale-pid detection
+} __attribute__((aligned(64))) rocp_ctrl_t;
+```
+
+### Stub↔Tool state-sharing contract
+
+Instead of `extern` cross-DSO globals (fragile), the stub exports a single accessor function:
+
+```c
+typedef struct {
+    rocp_ctrl_t* ctrl;
+    rocp_config_t* pending_config;
+    rocprofiler_context_id_t* saved_ctx;
+} rocp_stub_state_t;
+
+const rocp_stub_state_t* rocp_stub_get_state(void);  // exported by stub
+```
+
+The tool's `rocprofiler_configure` calls `rocp_stub_get_state()` (resolved via `dlsym(RTLD_DEFAULT, ...)` after the stub was preloaded with effective `RTLD_GLOBAL` visibility) to obtain pointers to the shared state.
+
+### What this design reuses from rocprofiler-sdk (unchanged)
+
+- `copy_table` / `update_table` / `functor` template machinery
 - `context`, `callback_tracing_service`, `buffer_tracing_service`
 - `populate_contexts`, `context_filter`
-- `rocprofiler_create_context`
+- `rocprofiler_force_configure()` — public API, succeeds when SDK init_status == 0 (i.e., before SDK has loaded)
+- `rocprofiler_register_invoke_all_registrations()` — internally triggered by force_configure to replay runtime API tables
+- `rocprofiler_create_context`, `rocprofiler_start_context`, `rocprofiler_stop_context`
 - `rocprofiler_configure_callback_tracing_service`, `rocprofiler_configure_buffer_tracing_service`
-- `rocprofiler_start_context`, `rocprofiler_stop_context` — public APIs, callable from any thread post-init
 
-**What needs to be added:**
+### What this design adds
 
-- Tool library with `rocprofiler_configure` that registers all domains and creates an inactive context
-- Control channel setup (shm/socket/memfd) in `tool_initialize`
-- Background thread that reads commands and calls `rocprofiler_start_context()` / `rocprofiler_stop_context()`
-- Tool callbacks that check a runtime-updated filter struct before emitting events
-- Controller binary that writes filter config and sends commands
+Per option (all four implement the same pattern, differing only in IPC):
+- A **stub library** preloaded via `LD_PRELOAD` (no `rocprofiler_configure` symbol → register-lib doesn't load SDK)
+- A **tool library** dlopen'd by the stub at first attach (exports `rocprofiler_configure` returning real callbacks)
+- A **controller binary** that writes config + commands to the IPC channel
 
-**No new SDK APIs are needed.** All the public APIs already exist.
+**No new SDK APIs are needed.** All public APIs already exist.
 
 The key design question remains: **what IPC mechanism does the external controller use to communicate with the tool's background thread?**
 
