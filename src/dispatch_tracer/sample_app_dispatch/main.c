@@ -8,6 +8,7 @@
  * iterations it checks for a stop file so controllers can cleanly end
  * the run without sending SIGTERM.
  */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,11 +54,13 @@ static void wait_for_attach(void) {
     }
 
     /* Poll context_active until the controller attaches.
-     * Use volatile read since clang complains about _Atomic with MAP_SHARED.
+     * Use atomic_load_explicit for proper acquire semantics across the
+     * shared mapping (portable to AArch64, not just x86-64).
      * Time out after 30 seconds to avoid hanging benchmark runs. */
     int max_tries = 30000;  /* 30 s at 1 ms intervals */
     for (int i = 0; i < max_tries; i++) {
-        uint32_t active = *(volatile uint32_t*)&ctrl->context_active;
+        uint32_t active = atomic_load_explicit(
+            (_Atomic uint32_t*)&ctrl->context_active, memory_order_acquire);
         if (active) break;
         usleep(1000);
     }

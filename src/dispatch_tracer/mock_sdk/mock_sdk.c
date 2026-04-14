@@ -369,10 +369,19 @@ static void mylib_wrap_op1(unsigned int us)
 
 static void copy_table(dispatch_table_t* t)
 {
-    /* Copy original pointers out of the runtime-visible table. */
+    /* Copy original pointers out of the runtime-visible table.
+     * Guard against re-replay: if a slot already points at our wrappers,
+     * keep the previously-saved original so we don't save a wrapper
+     * as the "original" (which would cause infinite recursion on call). */
     void** slots = t->runtime_table;
     for (uint64_t i = 0; i < t->num_entries && i < MAX_OPS_PER_DOMAIN; ++i) {
-        t->originals[i] = slots[i];
+        void* cur = slots[i];
+        if (cur == (void*)&mylib_wrap_op0 ||
+            cur == (void*)&mylib_wrap_op1) {
+            /* Already wrapped — keep existing t->originals[i] */
+            continue;
+        }
+        t->originals[i] = cur;
     }
 }
 

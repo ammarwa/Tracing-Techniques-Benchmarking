@@ -118,13 +118,15 @@ Since the existing rocprofiler-sdk context system handles per-operation enable/d
 
 enum rocp_ctrl_command {
     CMD_NONE        = 0,   // No pending command
-    CMD_ACTIVATE    = 1,   // Apply config + rocprofiler_start_context()
-    CMD_DEACTIVATE  = 2,   // rocprofiler_stop_context() (wrappers stay, Level 2 noop)
-    CMD_RECONFIGURE = 3,   // Update runtime filter (output, domains-to-emit, patterns)
+    CMD_CONFIGURE   = 1,   // First attach: dlopen SDK + force_configure with config
+    CMD_ACTIVATE    = 2,   // rocprofiler_start_context() (after CMD_CONFIGURE)
+    CMD_DEACTIVATE  = 3,   // rocprofiler_stop_context() (wrappers stay, Level 2 noop)
+    CMD_RECONFIGURE = 4,   // Update runtime filter (output, domains-to-emit, patterns)
+    CMD_STATUS      = 5,   // Query current state
                            //   without changing context activation state
 };
 
-/* Configuration the controller sends with CMD_ACTIVATE / CMD_RECONFIGURE.
+/* Configuration the controller sends with CMD_CONFIGURE / CMD_RECONFIGURE.
  * The tool's real_tool_initialize reads this to decide which
  * domains/services to register. */
 typedef struct {
@@ -158,7 +160,7 @@ typedef struct {
 
     /* Status (tool → controller, read-only from controller side) */
     _Atomic uint32_t context_active;  // 0 = inactive, 1 = active
-    _Atomic uint32_t context_id;      // rocprofiler_context_id_t.handle (0 if not yet configured)
+    _Atomic uint64_t context_id;      // rocprofiler_context_id_t.handle (0 if not yet configured)
     _Atomic uint64_t events_traced;
     _Atomic uint64_t events_dropped;
 

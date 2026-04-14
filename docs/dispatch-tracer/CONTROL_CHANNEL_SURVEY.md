@@ -327,12 +327,12 @@ We applied two hard filters:
 
 | Option | Hot-Path | Auth Model | Config | Filesystem Footprint |
 |--------|----------|------------|--------|---------------------|
-| **B** (mmap regular file) | ~10-20 ns | Directory `0700` + file `0600` | Command + status | `/run/user/<uid>/...` |
-| **F** (Unix domain socket) | ~10-20 ns | `SO_PEERCRED` (kernel-verified) | Full protocol | None (abstract namespace) |
-| **F+memfd** (Socket + anonymous shm) | ~10-20 ns | `SO_PEERCRED` | Command struct + protocol | None whatsoever |
-| **Signal + B or F** (Trigger + data channel) | ~10-20 ns | `kill()` UID check + paired channel | Via paired channel | Depends on pair |
+| **B** (mmap regular file) | **0 ns** | Directory `0700` + file `0600` | Command + status | `/run/user/<uid>/...` |
+| **F** (Unix domain socket) | **0 ns** | `SO_PEERCRED` (kernel-verified) | Full protocol | None (abstract namespace) |
+| **F+memfd** (Socket + anonymous shm) | **0 ns** | `SO_PEERCRED` | Command struct + protocol | None whatsoever |
+| **Signal + B or F** (Trigger + data channel) | **0 ns** | `kill()` UID check + paired channel | Via paired channel | Depends on pair |
 
-Hot-path overhead is from rocprofiler-sdk's existing `populate_contexts()` (~10-20 ns). The control channel itself adds zero to the hot path — it only toggles `rocprofiler_start_context()` / `rocprofiler_stop_context()` from a background thread or signal handler.
+**Before any controller attaches**, hot-path overhead is 0 ns because the stub library doesn't export `rocprofiler_configure`, so rocprofiler-register never loads rocprofiler-sdk — no wrappers are installed. **After detach** (controller previously attached and then deactivated), wrappers remain installed and `populate_contexts()` returns empty at ~10-20 ns per call (Level 2 noop).
 
 ## Detailed Comparison of Surviving Options
 
@@ -352,7 +352,8 @@ Hot-path overhead is from rocprofiler-sdk's existing `populate_contexts()` (~10-
 |-------|---|---|---------|----------|
 | Init (target side) | ~10 μs (open+mmap) | ~10 μs (socket+bind+listen+thread) | ~15 μs (socket+thread) | ~10 μs (sigaction+paired init) |
 | Attach (controller) | ~5 μs (open+mmap) | ~5 μs (connect+SO_PEERCRED) | ~10 μs (connect+memfd+SCM_RIGHTS) | ~5 μs (paired attach) |
-| Hot-path (noop) | ~10-20 ns (existing populate_contexts) | ~10-20 ns | ~10-20 ns | ~10-20 ns |
+| Hot-path (no attach) | 0 ns | 0 ns | 0 ns | 0 ns |
+| Hot-path (after detach, wrappers stay) | ~10-20 ns | ~10-20 ns | ~10-20 ns | ~10-20 ns |
 | Context toggle | ~1 ms (poll interval) | ~5 μs (socket recv) | ~50-100 ns (mmap write) + ~1 ms (poll) | ~1-5 μs (signal delivery) |
 
 ### Architecture Fit for rocprofiler-sdk
@@ -362,7 +363,7 @@ Hot-path overhead is from rocprofiler-sdk's existing `populate_contexts()` (~10-
 | Per-function enable | Existing `rocprofiler_configure_*` at init | Same | Same | Same |
 | Multi-runtime config | Single ctrl file per process | Single socket per process | Single socket + memfd | Single signal + paired channel |
 | Bidirectional (status queries) | Status fields in mmap | Yes (native) | Yes (socket) + fast status (memfd) | Limited |
-| Graceful detach | CMD_DEACTIVATE in mmap | Send CMD_DISABLE, get ACK | Send CMD_DISABLE, get ACK | Signal + paired |
+| Graceful detach | CMD_DEACTIVATE in mmap | Send CMD_DEACTIVATE, get ACK | Send CMD_DEACTIVATE, get ACK | Signal + paired |
 | Changes to rocprofiler-sdk | Minimal (tool lib + bg thread) | Same + socket protocol | Same + memfd + SCM_RIGHTS | Same + signal handler |
 
 ## Special Considerations

@@ -11,6 +11,7 @@ This directory contains the design documentation for adding an **external contro
 | [OPTION_F_UNIX_SOCKET.md](OPTION_F_UNIX_SOCKET.md) | Design using Unix domain socket with `SO_PEERCRED` — strongest authentication |
 | [OPTION_F_MEMFD.md](OPTION_F_MEMFD.md) | Design combining Unix socket auth with `memfd_create` anonymous shared memory — best overall for production |
 | [OPTION_SIGNAL.md](OPTION_SIGNAL.md) | Design using real-time signals as instant notification layered on top of B or F+memfd |
+| [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Measured benchmark results for all 4 options (noop, attach latency, active tracing) on AMD EPYC 9354 |
 
 ## Quick Comparison
 

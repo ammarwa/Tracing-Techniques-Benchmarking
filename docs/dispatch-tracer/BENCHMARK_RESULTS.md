@@ -188,7 +188,7 @@ Environment requirements:
 
 ## Raw Run Logs
 
-Attached to this repo under `docs/dispatch-tracer/raw_runs/` (not committed; regenerate via the benchmark script).
+Raw run logs are not committed to the repo — regenerate locally via the benchmark script below.
 
 ## Conclusion
 

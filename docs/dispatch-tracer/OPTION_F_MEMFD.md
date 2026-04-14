@@ -16,7 +16,7 @@ Same as all options — uses the **late-load design** described in [Option B](OP
 
 This option combines Option F's socket (for `SO_PEERCRED` authentication + bootstrap) with a memfd containing the `rocp_ctrl_t` struct (same layout as Option B). The differences from Option B: the control struct lives in anonymous memory (no filesystem), authentication is via `SO_PEERCRED`, and the memfd is handed off via `SCM_RIGHTS` rather than discovered by filesystem path.
 
-Line 17 correction: the background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE`.
+The background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE`.
 
 ## Architecture
 
