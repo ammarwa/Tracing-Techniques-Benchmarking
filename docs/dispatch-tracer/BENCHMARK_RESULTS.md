@@ -45,41 +45,56 @@ Wall-clock time from controller's `configure` command send to completion, measur
 
 | Channel | Mean | Median | Min |
 |---------|-----:|-------:|----:|
-| mmap   | 2.11 ms | 1.96 ms | 1.81 ms |
-| sock   | — (measurement flaky; controller `connect` races stub socket `listen` on some trials) | | |
-| memfd  | 2.22 ms | 1.93 ms | 1.80 ms |
-| signal | 2.46 ms | 2.48 ms | 2.03 ms |
+| mmap   | 1.84 ms | 1.98 ms | 1.31 ms |
+| sock   | 1.17 ms | 1.10 ms | 1.07 ms |
+| memfd  | 1.71 ms | 1.85 ms | 1.10 ms |
+| signal | 1.80 ms | 1.94 ms | 1.08 ms |
 
-All working channels land in the **~2 ms** range. The IPC mechanism contributes negligibly — latency is dominated by `dlopen()` of the tool library (~1.5 ms) plus `force_configure` + `update_table()` propagation. The sock channel's latency is within the same range in successful trials; the measurement harness needs a brief retry loop around `connect` to cope with the rare listen-before-accept race and is tracked as a harness flakiness rather than a channel defect.
+All four channels land in the **~1–2 ms** range and are within a few hundred microseconds of each other — the IPC mechanism contributes negligibly. Latency is dominated by the one-time `dlopen()` of the tool library plus `rocprofiler_force_configure()` + `update_table()` propagation through mock_register, which are the same for every channel. sock is marginally fastest because its protocol is a single `sendmsg`/`recvmsg` round-trip with no shared-memory handshake, while memfd and mmap have slightly more work (memfd hands off an fd via `SCM_RIGHTS`; mmap polls a version field). These differences would be masked by real rocprofiler-sdk's `dlopen` cost, which is larger than the mock's.
+
+_An earlier run of this benchmark reported mean 0 ms for sock because the harness used `shell=True` with `/usr/bin/time` as the wrapper, so `Popen.pid` was the shell/time wrapper's pid rather than the sample_app's; the stub's abstract-socket name is derived from the app's `getpid()`, so the controller tried to connect to a nonexistent rendezvous. Fixed by dropping the `time` wrapper (we measure wall time in Python instead) and spawning the app with `shell=False`._
 
 ## Active Tracing Overhead
 
-### Blended Measurement (controller attaches 300ms into a 500ms run)
+10 runs per cell with 2 warmup runs discarded (`scripts/benchmark_dispatch.py --quick --runs 10`). Each run reports `mean ± stdev`, `95% CI` is computed from stdev and sample count.
 
-500 iterations × 1000μs work. Controller attaches 300ms after app start (too late for WAIT_FOR_ATTACH sync on sock/memfd which lack a filesystem-visible ctrl file). The reported average is blended across noop-before-attach and active-after-attach. The **traced event count** confirms tracing works end-to-end.
+### Full Active Tracing (WAIT_FOR_ATTACH=1) — mmap and signal only
 
-| Channel | Avg ns/call | Events traced | Active fraction |
-|--------|-------------|---------------|-----------------|
-| mmap | 1,001,899 | 196 | ~39% |
-| sock | 1,001,779 | 197 | ~39% |
-| memfd | 1,000,405 | 196 | ~39% |
-| signal | 1,001,873 | 198 | ~40% |
+100,000 iterations of an empty function. The app blocks on the ctrl file until `context_active=1` before starting iterations, so the whole measurement is active tracing with wrappers installed.
 
-_At 1 ms/call, the per-call tracing overhead (hundreds of ns) is far below noise, so `avg_ns` shows ~1,000,050 regardless of option. The **event count** is the meaningful validation: with a 500 ms total run, 300 ms pre-attach + 200 ms active = ~200 active events expected. Actual 196-198 events confirms all four channels trace correctly._
+| Channel | Mean ns/call | Stdev | 95% CI | Active-tracing cost/call |
+|---------|-------------:|------:|-------:|-------------------------:|
+| Baseline (no stub)  | 3.60  | 0.52  | ±0.23 | 0 ns (no tracing) |
+| mmap                | 2,915 | 77.8  | ±88   | ~2,911 ns |
+| signal              | 2,493 | 7.4   | ±8    | ~2,489 ns |
 
-### Full Active Tracing (WAIT_FOR_ATTACH=1)
+Only mmap and signal have a filesystem-visible ctrl file that the app can poll via `WAIT_FOR_ATTACH=1`, so these are the only two channels where the empty-function measurement is fully "active" end-to-end. The ~2.5–2.9 µs/call cost is the mock SDK's wrapper path (populate_contexts + enter/exit callbacks + atomic stats stores + a `fprintf` into the trace file), not the IPC channel — the IPC channel is only touched by the background control thread, which is idle during the hot loop. **Signal is consistently ~400 ns faster than mmap here** purely because it doesn't have mmap's background poll thread spinning in `usleep(1000)`; otherwise the path is identical.
 
-10,000 iterations of empty function. App blocks until `context_active=1` before starting iterations, so the entire measurement reflects active tracing.
+_For reference: real rocprofiler-sdk's functor overhead (populate_contexts + enter/exit callbacks + buffer emplace) is ~50–200 ns. Our mock's higher cost is the per-event `fprintf` to a text file for verification, which dominates by an order of magnitude and is the same across all channels._
 
-| Channel | Avg ns/call | Events traced | Active-tracing cost/call |
-|--------|-------------|---------------|--------------------------|
-| Baseline | 6.04 | 0 | 0 ns (no tracing) |
-| mmap | 2,656 | 10,000 | ~2,650 ns |
-| signal | 5,959 | 10,000 | ~5,950 ns |
+### Blended Measurement (100 µs workload, controller attaches ~500 ms in)
 
-_Only mmap and signal support WAIT_FOR_ATTACH (they have a ctrl file at `/run/user/<uid>/rocprofiler/<pid>/ctrl` the app can poll). Signal's higher cost reflects additional work in its callback path (atomic stores for stats, output formatting) — these are **mock SDK implementation choices**, not IPC channel overheads. The IPC channel adds **zero** to the hot path; it's only used by the background thread to receive commands._
+Workload: 10,000 iterations × 100 µs simulated work = ~1 s run. Controller attaches after a fixed 0.3–0.5 s warmup. For sock and memfd, the app does not wait for attach (neither channel has a filesystem-visible ctrl primitive the app can poll before the memfd/socket is handed off), so the measurement blends iterations run before attach (noop, ~100,055 ns) with iterations run after attach (active, ~100,055 + wrapper cost ns). **The delta vs the corresponding noop column is the post-attach active cost averaged over the fraction of iterations that saw active tracing.**
 
-_For reference: real rocprofiler-sdk's functor overhead (populate_contexts + enter/exit callbacks + buffer emplace) is ~50-200 ns. Our mock's overhead is higher because it writes to a text file per event for verification, which dominates._
+| Channel | Noop mean (ns) | Active mean (ns) | Δ active−noop (ns) | Interpretation |
+|---------|---------------:|-----------------:|-------------------:|:---|
+| mmap    | 100,058 | 103,088 | +3,030 | Fully active (WAIT_FOR_ATTACH); full per-call wrapper cost visible |
+| signal  | 100,060 | 102,926 | +2,866 | Fully active (WAIT_FOR_ATTACH); matches mmap within noise |
+| sock    | 100,056 | 101,445 | +1,389 | Blended — about half of iterations ran before attach |
+| memfd   | 100,058 | 100,224 |   +166 | Blended — attach happened very late; most iterations ran as noop |
+
+The mmap and signal rows are the meaningful "active cost" rows here. sock and memfd show the blending effect — with no WAIT_FOR_ATTACH primitive, the "active" column understates per-call cost because the fraction of active iterations is small and variable. Event-count validation (~200 traced events per 0.5 s of active window) confirms tracing works end-to-end on all four channels; the per-call measurement is just less granular without WAIT_FOR_ATTACH.
+
+### Runtime Filter Rejection (filter_rejected phase)
+
+Configure with all domains disabled so the runtime filter (`g_runtime_domain_mask`) masks every event. Wrappers are still installed; each call still pays the wrapper prologue (populate_contexts + filter check) but the callback is skipped early.
+
+| Channel | Empty fn (ns) | 100 µs fn (ns) | Filter-path cost |
+|---------|-------------:|---------------:|:---|
+| mmap    | 2,513  | 103,003 | ~2,510 ns filter-rejected (vs 2,915 ns emit → filter saves ~400 ns) |
+| signal  | 2,518  | 103,062 | ~2,514 ns filter-rejected |
+
+Filter rejection shaves a few hundred ns off the "full emit" path — the callback body (atomic stats + fprintf) is the expensive part and is skipped when the filter rejects. In real rocprofiler-sdk the filter-rejected path would be ~20–40 ns (atomic load + branch) rather than ~2.5 µs, because real SDK wrappers don't do text-file I/O.
 
 ## Security Comparison
 

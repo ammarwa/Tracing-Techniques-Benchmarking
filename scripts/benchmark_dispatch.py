@@ -91,6 +91,7 @@ def bench_noop(option: str, scenario_name: str, work_us: int, iters: int) -> Ben
     env = {
         "LD_PRELOAD": str(stub),
         "LD_LIBRARY_PATH": str(BUILD_DIR / "lib"),
+        "ROCP_DISPATCH_LIB_DIR": str(BUILD_DIR / "lib"),
     }
     if work_us > 0:
         env["SIMULATED_WORK_US"] = str(work_us)
@@ -127,6 +128,7 @@ def bench_active(option: str, scenario_name: str, work_us: int, iters: int,
     env = {
         "LD_PRELOAD": str(stub),
         "LD_LIBRARY_PATH": str(BUILD_DIR / "lib"),
+        "ROCP_DISPATCH_LIB_DIR": str(BUILD_DIR / "lib"),
     }
     if work_us > 0:
         env["SIMULATED_WORK_US"] = str(work_us)
@@ -136,13 +138,15 @@ def bench_active(option: str, scenario_name: str, work_us: int, iters: int,
     if use_wait:
         env["WAIT_FOR_ATTACH"] = "1"
 
-    # Start the app in the background under /usr/bin/time
-    app_cmd = f'/usr/bin/time -f "wall_time=%e user_time=%U sys_time=%S max_rss=%M" {app} {iters}'
-
+    # Start the app directly (no /usr/bin/time wrapper — `time` forks+waits, so
+    # proc.pid would be time's pid not the app's, and the stub's abstract socket
+    # name comes from the app's getpid(). We measure wall time in Python instead.
+    app_argv = [str(app), str(iters)]
     full_env = dict(os.environ)
     full_env.update(env)
+    wall_t0 = time.perf_counter()
     proc = subprocess.Popen(
-        app_cmd, shell=True, env=full_env,
+        app_argv, env=full_env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
 
@@ -153,14 +157,12 @@ def bench_active(option: str, scenario_name: str, work_us: int, iters: int,
 
     # Attach the controller with configure command
     trace_path = f"/tmp/trace_{option}_{scenario_name.replace(' ', '_').replace('(', '').replace(')', '').replace('μ', 'u')}.txt"
-    if filter_reject:
-        # Configure with no domains enabled — runtime filter rejects everything
-        cfg_args = "configure --output text --out " + trace_path
-    else:
-        cfg_args = "configure --hip --output text --out " + trace_path
-    cfg_cmd = f"{ctrl} --pid {proc.pid} {cfg_args}"
+    cfg_argv = [str(ctrl), "--pid", str(proc.pid), "configure"]
+    if not filter_reject:
+        cfg_argv.append("--hip")
+    cfg_argv += ["--output", "text", "--out", trace_path]
     try:
-        cr = run(cfg_cmd, timeout=10)
+        cr = subprocess.run(cfg_argv, timeout=10, capture_output=True, text=True)
         if cr.returncode != 0:
             print(f"    [WARN] configure failed for {option} {scenario_name}: rc={cr.returncode}")
             print(f"           stderr: {cr.stderr[:200]}")
@@ -180,7 +182,7 @@ def bench_active(option: str, scenario_name: str, work_us: int, iters: int,
     except OSError:
         pass
 
-    td = parse_time(stderr)
+    wall_time_s = time.perf_counter() - wall_t0
     ad = parse_app(stdout)
     suffix = "filter_rejected" if filter_reject else "active"
     return BenchmarkResult(
@@ -188,10 +190,10 @@ def bench_active(option: str, scenario_name: str, work_us: int, iters: int,
         method=f"dispatch_{option}_{suffix}",
         iterations=iters,
         simulated_work_us=work_us,
-        wall_time_s=td.get("wall_time", 0),
-        user_cpu_s=td.get("user_time", 0),
-        system_cpu_s=td.get("sys_time", 0),
-        max_rss_kb=int(td.get("max_rss", 0)),
+        wall_time_s=wall_time_s,
+        user_cpu_s=0,
+        system_cpu_s=0,
+        max_rss_kb=0,
         avg_time_per_call_ns=ad.get("avg_time_ns", 0),
     )
 
@@ -206,11 +208,15 @@ def bench_attach_latency(option: str) -> Dict[str, float]:
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(stub)
     env["LD_LIBRARY_PATH"] = str(BUILD_DIR / "lib")
+    env["ROCP_DISPATCH_LIB_DIR"] = str(BUILD_DIR / "lib")
     env["SIMULATED_WORK_US"] = "100"  # moderate work so app stays alive
 
-    # Launch a long-running app (100k iters x 100us = 10s)
+    # Launch a long-running app (100k iters x 100us = 10s). Pass argv directly
+    # (shell=False) so proc.pid == actual app PID; with shell=True we'd get the
+    # bash intermediary's pid, and the stub's abstract socket uses getpid(), so
+    # the controller would connect to a nonexistent name.
     proc = subprocess.Popen(
-        f"{app} 100000", shell=True, env=env,
+        [str(app), "100000"], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     time.sleep(0.3)
@@ -218,10 +224,11 @@ def bench_attach_latency(option: str) -> Dict[str, float]:
     latencies = []
     for trial in range(5):
         trace_path = f"/tmp/trace_{option}_attach_lat_{trial}.txt"
-        cfg_cmd = f"{ctrl} --pid {proc.pid} configure --hip --output text --out {trace_path}"
+        cfg_argv = [str(ctrl), "--pid", str(proc.pid), "configure",
+                    "--hip", "--output", "text", "--out", trace_path]
         t0 = time.perf_counter()
         try:
-            subprocess.run(cfg_cmd, shell=True, timeout=10,
+            subprocess.run(cfg_argv, timeout=10,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
             t1 = time.perf_counter()
             latencies.append((t1 - t0) * 1000.0)  # ms
@@ -229,7 +236,7 @@ def bench_attach_latency(option: str) -> Dict[str, float]:
             pass
         # Deactivate between trials so CMD_CONFIGURE matters (though after 1st call
         # it becomes a CMD_RECONFIGURE internally — still good measure)
-        subprocess.run(f"{ctrl} --pid {proc.pid} deactivate", shell=True,
+        subprocess.run([str(ctrl), "--pid", str(proc.pid), "deactivate"],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.1)
         try:
@@ -295,6 +302,21 @@ def main():
 
     all_results: List[BenchmarkResult] = []
     attach_latencies: Dict[str, Dict[str, float]] = {}
+    # Per-cell (option, scenario, phase) sample arrays with stats, for the report
+    stats_by_cell: Dict[str, Dict[str, float]] = {}
+
+    WARMUP_RUNS = 2  # discarded runs to steady CPU freq / caches before sampling
+
+    def summarise(samples: List[float]) -> Dict[str, float]:
+        if not samples:
+            return {"runs": 0, "mean_ns": 0, "stdev_ns": 0,
+                    "ci95_ns": 0, "min_ns": 0, "max_ns": 0, "median_ns": 0}
+        mean = statistics.mean(samples)
+        stdev = statistics.stdev(samples) if len(samples) > 1 else 0.0
+        ci95 = 1.96 * stdev / (len(samples) ** 0.5) if len(samples) > 1 else 0.0
+        return {"runs": len(samples), "mean_ns": mean, "stdev_ns": stdev,
+                "ci95_ns": ci95, "min_ns": min(samples), "max_ns": max(samples),
+                "median_ns": statistics.median(samples)}
 
     for opt in options:
         print(f"\n### Option: {opt.upper()} ###")
@@ -312,38 +334,51 @@ def main():
         for (sc_name, work_us, iters) in scenarios:
             print(f"  {sc_name} (work={work_us}us, iters={iters})")
 
-            # noop phase
-            noop_results = []
-            for run_i in range(runs):
-                noop_results.append(bench_noop(opt, sc_name, work_us, iters))
-            avg_noop_ns = statistics.mean(r.avg_time_per_call_ns for r in noop_results)
-            print(f"    noop:     {avg_noop_ns:9.2f} ns/call")
-            # Aggregate: use the median run as representative
+            # ----- noop phase -----
+            for _ in range(WARMUP_RUNS):
+                try: bench_noop(opt, sc_name, work_us, iters)
+                except Exception: pass
+            noop_results = [bench_noop(opt, sc_name, work_us, iters) for _ in range(runs)]
+            noop_samples = [r.avg_time_per_call_ns for r in noop_results]
+            s = summarise(noop_samples)
+            stats_by_cell[f"{opt}|{sc_name}|noop"] = {**s, "samples_ns": noop_samples}
+            print(f"    noop:     mean={s['mean_ns']:9.2f} ns  stdev={s['stdev_ns']:7.2f}  "
+                  f"95% CI=±{s['ci95_ns']:.2f}")
             noop_results.sort(key=lambda r: r.avg_time_per_call_ns)
             all_results.append(noop_results[len(noop_results) // 2])
 
-            # active phase
+            # ----- active phase -----
+            for _ in range(WARMUP_RUNS):
+                try: bench_active(opt, sc_name, work_us, iters, filter_reject=False)
+                except Exception: pass
             active_results = []
-            for run_i in range(runs):
+            for _ in range(runs):
                 r = bench_active(opt, sc_name, work_us, iters, filter_reject=False)
-                if r is not None:
-                    active_results.append(r)
+                if r is not None: active_results.append(r)
             if active_results:
-                avg_active_ns = statistics.mean(r.avg_time_per_call_ns for r in active_results)
-                print(f"    active:   {avg_active_ns:9.2f} ns/call")
+                active_samples = [r.avg_time_per_call_ns for r in active_results]
+                s = summarise(active_samples)
+                stats_by_cell[f"{opt}|{sc_name}|active"] = {**s, "samples_ns": active_samples}
+                print(f"    active:   mean={s['mean_ns']:9.2f} ns  stdev={s['stdev_ns']:7.2f}  "
+                      f"95% CI=±{s['ci95_ns']:.2f}")
                 active_results.sort(key=lambda r: r.avg_time_per_call_ns)
                 all_results.append(active_results[len(active_results) // 2])
 
-            # filter_rejected phase (only for scenarios where active mattered)
-            if work_us <= 100:  # skip slow scenarios to save time
+            # ----- filter_rejected phase (only for fast scenarios) -----
+            if work_us <= 100:
+                for _ in range(WARMUP_RUNS):
+                    try: bench_active(opt, sc_name, work_us, iters, filter_reject=True)
+                    except Exception: pass
                 fr_results = []
-                for run_i in range(runs):
+                for _ in range(runs):
                     r = bench_active(opt, sc_name, work_us, iters, filter_reject=True)
-                    if r is not None:
-                        fr_results.append(r)
+                    if r is not None: fr_results.append(r)
                 if fr_results:
-                    avg_fr_ns = statistics.mean(r.avg_time_per_call_ns for r in fr_results)
-                    print(f"    filtered: {avg_fr_ns:9.2f} ns/call")
+                    fr_samples = [r.avg_time_per_call_ns for r in fr_results]
+                    s = summarise(fr_samples)
+                    stats_by_cell[f"{opt}|{sc_name}|filtered"] = {**s, "samples_ns": fr_samples}
+                    print(f"    filtered: mean={s['mean_ns']:9.2f} ns  stdev={s['stdev_ns']:7.2f}  "
+                          f"95% CI=±{s['ci95_ns']:.2f}")
                     fr_results.sort(key=lambda r: r.avg_time_per_call_ns)
                     all_results.append(fr_results[len(fr_results) // 2])
 
@@ -355,7 +390,9 @@ def main():
         "options": options,
         "scenarios": [{"name": s[0], "work_us": s[1], "iterations": s[2]} for s in scenarios],
         "runs_per_cell": runs,
+        "warmup_runs_per_cell": WARMUP_RUNS,
         "attach_latencies_ms": attach_latencies,
+        "cell_stats": stats_by_cell,
         "results": [asdict(r) for r in all_results],
     }
     with open(out, "w") as f:
