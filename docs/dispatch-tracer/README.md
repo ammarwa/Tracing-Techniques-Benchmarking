@@ -10,17 +10,17 @@ This directory contains the design documentation for adding an **external contro
 | [OPTION_B_MMAP_FILE.md](OPTION_B_MMAP_FILE.md) | Design using memory-mapped regular file under `/run/user/<uid>/` — simplest control channel |
 | [OPTION_F_UNIX_SOCKET.md](OPTION_F_UNIX_SOCKET.md) | Design using Unix domain socket with `SO_PEERCRED` — strongest authentication |
 | [OPTION_F_MEMFD.md](OPTION_F_MEMFD.md) | Design combining Unix socket auth with `memfd_create` anonymous shared memory — best overall for production |
-| [OPTION_SIGNAL.md](OPTION_SIGNAL.md) | Design using real-time signals as instant notification layered on top of B or F+memfd |
+| [OPTION_SIGNAL.md](OPTION_SIGNAL.md) | Design using real-time signals as instant notification layered on top of mmap or memfd |
 | [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Measured benchmark results for all 4 options (noop, attach latency, active tracing) on AMD EPYC 9354 |
 
 ## Quick Comparison
 
-| Option | Hot-Path (no attach) | Hot-Path (active) | Auth Model | Best For |
+| Channel | Hot-Path (no attach) | Hot-Path (active) | Auth Model | Best For |
 |--------|----------------------|-------------------|------------|----------|
-| **B** (mmap file) | **0 ns** | ~50-200 ns | Dir `0700` + file `0600` | Simplicity |
-| **F** (Unix socket) | **0 ns** | ~50-200 ns | `SO_PEERCRED` (kernel-verified) | Authentication |
-| **F+memfd** | **0 ns** | ~50-200 ns | `SO_PEERCRED` + anonymous memory | Production |
-| **Signal+B/F** | **0 ns** | ~50-200 ns | `kill()` UID + paired channel | Instant attach |
+| **mmap** (file) | **0 ns** | ~50-200 ns | Dir `0700` + file `0600` | Simplicity |
+| **socket** (Unix domain) | **0 ns** | ~50-200 ns | `SO_PEERCRED` (kernel-verified) | Authentication |
+| **memfd** (socket + anonymous shm) | **0 ns** | ~50-200 ns | `SO_PEERCRED` + anonymous memory | Production |
+| **signal** (+ mmap or memfd) | **0 ns** | ~50-200 ns | `kill()` UID + paired channel | Instant attach |
 
 **Late-load architecture**: A small **stub library** is preloaded that does NOT export `rocprofiler_configure`, so rocprofiler-register sees no tool and does NOT load rocprofiler-sdk. Original function pointers remain in the dispatch tables. The application runs at native speed.
 

@@ -1,14 +1,14 @@
-# Option Signal+B/F: Dispatch Tracer with Signal-Triggered Data Channel
+# signal: Dispatch Tracer with Signal-Triggered Data Channel
 
 ## Overview
 
-This design uses a **real-time signal** (`SIGRTMIN+n`) as an instant notification mechanism combined with a **data channel** (Option B or F) for configuration. The signal solves the one limitation shared by all other options: **notification latency**. Without signals, the library must poll a flag on every intercepted call (which it already does). With signals, a background thread can block-wait with zero CPU cost and be woken instantly when the controller wants to change configuration.
+This design uses a **real-time signal** (`SIGRTMIN+n`) as an instant notification mechanism combined with a **data channel** (mmap or memfd) for configuration. The signal solves the one limitation shared by all other channels: **notification latency**. Without signals, the library must poll a flag on every intercepted call (which it already does). With signals, a background thread can block-wait with zero CPU cost and be woken instantly when the controller wants to change configuration.
 
-This is not a standalone option — it's an **enhancement** layered on top of B (mmap file) or F/F+memfd (Unix socket) to add instant, zero-CPU-cost notification for configuration changes.
+This is not a standalone channel — it's an **enhancement** layered on top of mmap (file) or memfd (socket + anonymous shm) to add instant, zero-CPU-cost notification for configuration changes.
 
 ## Why Signals?
 
-Under the late-load architecture (see [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture)), **before any controller attaches, no wrappers exist** — rocprofiler-sdk is not loaded, the dispatch tables still point at original function pointers, and the hot path cost is **0 ns**. There is no `populate_contexts()` check happening per call yet, because the SDK has not been configured.
+Under the late-load architecture (see [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture)), **before any controller attaches, no wrappers exist** — rocprofiler-sdk is not loaded, the dispatch tables still point at original function pointers, and the hot path cost is **0 ns**. There is no `populate_contexts()` check happening per call yet, because the SDK has not been configured.
 
 Signals become valuable precisely because of this architecture: the first attach (`CMD_CONFIGURE`) triggers heavy one-shot work — `dlopen("librocprofiler-sdk-tool.so")`, symbol resolution, `rocprofiler_force_configure()`, runtime API-table re-propagation, and `update_table()` wrapper installation. This work typically takes **~5-50 ms** and must happen off the hot path on a background thread. A sleeping `poll()`-based background thread costs 0 CPU; a real-time signal wakes it within ~1-5 μs of the controller's `sigqueue()`, so attach latency is dominated by the unavoidable dlopen work, not by polling interval.
 
@@ -82,7 +82,7 @@ Signals are also valuable for:
 └──────────────────────┬──────────────────────────────────────────┘
                        │
                        │ SIGRTMIN+7 via sigqueue()
-                       │ + paired data channel (B: mmap file, or F+memfd)
+                       │ + paired data channel (mmap file, or memfd)
                        │
 ┌──────────────────────▼──────────────────────────────────────────┐
 │                    Controller                                    │
@@ -142,7 +142,7 @@ static void sig_handler(int sig, siginfo_t *info, void *ucontext) {
 
 ## Combination Variants
 
-### Signal + B (mmap file)
+### Signal + mmap (file)
 
 ```
 Controller writes config to /run/user/<uid>/dispatch/<pid>/ctrl
@@ -154,7 +154,7 @@ Library bg thread wakes, reads ctrl file, applies config
 - Config update latency: ~1-5 μs (signal delivery)
 - No bidirectional communication
 
-### Signal + F+memfd (Unix socket + anonymous shm)
+### Signal + memfd (Unix socket + anonymous shm)
 
 ```
 Phase 1 (bootstrap): Socket connect + SO_PEERCRED + SCM_RIGHTS memfd
@@ -169,13 +169,13 @@ Phase 3 (queries): Controller uses socket for CMD_STATUS, CMD_FLUSH
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — uses the **late-load design** in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): stub preloaded (no `rocprofiler_configure` symbol, 0 ns hot path), SDK `dlopen`'d at attach via `rocprofiler_force_configure()`.
+Same as all options — uses the **late-load design** in [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): stub preloaded (no `rocprofiler_configure` symbol, 0 ns hot path), SDK `dlopen`'d at attach via `rocprofiler_force_configure()`.
 
 The signal serves as an instant wake mechanism for the stub's background thread. When woken, the thread reads the paired data channel (mmap or memfd) and dispatches: `CMD_CONFIGURE` → dlopen SDK + force_configure (first attach only), `CMD_ACTIVATE` → `rocprofiler_start_context()`, `CMD_DEACTIVATE` → `rocprofiler_stop_context()`, `CMD_RECONFIGURE` → atomic update of the runtime filter. The signal handler itself only writes a wake byte to a pipe — all SDK/dlopen work happens in the background thread.
 
 ## Control Structure
 
-The control struct, command enum, and `rocp_config_t` layout are identical to Option B. The canonical command enum lives in [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) and defines:
+The control struct, command enum, and `rocp_config_t` layout are identical to mmap. The canonical command enum lives in [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) and defines:
 
 ```c
 enum rocp_ctrl_command {
@@ -189,7 +189,7 @@ enum rocp_ctrl_command {
 };
 ```
 
-See Option B's [Control Structure section](OPTION_B_MMAP_FILE.md#control-structure) for the full `rocp_ctrl_t` layout and field semantics.
+See mmap's [Control Structure section](OPTION_B_MMAP_FILE.md#control-structure) for the full `rocp_ctrl_t` layout and field semantics.
 
 ## Components
 
@@ -207,7 +207,7 @@ static rocprofiler_context_id_t saved_ctx;
 static void* sdk_handle = NULL;
 
 /* Exported accessor — tool calls this after being dlopen'd at attach time.
- * Same pattern as Option B to avoid extern cross-DSO globals. */
+ * Same pattern as mmap to avoid extern cross-DSO globals. */
 typedef struct {
     rocp_ctrl_t* ctrl;
     rocp_config_t* pending_config;
@@ -251,7 +251,7 @@ static void stub_init(void) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGRTMIN + 7, &sa, NULL);
 
-    /* Set up paired data channel (mmap file or memfd — same as Option B/F+memfd) */
+    /* Set up paired data channel (mmap file or memfd — same as mmap/memfd) */
     init_data_channel(&ctrl);
 
     /* Spawn bg thread (joinable for clean shutdown) */
@@ -261,11 +261,11 @@ static void stub_init(void) {
 
 ### 2. Background Thread (signal-woken dispatcher, dlopens SDK on first CMD_CONFIGURE)
 
-The bg thread mirrors Option B's `control_poll_loop` — same command dispatch, same `load_sdk_and_configure()` sequence — but blocks on `poll(wakeup_pipe)` instead of busy-polling a version counter. The signal wakes it within ~1-5 μs.
+The bg thread mirrors mmap's `control_poll_loop` — same command dispatch, same `load_sdk_and_configure()` sequence — but blocks on `poll(wakeup_pipe)` instead of busy-polling a version counter. The signal wakes it within ~1-5 μs.
 
 ```c
 /* On first CMD_CONFIGURE: dlopen rocprofiler-sdk-tool, resolve symbols
- * via RTLD_DEFAULT, call force_configure. Identical to Option B. */
+ * via RTLD_DEFAULT, call force_configure. Identical to mmap. */
 static rocprofiler_status_t (*p_force_configure)(rocprofiler_configure_func_t);
 static rocprofiler_status_t (*p_start_context)(rocprofiler_context_id_t);
 static rocprofiler_status_t (*p_stop_context)(rocprofiler_context_id_t);
@@ -358,7 +358,7 @@ static void* control_poll_loop(void* arg) {
 
 ### 3. Tool Library (`librocprofiler-sdk-tool.so` — dlopen'd at attach)
 
-Identical to [Option B's tool library](OPTION_B_MMAP_FILE.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach): exports `rocprofiler_configure`, its `tool_initialize` calls `rocp_stub_get_state()` to retrieve the pending config, registers the controller-selected domains, and calls `rocprofiler_start_context()`.
+Identical to [mmap's tool library](OPTION_B_MMAP_FILE.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach): exports `rocprofiler_configure`, its `tool_initialize` calls `rocp_stub_get_state()` to retrieve the pending config, registers the controller-selected domains, and calls `rocprofiler_start_context()`.
 
 ### 4. Controller
 
@@ -381,7 +381,7 @@ if (ret < 0) {
 |----------|------------|
 | **Signal delivery auth** | Kernel-enforced UID check on `sigqueue()` — unforgeable |
 | **Handler UID verification** | `info->si_uid` double-check in handler |
-| **Data channel auth** | Depends on paired option (B: file mode, F+memfd: SO_PEERCRED) |
+| **Data channel auth** | Depends on paired option (B: file mode, memfd: SO_PEERCRED) |
 | **Signal number conflict** | Low risk — SIGRTMIN+7 is in the application-reserved range |
 | **Signal flood** | RT signals are queued (up to `RLIMIT_SIGPENDING`); excess are dropped with `EAGAIN` |
 
@@ -424,10 +424,10 @@ This avoids per-runtime socket round-trips and ensures all runtimes activate sim
 
 ```
 src/tools/rocprofiler_tool_signal/
-├── rocp_signal.h              # Signal number, rocp_ctrl_t (same as Option B)
+├── rocp_signal.h              # Signal number, rocp_ctrl_t (same as mmap)
 ├── rocp_stub_signal.c         # Stub library: sig handler + bg thread (preloaded, no rocprofiler_configure)
 ├── rocp_signal_tool.c         # SDK tool library (dlopen'd at attach, exports rocprofiler_configure)
-├── rocp_signal_data.c         # Paired data-channel integration (B or F+memfd)
+├── rocp_signal_data.c         # Paired data-channel integration (B or memfd)
 └── rocp_signal_controller.c   # CLI controller
 ```
 
@@ -482,15 +482,15 @@ build/bin/rocp_ctrl_signal --pid $! deactivate
 1. **Signal handler context** — Only async-signal-safe functions allowed in the handler. Our handler only sets an atomic flag and writes 1 byte to a pipe (both safe).
 2. **Signal conflict** — If the application also uses `SIGRTMIN+7`, our handler clobbers theirs. Mitigated by using a configurable signal number via environment variable (`DISPATCH_SIGNAL=SIGRTMIN+9`).
 3. **Signal queuing limit** — `RLIMIT_SIGPENDING` (default ~128K) limits queued signals. Not a concern for config changes (rare events).
-4. **Background thread** — Same overhead as Options F/F+memfd (~2 MB default stack). Thread must be joinable so `tool_finalize()` (called via `atexit()`) can shut it down cleanly.
+4. **Background thread** — Same overhead as socket/memfd (~2 MB default stack). Thread must be joinable so `tool_finalize()` (called via `atexit()`) can shut it down cleanly.
 5. **Lost wakeup recovery** — If signal handler fires when the self-pipe is full (`O_NONBLOCK`), the wakeup byte is silently dropped. The background thread uses `poll()` with a 30-second timeout as a fallback, so config changes are eventually applied even under signal flood.
 6. **Signal number coordination** — The controller and library must use the same signal number. If both sides are configured independently via environment variables (`DISPATCH_SIGNAL`), a mismatch causes silent failure. The controller should verify via `/proc/<pid>/status` SigCgt mask that the expected signal is registered.
 7. **fork() behavior** — After `fork()`, the signal handler is inherited but the background thread is not. A `pthread_atfork()` child handler should reset the signal handler to SIG_DFL, close the pipe, and set `finalize_status = 1` so the child's atexit handler skips cleanup.
 8. **Complexity** — This is a composite option (signal + data channel), so it has more moving parts than B or F alone. The benefit is instant notification for heavy config changes.
 9. **Overhead estimates are pre-implementation** — All timing figures should be validated with benchmarks after implementation.
 
-## When to Use This Option
+## When to Use This Channel
 
-- **Use Signal+B** when you want the simplest possible approach with instant notification and no socket overhead.
-- **Use Signal+F+memfd** when you need the strongest security (SO_PEERCRED) plus instant notification plus zero filesystem footprint.
-- **Skip signals** (use B or F+memfd alone) when the hot-path polling is sufficient and you don't need background config setup.
+- **Use signal** when you want the simplest possible approach with instant notification and no socket overhead.
+- **Use Signal+memfd** when you need the strongest security (SO_PEERCRED) plus instant notification plus zero filesystem footprint.
+- **Skip signals** (use B or memfd alone) when the hot-path polling is sufficient and you don't need background config setup.

@@ -270,9 +270,9 @@ The "Hot-Path Cost" column below shows the **raw IPC mechanism cost** (atomic lo
 | ID | Mechanism | IPC Check Cost | Requires | Security |
 |----|-----------|---------------|----------|----------|
 | F | Unix domain socket | ~1-5 ns (local atomic) | Nothing | `SO_PEERCRED` (kernel-verified effective UID/PID) |
-| F+memfd | Unix socket + `memfd_create` | ~1-5 ns (mmap'd memfd) | Nothing | `SO_PEERCRED` + no filesystem entry |
+| memfd | Unix socket + `memfd_create` | ~1-5 ns (mmap'd memfd) | Nothing | `SO_PEERCRED` + no filesystem entry |
 
-**How they work:** The tool library creates a listener socket (abstract namespace) and spawns a background thread during its `initialize` callback. The controller connects, is authenticated via `SO_PEERCRED` (kernel-verified effective UID/GID at connect time, unforgeable), and sends commands. The background thread calls `rocprofiler_start_context()` / `rocprofiler_stop_context()`. No socket I/O on the hot path — the hot path is entirely within rocprofiler-sdk's existing `populate_contexts()`. The F+memfd variant adds `memfd_create` for anonymous shared memory passed via `SCM_RIGHTS`, enabling the controller to write commands directly to mmap'd memory.
+**How they work:** The tool library creates a listener socket (abstract namespace) and spawns a background thread during its `initialize` callback. The controller connects, is authenticated via `SO_PEERCRED` (kernel-verified effective UID/GID at connect time, unforgeable), and sends commands. The background thread calls `rocprofiler_start_context()` / `rocprofiler_stop_context()`. No socket I/O on the hot path — the hot path is entirely within rocprofiler-sdk's existing `populate_contexts()`. The memfd variant adds `memfd_create` for anonymous shared memory passed via `SCM_RIGHTS`, enabling the controller to write commands directly to mmap'd memory.
 
 ### Category 4: Direct Memory Access
 
@@ -290,7 +290,7 @@ The "Hot-Path Cost" column below shows the **raw IPC mechanism cost** (atomic lo
 | J | SIGUSR1/SIGUSR2 | ~1-5 ns (`sig_atomic_t`) | Nothing | `kill()` UID check |
 | K | Real-time signal (SIGRTMIN+n) | ~1-5 ns | Nothing | `kill()` UID check |
 
-**How they work:** The tool library registers a signal handler during its `initialize` callback. The controller sends `kill(target_pid, SIGUSR1)`. The kernel enforces that only processes with the same UID can send signals. Carries zero configuration data (SIGUSR1/2) or one `int` via `sigqueue()` (real-time signals). Useful as an instant wakeup trigger paired with a data channel (B or F+memfd) for the actual command.
+**How they work:** The tool library registers a signal handler during its `initialize` callback. The controller sends `kill(target_pid, SIGUSR1)`. The kernel enforces that only processes with the same UID can send signals. Carries zero configuration data (SIGUSR1/2) or one `int` via `sigqueue()` (real-time signals). Useful as an instant wakeup trigger paired with a data channel (B or memfd) for the actual command.
 
 ### Category 6: Code Injection
 
@@ -325,12 +325,12 @@ We applied two hard filters:
 
 ### What Survived
 
-| Option | Hot-Path | Auth Model | Config | Filesystem Footprint |
-|--------|----------|------------|--------|---------------------|
-| **B** (mmap regular file) | **0 ns** | Directory `0700` + file `0600` | Command + status | `/run/user/<uid>/...` |
-| **F** (Unix domain socket) | **0 ns** | `SO_PEERCRED` (kernel-verified) | Full protocol | None (abstract namespace) |
-| **F+memfd** (Socket + anonymous shm) | **0 ns** | `SO_PEERCRED` | Command struct + protocol | None whatsoever |
-| **Signal + B or F** (Trigger + data channel) | **0 ns** | `kill()` UID check + paired channel | Via paired channel | Depends on pair |
+| Channel | Hot-Path | Auth Model | Config | Filesystem Footprint |
+|---------|----------|------------|--------|---------------------|
+| **mmap** (regular file) | **0 ns** | Directory `0700` + file `0600` | Command + status | `/run/user/<uid>/...` |
+| **socket** (Unix domain) | **0 ns** | `SO_PEERCRED` (kernel-verified) | Full protocol | None (abstract namespace) |
+| **memfd** (socket + anonymous shm) | **0 ns** | `SO_PEERCRED` | Command struct + protocol | None whatsoever |
+| **signal** (trigger + mmap/memfd data channel) | **0 ns** | `kill()` UID check + paired channel | Via paired channel | Depends on pair |
 
 **Before any controller attaches**, hot-path overhead is 0 ns because the stub library doesn't export `rocprofiler_configure`, so rocprofiler-register never loads rocprofiler-sdk — no wrappers are installed. **After detach** (controller previously attached and then deactivated), wrappers remain installed and `populate_contexts()` returns empty at ~10-20 ns per call (Level 2 noop).
 
@@ -338,7 +338,7 @@ We applied two hard filters:
 
 ### Security Comparison
 
-| Threat | B (mmap file) | F (Unix socket) | F+memfd | Signal+paired |
+| Threat | mmap (file) | socket (Unix socket) | memfd | signal |
 |--------|---------------|-----------------|---------|---------------|
 | Other user reads config | Blocked (0700 dir) | Blocked (SO_PEERCRED) | Blocked (SO_PEERCRED) | Blocked (kill UID) |
 | Other user modifies config | Blocked (0700 dir) | Blocked (SO_PEERCRED) | Blocked (SO_PEERCRED) | Blocked (kill UID) |
@@ -348,7 +348,7 @@ We applied two hard filters:
 
 ### Overhead Comparison
 
-| Phase | B | F | F+memfd | Signal+B |
+| Phase | B | F | memfd | signal |
 |-------|---|---|---------|----------|
 | Init (target side) | ~10 μs (open+mmap) | ~10 μs (socket+bind+listen+thread) | ~15 μs (socket+thread) | ~10 μs (sigaction+paired init) |
 | Attach (controller) | ~5 μs (open+mmap) | ~5 μs (connect+SO_PEERCRED) | ~10 μs (connect+memfd+SCM_RIGHTS) | ~5 μs (paired attach) |
@@ -358,7 +358,7 @@ We applied two hard filters:
 
 ### Architecture Fit for rocprofiler-sdk
 
-| Aspect | B | F | F+memfd | Signal+B |
+| Aspect | B | F | memfd | signal |
 |--------|---|---|---------|----------|
 | Per-function enable | Existing `rocprofiler_configure_*` at init | Same | Same | Same |
 | Multi-runtime config | Single ctrl file per process | Single socket per process | Single socket + memfd | Single signal + paired channel |
@@ -453,14 +453,14 @@ The late-load design provides full late configuration without ptrace. Here is th
 
 ### Cross-Platform Considerations
 
-All four surviving control channel options (B, F, F+memfd, Signal) are **Linux-specific**:
+All four surviving control channel options (B, F, memfd, Signal) are **Linux-specific**:
 
-- Abstract Unix sockets (Options F, F+memfd) are Linux-only (not macOS/BSD)
-- `memfd_create` (Option F+memfd) is Linux-only
-- `/run/user/<uid>/` (Option B) depends on systemd
-- Real-time signals with `sigqueue` (Option Signal) are POSIX but behavior varies
+- Abstract Unix sockets (Options F, memfd) are Linux-only (not macOS/BSD)
+- `memfd_create` (memfd) is Linux-only
+- `/run/user/<uid>/` (mmap) depends on systemd
+- Real-time signals with `sigqueue` (signal) are POSIX but behavior varies
 
-For future cross-platform support, Option B could fall back to a platform-appropriate temp directory, and Option F could fall back to filesystem-namespace Unix sockets. The dispatch table mechanism itself (atomic load + function pointer check) is portable to any platform with C11 atomics.
+For future cross-platform support, mmap could fall back to a platform-appropriate temp directory, and socket could fall back to filesystem-namespace Unix sockets. The dispatch table mechanism itself (atomic load + function pointer check) is portable to any platform with C11 atomics.
 
 ## Recommendation
 
@@ -468,15 +468,15 @@ The four surviving options each have distinct strengths:
 
 - **B** is the simplest — minimal code, one background thread, no sockets. Best for straightforward enable/disable.
 - **F** has the strongest authentication — kernel-verified identity on every connection. Best for security-sensitive deployments.
-- **F+memfd** combines F's authentication with mmap-speed config access and zero filesystem footprint. Best overall for production.
-- **Signal+B/F** adds instant notification without polling. Useful as an enhancement to B or F.
+- **memfd** combines F's authentication with mmap-speed config access and zero filesystem footprint. Best overall for production.
+- **signal** adds instant notification without polling. Useful as an enhancement to mmap or memfd.
 
 Each option is designed in detail in its own document:
 
-- [Option B Design: mmap Regular File](OPTION_B_MMAP_FILE.md)
-- [Option F Design: Unix Domain Socket](OPTION_F_UNIX_SOCKET.md)
-- [Option F+memfd Design: Socket + Anonymous Shared Memory](OPTION_F_MEMFD.md)
-- [Option Signal+B/F Design: Signal-Triggered Data Channel](OPTION_SIGNAL.md)
+- [mmap Design: mmap Regular File](OPTION_B_MMAP_FILE.md)
+- [socket Design: Unix Domain Socket](OPTION_F_UNIX_SOCKET.md)
+- [memfd Design: Socket + Anonymous Shared Memory](OPTION_F_MEMFD.md)
+- [signal Design: Signal-Triggered Data Channel](OPTION_SIGNAL.md)
 
 ## References
 

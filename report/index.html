@@ -830,7 +830,7 @@
 <li><b>All 4 options achieve 0 ns hot-path overhead</b> when no controller is attached — late-load design works as specified.</li>
 <li><b>Attach latency 2-3 ms</b> across all options, dominated by dlopen + SDK initialize, not the IPC channel.</li>
 <li><b>No sudo, no capabilities, no specific kernel version</b> required for any option.</li>
-<li><b>Recommended for production:</b> Option F+memfd (strongest security with zero filesystem footprint).</li>
+<li><b>Recommended for production:</b> memfd channel (strongest security with zero filesystem footprint).</li>
 </ul>
 
 <p>Full analysis and reproduction steps: <a href="../docs/dispatch-tracer/BENCHMARK_RESULTS.md">BENCHMARK_RESULTS.md</a>. Raw data: <a href="dispatch_results.json">dispatch_results.json</a>.</p>

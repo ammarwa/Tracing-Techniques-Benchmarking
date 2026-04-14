@@ -1,10 +1,10 @@
-# Option F+memfd: Dispatch Tracer with Socket + Anonymous Shared Memory
+# memfd: Dispatch Tracer with Socket + Anonymous Shared Memory
 
 ## Overview
 
-This design combines the **Unix domain socket** (Option F) for authentication and command/response with **`memfd_create`** for anonymous shared memory passed via `SCM_RIGHTS`. This gives us the best of both worlds:
+This design combines the **Unix domain socket** (socket) for authentication and command/response with **`memfd_create`** for anonymous shared memory passed via `SCM_RIGHTS`. This gives us the best of both worlds:
 
-- `SO_PEERCRED` for kernel-verified authentication (from Option F)
+- `SO_PEERCRED` for kernel-verified authentication (from socket)
 - mmap-speed command writes from controller (~50-100 ns cache-line transfer)
 - **Zero filesystem footprint** — no files in `/dev/shm/`, no files in `/run/`, no socket files. The abstract socket and memfd are both anonymous and vanish on process exit.
 
@@ -12,9 +12,9 @@ This is the **recommended option for production** (e.g., rocprofiler-sdk) as it 
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — uses the **late-load design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path), and `rocprofiler-sdk` is `dlopen`'d at attach via `CMD_CONFIGURE`, which triggers `rocprofiler_force_configure()` to install wrappers for the controller-specified domains.
+Same as all options — uses the **late-load design** described in [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path), and `rocprofiler-sdk` is `dlopen`'d at attach via `CMD_CONFIGURE`, which triggers `rocprofiler_force_configure()` to install wrappers for the controller-specified domains.
 
-This option combines Option F's socket (for `SO_PEERCRED` authentication + bootstrap) with a memfd containing the `rocp_ctrl_t` struct (same layout as Option B). The differences from Option B: the control struct lives in anonymous memory (no filesystem), authentication is via `SO_PEERCRED`, and the memfd is handed off via `SCM_RIGHTS` rather than discovered by filesystem path.
+This channel combines a Unix domain socket (for `SO_PEERCRED` authentication + bootstrap) with a memfd containing the `rocp_ctrl_t` struct (same layout as mmap). The differences from mmap: the control struct lives in anonymous memory (no filesystem), authentication is via `SO_PEERCRED`, and the memfd is handed off via `SCM_RIGHTS` rather than discovered by filesystem path.
 
 The background thread polls the memfd for `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE`.
 
@@ -121,14 +121,14 @@ Key: After the initial socket handshake + SCM_RIGHTS fd passing,
      needing a response.
 ```
 
-Uses the same **late-load design** as [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path); `rocprofiler-sdk` is `dlopen`'d on the first `CMD_CONFIGURE` and `rocprofiler_force_configure()` installs wrappers for the controller-specified domains. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#late-load-design-defer-rocprofiler-sdk-loading-until-attach) for the full mechanism explanation.
+Uses the same **late-load design** as [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture): a stub library is preloaded with no `rocprofiler_configure` symbol (0 ns hot path); `rocprofiler-sdk` is `dlopen`'d on the first `CMD_CONFIGURE` and `rocprofiler_force_configure()` installs wrappers for the controller-specified domains. See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#late-load-design-defer-rocprofiler-sdk-loading-until-attach) for the full mechanism explanation.
 
 ## Control Structure
 
-Same as Option B — the `rocp_ctrl_t` struct carries commands, the controller's per-attach `rocp_config_t`, and status counters. The canonical definitions live in [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#canonical-control-struct). Summary:
+Same as mmap — the `rocp_ctrl_t` struct carries commands, the controller's per-attach `rocp_config_t`, and status counters. The canonical definitions live in [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md#canonical-control-struct). Summary:
 
 ```c
-#define ROCP_CTRL_MAGIC   0xD15EA7C0  // Same as Option B for interoperability
+#define ROCP_CTRL_MAGIC   0xD15EA7C0  // Same as mmap for interoperability
 #define ROCP_CTRL_VERSION 1
 
 /* See CONTROL_CHANNEL_SURVEY.md for the canonical enum. */
@@ -141,7 +141,7 @@ enum rocp_ctrl_command {
     CMD_STATUS      = 5,  // Socket-side query (response via socket)
 };
 
-/* Same layout as Option B's rocp_config_t — see CONTROL_CHANNEL_SURVEY.md.
+/* Same layout as mmap's rocp_config_t — see CONTROL_CHANNEL_SURVEY.md.
  * Carries the domain enable bits, output format, buffer sizing, filter
  * patterns; the tool's real_tool_initialize reads this to decide which
  * services to register. */
@@ -208,7 +208,7 @@ static rocprofiler_context_id_t saved_ctx;
 static void* sdk_handle = NULL;
 
 /* Exported accessor — tool calls this after being dlopen'd.
- * Avoids extern cross-DSO globals (see Option B's stub↔tool contract). */
+ * Avoids extern cross-DSO globals (see mmap's stub↔tool contract). */
 typedef struct {
     rocp_ctrl_t* ctrl;
     rocp_config_t* pending_config;
@@ -257,7 +257,7 @@ static void setup_memfd_and_socket(void) {
 
 ```c
 /* On first CMD_CONFIGURE: dlopen rocprofiler-sdk-tool, force_configure.
- * See Option B for the shared stub↔tool state contract and rationale
+ * See mmap for the shared stub↔tool state contract and rationale
  * for RTLD_GLOBAL + RTLD_DEFAULT symbol resolution. */
 static void load_sdk_and_configure(void) {
     sdk_handle = dlopen("librocprofiler-sdk-tool.so",
@@ -339,15 +339,15 @@ static void* control_loop(void* arg) {
 
 ### 3. Tool Library (`librocprofiler-sdk-tool.so` — dlopen'd at first attach)
 
-Same as Option B. The tool exports `rocprofiler_configure`, and its `tool_initialize` calls the stub's `rocp_stub_get_state()` accessor to read the pending config and write the created `rocprofiler_context_id_t` back for the bg thread to toggle. See [Option B § Tool Library](OPTION_B_MMAP_FILE.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach) for the full `tool_initialize` body and the stub↔tool accessor contract — the only difference under F+memfd is that the control struct is backed by the memfd instead of a `/run/user/<uid>/` file.
+Same as mmap. The tool exports `rocprofiler_configure`, and its `tool_initialize` calls the stub's `rocp_stub_get_state()` accessor to read the pending config and write the created `rocprofiler_context_id_t` back for the bg thread to toggle. See [mmap § Tool Library](OPTION_B_MMAP_FILE.md#3-tool-library-librocprofiler-sdk-toolso--dlopend-at-attach) for the full `tool_initialize` body and the stub↔tool accessor contract — the only difference under memfd is that the control struct is backed by the memfd instead of a `/run/user/<uid>/` file.
 
 ### 4. Controller
 
-The controller connects to the abstract socket, receives the memfd via `SCM_RIGHTS`, mmaps it, and then drives `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE` identically to Option B's controller. `CMD_STATUS` (response-bearing query) goes over the socket instead of mmap.
+The controller connects to the abstract socket, receives the memfd via `SCM_RIGHTS`, mmaps it, and then drives `CMD_CONFIGURE` / `CMD_ACTIVATE` / `CMD_DEACTIVATE` / `CMD_RECONFIGURE` identically to mmap's controller. `CMD_STATUS` (response-bearing query) goes over the socket instead of mmap.
 
 ## SCM_RIGHTS File Descriptor Passing
 
-This is the core mechanism that makes F+memfd work. `SCM_RIGHTS` allows one process to send a file descriptor to another over a Unix domain socket. The kernel duplicates the fd into the receiver's fd table.
+This is the core mechanism that makes memfd work. `SCM_RIGHTS` allows one process to send a file descriptor to another over a Unix domain socket. The kernel duplicates the fd into the receiver's fd table.
 
 ### Tool side (sender):
 
@@ -436,7 +436,7 @@ Sealing only prevents size manipulation, not content corruption. The tool should
 | **Container isolation** | Abstract sockets scoped to network namespace |
 | **Socket probing** | Any process in the same network namespace can attempt to connect, revealing socket existence. SO_PEERCRED check rejects unauthorized connections, but tracer-loaded PIDs are discoverable |
 
-### Why F+memfd is more secure than Option B (mmap file):
+### Why memfd is more secure than mmap (file):
 
 1. **No predictable path** — the memfd has no filesystem entry at all
 2. **No race window** — the memfd is created by the tool, not discovered by name
@@ -457,13 +457,13 @@ Sealing only prevents size manipulation, not content corruption. The tool should
 
 ## Multi-Runtime Application (rocprofiler-sdk)
 
-Since the tool uses rocprofiler-sdk's context system, multi-runtime support is the same as Option B: a single context covers all registered domains. A single `rocprofiler_start_context(ctx)` activates tracing for HIP, HSA, RCCL, OMPT, etc. simultaneously.
+Since the tool uses rocprofiler-sdk's context system, multi-runtime support is the same as mmap: a single context covers all registered domains. A single `rocprofiler_start_context(ctx)` activates tracing for HIP, HSA, RCCL, OMPT, etc. simultaneously.
 
 The memfd carries only the `rocp_ctrl_t` command/status struct — no per-runtime control needed. The controller writes `CMD_ACTIVATE` to the memfd; the tool's background thread calls `rocprofiler_start_context()` and all registered domains begin tracing.
 
-**Advantage over Option B**: The memfd has no filesystem path, so there's nothing to clean up on crash and no PID-reuse stale file problem.
+**Advantage over mmap**: The memfd has no filesystem path, so there's nothing to clean up on crash and no PID-reuse stale file problem.
 
-**Advantage over Option F (pure socket)**: Commands go through mmap (~50-100 ns) instead of socket send (~1-5 μs). The socket is reserved for status queries that need responses.
+**Advantage over socket**: Commands go through mmap (~50-100 ns) instead of socket send (~1-5 μs). The socket is reserved for status queries that need responses.
 
 ### OpenMP Integration
 

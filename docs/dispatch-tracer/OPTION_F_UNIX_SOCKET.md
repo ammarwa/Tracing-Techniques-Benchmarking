@@ -1,4 +1,4 @@
-# Option F: Dispatch Tracer with Unix Domain Socket Control Channel
+# socket: Dispatch Tracer with Unix Domain Socket Control Channel
 
 ## Overview
 
@@ -8,15 +8,15 @@ This option provides the **strongest authentication model** of all options: the 
 
 ## Integration with rocprofiler-sdk
 
-Same as all options — uses the **late-load design** described in [Option B](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture):
+Same as all options — uses the **late-load design** described in [mmap](OPTION_B_MMAP_FILE.md#what-changes-minimal--late-load-architecture):
 
 - A small **stub library** is preloaded (via `LD_PRELOAD`) that does NOT export `rocprofiler_configure`, so rocprofiler-register doesn't load rocprofiler-sdk → 0 ns hot path before any attach
 - On `CMD_CONFIGURE`, the stub `dlopen`s the tool library and calls `rocprofiler_force_configure()` (succeeds because SDK `init_status` is still 0)
 - SDK initializes with the controller-specified domains, propagation runs, wrappers install only for the requested operations
 
-The **only difference from Option B** is the IPC mechanism: a Unix domain socket where the stub's background thread blocks on `accept()`/`recv()` and responds to commands directly. The protocol carries `CMD_CONFIGURE` (full config payload), `CMD_ACTIVATE`, `CMD_DEACTIVATE`, `CMD_RECONFIGURE`, and `CMD_STATUS`.
+The **only difference from mmap** is the IPC mechanism: a Unix domain socket where the stub's background thread blocks on `accept()`/`recv()` and responds to commands directly. The protocol carries `CMD_CONFIGURE` (full config payload), `CMD_ACTIVATE`, `CMD_DEACTIVATE`, `CMD_RECONFIGURE`, and `CMD_STATUS`.
 
-**Advantage over Option B**: the socket is inherently bidirectional, so the controller can synchronously wait for `CMD_CONFIGURE` to complete (including dlopen + force_configure + propagation, ~5-50 ms) and receive a confirmation ACK with event counters.
+**Advantage over mmap**: the socket is inherently bidirectional, so the controller can synchronously wait for `CMD_CONFIGURE` to complete (including dlopen + force_configure + propagation, ~5-50 ms) and receive a confirmation ACK with event counters.
 
 ## Architecture
 
@@ -118,7 +118,7 @@ CMD_STATUS      = 5   // Query current state / counters
 ### Message Format
 
 Only the protocol-specific wire framing is defined here. The config payload
-(`rocp_config_t`) is identical to Option B.
+(`rocp_config_t`) is identical to mmap.
 
 ```c
 /* Request: controller → tool */
@@ -572,7 +572,7 @@ static void tool_finalize(void* tool_data) {
 
 ## Multi-Runtime Application (rocprofiler-sdk)
 
-Since the tool uses rocprofiler-sdk's context system, multi-runtime support is the same as Option B: a single context covers all registered domains. A single `rocprofiler_start_context(ctx)` activates tracing for HIP, HSA, RCCL, OMPT, etc. simultaneously.
+Since the tool uses rocprofiler-sdk's context system, multi-runtime support is the same as mmap: a single context covers all registered domains. A single `rocprofiler_start_context(ctx)` activates tracing for HIP, HSA, RCCL, OMPT, etc. simultaneously.
 
 The socket's bidirectional nature adds value for status queries:
 
@@ -583,7 +583,7 @@ Tool → Controller:  {active: true, events_traced: 42000, ...}
 
 ### Bidirectional Queries
 
-Unlike Option B (shared memory status fields), the socket naturally supports rich queries with structured responses. This is useful for `rocprofv3`-style tools that want to display what's being traced and how many events have been collected.
+Unlike mmap (shared memory status fields), the socket naturally supports rich queries with structured responses. This is useful for `rocprofv3`-style tools that want to display what's being traced and how many events have been collected.
 
 ### OpenMP Integration
 
@@ -654,6 +654,6 @@ build/bin/rocp_ctrl_sock --pid $! activate
 2. **fork() handling** — After `fork()`, the background thread is gone. `pthread_atfork()` child handler must close the listen fd and set `finalize_status = 1` so the child's atexit handler skips cleanup.
 3. **Socket buffer limits** — Large response payloads may require multiple `send()`/`recv()` calls with framing.
 4. **Abstract namespace portability** — Abstract Unix sockets are Linux-specific (not available on macOS/BSD). For cross-platform, fall back to filesystem sockets.
-5. **Context toggle latency** — ~5 μs per activate/deactivate (socket round-trip) vs ~1 ms (poll interval) for Option B. Socket is faster for toggle but has higher per-command overhead.
+5. **Context toggle latency** — ~5 μs per activate/deactivate (socket round-trip) vs ~1 ms (poll interval) for mmap. Socket is faster for toggle but has higher per-command overhead.
 6. **Backlog sizing** — Use `listen(sock, 5)` rather than `listen(sock, 1)`. A backlog of 1 only supports a single in-flight connection, which breaks attach-detach-reattach cycles if a new controller connects before the previous one is fully drained. Backlog=5 gives headroom for transient overlap without meaningfully increasing resource use.
 7. **Overhead estimates are pre-implementation** — All timing figures are projected from known syscall costs and should be validated with benchmarks.

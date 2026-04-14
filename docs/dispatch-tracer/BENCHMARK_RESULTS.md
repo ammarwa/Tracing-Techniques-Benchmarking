@@ -23,7 +23,7 @@ The sample workload (`sample_app_dispatch`) calls `my_traced_function()` through
 
 100,000 iterations of empty function, 3 runs each:
 
-| Option | Run 1 | Run 2 | Run 3 | Avg |
+| Channel | Run 1 | Run 2 | Run 3 | Avg |
 |--------|-------|-------|-------|-----|
 | Baseline (no stub) | — | — | — | **6.04 ns** |
 | mmap | 3.17 | 3.17 | 3.17 | **3.17 ns** |
@@ -37,7 +37,7 @@ _All four stubs produce ~3.17 ns/call, slightly **faster** than baseline — wit
 
 Wall-clock time from controller's `configure` command send to completion. 5 trials per option, including dlopen of mock_sdk + `force_configure()` + runtime API table propagation + `update_table()` to install wrappers.
 
-| Option | Trials (ms) | Avg |
+| Channel | Trials (ms) | Avg |
 |--------|-------------|-----|
 | mmap | 3, 4, 2, 2, 2 | **~2 ms** |
 | sock | 2, 3, 2, 2, 3 | **~2 ms** |
@@ -52,20 +52,20 @@ All options land in the 2-4 ms range. The IPC mechanism contributes minimally �
 
 500 iterations × 1000μs work. Controller attaches 300ms after app start (too late for WAIT_FOR_ATTACH sync on sock/memfd which lack a filesystem-visible ctrl file). The reported average is blended across noop-before-attach and active-after-attach. The **traced event count** confirms tracing works end-to-end.
 
-| Option | Avg ns/call | Events traced | Active fraction |
+| Channel | Avg ns/call | Events traced | Active fraction |
 |--------|-------------|---------------|-----------------|
 | mmap | 1,001,899 | 196 | ~39% |
 | sock | 1,001,779 | 197 | ~39% |
 | memfd | 1,000,405 | 196 | ~39% |
 | signal | 1,001,873 | 198 | ~40% |
 
-_At 1 ms/call, the per-call tracing overhead (hundreds of ns) is far below noise, so `avg_ns` shows ~1,000,050 regardless of option. The **event count** is the meaningful validation: with a 500 ms total run, 300 ms pre-attach + 200 ms active = ~200 active events expected. Actual 196-198 events confirms all four options trace correctly._
+_At 1 ms/call, the per-call tracing overhead (hundreds of ns) is far below noise, so `avg_ns` shows ~1,000,050 regardless of option. The **event count** is the meaningful validation: with a 500 ms total run, 300 ms pre-attach + 200 ms active = ~200 active events expected. Actual 196-198 events confirms all four channels trace correctly._
 
 ### Full Active Tracing (WAIT_FOR_ATTACH=1)
 
 10,000 iterations of empty function. App blocks until `context_active=1` before starting iterations, so the entire measurement reflects active tracing.
 
-| Option | Avg ns/call | Events traced | Active-tracing cost/call |
+| Channel | Avg ns/call | Events traced | Active-tracing cost/call |
 |--------|-------------|---------------|--------------------------|
 | Baseline | 6.04 | 0 | 0 ns (no tracing) |
 | mmap | 2,656 | 10,000 | ~2,650 ns |
@@ -101,7 +101,7 @@ _For reference: real rocprofiler-sdk's functor overhead (populate_contexts + ent
 
 ## Protocol Richness
 
-All four options implement the canonical protocol commands (`CMD_NONE`, `CMD_CONFIGURE`, `CMD_ACTIVATE`, `CMD_DEACTIVATE`, `CMD_RECONFIGURE`, `CMD_STATUS`) with the same `rocp_config_t` payload.
+All four channels implement the canonical protocol commands (`CMD_NONE`, `CMD_CONFIGURE`, `CMD_ACTIVATE`, `CMD_DEACTIVATE`, `CMD_RECONFIGURE`, `CMD_STATUS`) with the same `rocp_config_t` payload.
 
 | Feature | mmap | sock | memfd | signal |
 |---------|------|------|-------|--------|
@@ -134,7 +134,7 @@ From [report/results.json](../../report/results.json) (prior LTTng/eBPF/bpftime 
 
 ### For production (rocprofiler-sdk integration)
 
-**Option F+memfd** is the recommended production choice:
+**memfd** is the recommended production choice:
 - Strongest authentication (kernel-verified `SO_PEERCRED`)
 - Zero filesystem footprint (abstract socket + anonymous memfd)
 - Fastest subsequent command delivery after bootstrap (~50 ns mmap writes)
@@ -143,15 +143,15 @@ From [report/results.json](../../report/results.json) (prior LTTng/eBPF/bpftime 
 
 ### For simplicity / prototyping
 
-**Option B (mmap)** is the simplest: file at a predictable path, standard `cat`/`hexdump` debugging, one-directional protocol. Good for initial development and single-controller scenarios.
+**mmap** is the simplest: file at a predictable path, standard `cat`/`hexdump` debugging, one-directional protocol. Good for initial development and single-controller scenarios.
 
 ### For instant attach latency
 
-**Option Signal+B** is marginally fastest at ~1-5 μs signal delivery, but attach latency is dominated by dlopen not IPC — the benefit is minimal. The complexity of async-signal-safe handlers isn't worth it unless reconfigurations happen frequently.
+**signal** is marginally fastest at ~1-5 μs signal delivery, but attach latency is dominated by dlopen not IPC — the benefit is minimal. The complexity of async-signal-safe handlers isn't worth it unless reconfigurations happen frequently.
 
 ### Avoid
 
-**Option F (pure socket)** has no compelling advantage over F+memfd — the socket-only design loses mmap-speed command delivery and gains nothing over F+memfd's bidirectional capability.
+**socket** has no compelling advantage over memfd — the socket-only design loses mmap-speed command delivery and gains nothing over memfd's bidirectional capability.
 
 ## Honest Limitations
 
@@ -161,11 +161,11 @@ Only mmap and signal have a filesystem-visible ctrl file that the app can poll v
 
 ### Add-new-domain-after-first-attach
 
-`rocprofiler_force_configure()` is one-shot (locked after first call). None of the four options can add a new API domain post-first-attach. To add domains mid-run, the existing `rocprofv3 --attach --pid` ptrace mechanism is required (which dlopens a fresh SDK instance).
+`rocprofiler_force_configure()` is one-shot (locked after first call). None of the four channels can add a new API domain post-first-attach. To add domains mid-run, the existing `rocprofv3 --attach --pid` ptrace mechanism is required (which dlopens a fresh SDK instance).
 
 ### Measurement noise at sub-10 ns
 
-On this hardware, clock resolution + branch prediction noise makes differences below ~3 ns indistinguishable. The fact that all four options + baseline land in the 3-6 ns range is a feature of the design, not poor measurement.
+On this hardware, clock resolution + branch prediction noise makes differences below ~3 ns indistinguishable. The fact that all four channels + baseline land in the 3-6 ns range is a feature of the design, not poor measurement.
 
 ## Reproducing These Results
 
@@ -200,4 +200,4 @@ The late-load dispatch tracer design works as specified:
 4. **2-4 ms attach latency** — verified; dominated by dlopen + propagation, not IPC.
 5. **No sudo, no capabilities, no specific kernel version** — verified (runs as regular user).
 
-All four IPC options produce equivalent end-user semantics. The choice between them is a security/complexity/convenience trade-off, not a functional one. For new projects, **F+memfd** combines the best security properties with acceptable complexity.
+All four IPC options produce equivalent end-user semantics. The choice between them is a security/complexity/convenience trade-off, not a functional one. For new projects, **memfd** combines the best security properties with acceptable complexity.
