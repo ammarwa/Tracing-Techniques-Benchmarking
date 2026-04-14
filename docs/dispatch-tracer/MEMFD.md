@@ -9,12 +9,28 @@
 | Constraint | Pure socket | Pure memfd | Socket + memfd (this doc) |
 |---|---|---|---|
 | No sudo / no ptrace | ✓ | ✗ — needs `pidfd_getfd` (`CAP_SYS_PTRACE`) | ✓ |
-| No filesystem footprint | ✓ (abstract) | ✓ (anonymous) | ✓ |
+| No persistent filesystem entries | ✓ (abstract) | ✓ (anonymous) | ✓ (both are anonymous; combining doesn't create a file) |
 | Kernel-verified peer auth | ✓ (`SO_PEERCRED`) | N/A (no rendezvous primitive) | ✓ (inherited from socket) |
 | Cache-line-speed command delivery | ✗ (per-command `sendmsg`/`recvmsg`) | ✓ (mmap store) | ✓ (mmap store after bootstrap) |
 | Shared-state integrity seal | N/A | ✓ (`F_SEAL_SHRINK \| F_SEAL_GROW`) | ✓ (inherited from memfd) |
 
 The socket is doing exactly one job: *hand an anonymous fd across a process boundary with authentication*. The memfd is doing exactly one job: *hold shared control state at mmap speed*. Neither can do the other's job without losing a key property, so both are present.
+
+### What "no filesystem footprint" precisely means
+
+The phrase is a common source of confusion — combining *two* IPC mechanisms sounds like it should create *more* on-disk state, not zero. The claim holds because of what each mechanism is:
+
+- **Abstract Unix socket** (`\0rocprofiler_<pid>`): the leading NUL byte in `sun_path` tells the kernel to use its *abstract namespace*, which is a flat table inside the kernel's network namespace — **not** a mount, **not** a file, **not** under any directory. `stat("/tmp")`, `ls /run/user`, `find / -name 'rocprofiler*'` — none of these will ever see it. It is kernel state that disappears when the bound socket is closed (and closes automatically on process exit, including SIGKILL).
+- **`memfd_create`**: returns a file descriptor to an anonymous kernel memory region with **no path**. There is no directory entry anywhere — no `/tmp`, no `/dev/shm`, no `/run`. The memory is freed when the last fd is closed (same process-exit guarantee).
+
+So "combining both" does not add filesystem state because **neither of the two mechanisms has any to add**. Compared to the `mmap` channel, which puts a file at `/run/user/<uid>/rocprofiler/<pid>/ctrl` (mode `0600`, directory `0700`) that survives a crash and needs cleanup, this channel writes to zero paths.
+
+**Honest caveats.** Two places on Linux still show traces of both IPCs, but neither is the filesystem in the sense the claim cares about:
+
+1. `/proc/net/unix` lists the abstract-namespace socket (as does `ss -xap state listening | grep rocprofiler`). This is a kernel runtime table exposed via procfs — an in-memory view of live sockets, not a persistent file. Nothing to clean up.
+2. `/proc/<pid>/fd/<N>` for the memfd will resolve (via `readlink`) to `/memfd:rocp-ctrl (deleted)`. This is the standard procfs representation of any open fd, including regular files; the `(deleted)` suffix reflects that there was never a path backing it. It vanishes with the process.
+
+Neither of these is a file in any filesystem you can mount, back up, or `rm`. The design property the original "no filesystem footprint" line was trying to capture is: **zero paths to race on, zero stale entries on crash, zero cleanup burden**. That property does hold for the hybrid — and that is what the phrase now says explicitly.
 
 ## At a glance
 
@@ -23,7 +39,7 @@ The socket is doing exactly one job: *hand an anonymous fd across a process boun
 - Shared-state fd: **`memfd_create(..., MFD_CLOEXEC | MFD_ALLOW_SEALING)`** sized to `sizeof(rocp_ctrl_t)`, passed to controller via `sendmsg(..., SCM_RIGHTS)`.
 - Post-handoff integrity: **`fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW)`** — size is frozen after the controller has its fd, so neither side can resize under the other.
 - Command delivery: controller writes `rocp_cmd_t` fields into its mmap of the memfd, bumps `ctrl->version`, and (optionally) `close()`s the socket. Stub polls `ctrl->version` at 1 ms intervals and dispatches.
-- Filesystem footprint: **zero.** Abstract socket lives in the kernel net namespace; memfd lives in anonymous memory. Both die with the process — no stale files on crash.
+- Filesystem footprint: **zero persistent paths.** The abstract socket lives in the kernel's network namespace (visible via `/proc/net/unix` but not any mounted filesystem); the memfd lives in anonymous memory (visible via `/proc/<pid>/fd/<N>` as a `(deleted)` symlink, never a path). Both die automatically on process exit — no stale files on crash, nothing to `rm`. See [§ What "no filesystem footprint" precisely means](#what-no-filesystem-footprint-precisely-means) below for the full accounting.
 
 ## Integration with rocprofiler-sdk
 
