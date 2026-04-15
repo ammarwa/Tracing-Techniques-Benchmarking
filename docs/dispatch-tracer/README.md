@@ -23,7 +23,7 @@ See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNE
 | [MEMFD_SOCK.md](MEMFD_SOCK.md) | Design combining Unix socket auth with `memfd_create` anonymous shared memory — best overall for production |
 | [SIGNAL.md](SIGNAL.md) | Design using real-time signals as instant notification layered on top of mmap or memfd |
 | [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Measured benchmark results for all 4 options (noop, attach latency, active tracing) on AMD EPYC 9354 |
-| [SHIM_MEMFD_SOCK_DESIGN.md](SHIM_MEMFD_SOCK_DESIGN.md) | End-to-end design for the shim architecture with the memfd+sock channel: library layout, startup + attach + tracing + detach sequences, memfd layout, shim↔SDK ABI contract, OMPT integration, security model, ring-buffer protocol, test plan |
+| [SHIM_MEMFD_SOCK_DESIGN.md](SHIM_MEMFD_SOCK_DESIGN.md) | `libroc-shim.so` — IPC transport layer for OOP profiling. Proxies the rocprofiler-sdk tool API over memfd+sock, replaces ptrace attach. SDK does all profiling; shim handles IPC + ring buffers + record delivery. |
 
 ## Quick Comparison
 
@@ -57,7 +57,7 @@ See [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) for the full evaluati
 
 The survey also covers:
 
-- **OpenMP OMPT integration** — OMPT starts enabled at init, shim controls noop behavior inside callbacks, same control channel as other runtimes
+- **OpenMP OMPT integration** — OMPT tool discovery and callback registration for the late-load stub approach
 - **OpenMP tool plugin interface** — how the OMPT tool library fits the dispatch tracer architecture, compared with rocprofiler-sdk, VTune, and Nsight approaches
 - **Late configuration vs late activation** — what the control channel can and cannot reconfigure after process start, and how it coexists with rocprofiler-sdk's existing ptrace attach
 - **Cross-platform considerations** — Linux-specific mechanisms and portability fallbacks
