@@ -25,10 +25,95 @@ static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 /* Global ctrl pointer for op_info name lookup inside the callback. */
 static shim_ctrl_t* g_con_ctrl = NULL;
 
-/* Packed arg structs — same as in shim_mock.c. In the real shim these
- * come from rocprofiler-sdk's generated headers. */
-typedef struct { int a1; uint64_t a2; double a3; void* a4; } packed_op0_args_t;
-typedef struct { unsigned int us; } packed_op1_args_t;
+/* Include the typed arg structs from the mock libraries so the consumer
+ * can decode args for every op. In the real shim, these come from
+ * rocprofiler-sdk's generated headers. */
+#include "mock_libA.h"
+#include "mock_libB.h"
+
+/* Packed arg structs — matching shim_mock.c */
+typedef struct { int a1; uint64_t a2; double a3; void* a4; } packed_mylib_op0_t;
+typedef struct { unsigned int us; } packed_mylib_op1_t;
+typedef struct { liba_agent_t agent; uint32_t size; liba_queue_t* out; } packed_liba_op0_t;
+typedef struct { liba_memory_region_t region; uint64_t size; void** out_ptr; } packed_liba_op1_t;
+typedef struct { liba_queue_t queue; const liba_dispatch_packet_t* pkt; liba_signal_t completion; } packed_liba_op2_t;
+typedef struct { liba_signal_t signal; uint64_t timeout_ns; } packed_liba_op3_t;
+typedef struct { const libb_launch_config_t* config; } packed_libb_op0_t;
+typedef struct { void* dst; const void* src; uint64_t size; libb_stream_t stream; } packed_libb_op1_t;
+typedef struct { libb_stream_t stream; } packed_libb_op2_t;
+typedef struct { libb_device_prop_t* prop; int device_id; } packed_libb_op3_t;
+
+/* Find which table a global slot_idx belongs to, return the table name
+ * and the local op index within that table. */
+static const char* find_table_for_op(uint32_t slot_idx, uint32_t* local_op)
+{
+    if (!g_con_ctrl) return NULL;
+    for (uint32_t i = 0; i < g_con_ctrl->n_registrations; i++) {
+        const shim_table_registration_t* t = &g_con_ctrl->registrations[i];
+        if (slot_idx >= t->slot_base && slot_idx < t->slot_base + t->n_ops) {
+            *local_op = slot_idx - t->slot_base;
+            return t->name;
+        }
+    }
+    return NULL;
+}
+
+static void print_args(const shim_record_t* rec)
+{
+    if (rec->phase != SHIM_PHASE_ENTER || rec->arg_bytes == 0) return;
+
+    uint32_t local_op = 0;
+    const char* tbl = find_table_for_op(rec->op, &local_op);
+    if (!tbl) return;
+
+    if (strcmp(tbl, "mylib") == 0) {
+        if (local_op == 0 && rec->arg_bytes >= sizeof(packed_mylib_op0_t)) {
+            const packed_mylib_op0_t* a = (const packed_mylib_op0_t*)rec->args;
+            printf("  args(a1=%d, a2=%" PRIu64 ", a3=%.1f, a4=%p)",
+                   a->a1, a->a2, a->a3, a->a4);
+        } else if (local_op == 1 && rec->arg_bytes >= sizeof(packed_mylib_op1_t)) {
+            const packed_mylib_op1_t* a = (const packed_mylib_op1_t*)rec->args;
+            printf("  args(us=%u)", a->us);
+        }
+    } else if (strcmp(tbl, "libA_hsa") == 0) {
+        if (local_op == 0 && rec->arg_bytes >= sizeof(packed_liba_op0_t)) {
+            const packed_liba_op0_t* a = (const packed_liba_op0_t*)rec->args;
+            printf("  args(agent=0x%" PRIx64 ", size=%u, out=%p)",
+                   a->agent.handle, a->size, (void*)a->out);
+        } else if (local_op == 1 && rec->arg_bytes >= sizeof(packed_liba_op1_t)) {
+            const packed_liba_op1_t* a = (const packed_liba_op1_t*)rec->args;
+            printf("  args(region={base=0x%" PRIx64 ", size=%" PRIu64 ", seg=%u}, sz=%" PRIu64 ")",
+                   a->region.base_address, a->region.size_bytes, a->region.segment, a->size);
+        } else if (local_op == 2 && rec->arg_bytes >= sizeof(packed_liba_op2_t)) {
+            const packed_liba_op2_t* a = (const packed_liba_op2_t*)rec->args;
+            printf("  args(queue=0x%" PRIx64 ", pkt=%p, completion=0x%" PRIx64 ")",
+                   a->queue.handle, (void*)a->pkt, a->completion.handle);
+        } else if (local_op == 3 && rec->arg_bytes >= sizeof(packed_liba_op3_t)) {
+            const packed_liba_op3_t* a = (const packed_liba_op3_t*)rec->args;
+            printf("  args(signal=0x%" PRIx64 ", timeout=%" PRIu64 ")",
+                   a->signal.handle, a->timeout_ns);
+        }
+    } else if (strcmp(tbl, "libB_hip") == 0) {
+        if (local_op == 0 && rec->arg_bytes >= sizeof(packed_libb_op0_t)) {
+            const packed_libb_op0_t* a = (const packed_libb_op0_t*)rec->args;
+            /* config is a pointer into the target's stack — cannot deref
+             * from the consumer process (or even later in the same process
+             * after the stack frame is gone). Print pointer value only.
+             * This matches §7B.3: HANDLE args are opaque pointer values. */
+            printf("  args(config=%p)", (void*)a->config);
+        } else if (local_op == 1 && rec->arg_bytes >= sizeof(packed_libb_op1_t)) {
+            const packed_libb_op1_t* a = (const packed_libb_op1_t*)rec->args;
+            printf("  args(dst=%p, src=%p, size=%" PRIu64 ", stream=0x%" PRIx64 ")",
+                   a->dst, a->src, a->size, a->stream.handle);
+        } else if (local_op == 2 && rec->arg_bytes >= sizeof(packed_libb_op2_t)) {
+            const packed_libb_op2_t* a = (const packed_libb_op2_t*)rec->args;
+            printf("  args(stream=0x%" PRIx64 ")", a->stream.handle);
+        } else if (local_op == 3 && rec->arg_bytes >= sizeof(packed_libb_op3_t)) {
+            const packed_libb_op3_t* a = (const packed_libb_op3_t*)rec->args;
+            printf("  args(prop=%p, device_id=%d)", (void*)a->prop, a->device_id);
+        }
+    }
+}
 
 static void on_record(const shim_record_t* rec, void* user_data)
 {
@@ -50,17 +135,7 @@ static void on_record(const shim_record_t* rec, void* user_data)
            rec->correlation_id.external,
            rec->correlation_id.ancestor);
 
-    /* Print args if present (ENTER records only, for readability). */
-    if (rec->phase == SHIM_PHASE_ENTER && rec->arg_bytes > 0) {
-        if (rec->op == 0 && rec->arg_bytes >= sizeof(packed_op0_args_t)) {
-            const packed_op0_args_t* a = (const packed_op0_args_t*)rec->args;
-            printf("  args(a1=%d, a2=%" PRIu64 ", a3=%.1f, a4=%p)",
-                   a->a1, a->a2, a->a3, a->a4);
-        } else if (rec->op == 1 && rec->arg_bytes >= sizeof(packed_op1_args_t)) {
-            const packed_op1_args_t* a = (const packed_op1_args_t*)rec->args;
-            printf("  args(us=%u)", a->us);
-        }
-    }
+    print_args(rec);
     printf("\n");
 }
 
