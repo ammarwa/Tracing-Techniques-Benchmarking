@@ -250,6 +250,20 @@ force_configure(my_init)
   ← FORCE_CONFIGURE_RESP {SUCCESS}
 ```
 
+**tool_initialize timeout:** The shim imposes a mandatory timeout on the `tool_initialize` relay (default 30 seconds, configurable via `ROC_SHIM_INIT_TIMEOUT_SEC`). If the consumer fails to complete `tool_initialize` within the timeout (stalled, buggy, crashed mid-init), the shim returns failure from `shim_proxy_init`, the SDK rolls back initialization, and the shim returns to dormant. This prevents a misbehaving consumer from freezing the target.
+
+**Connection handshake:** Before any API commands, the consumer and shim exchange a `HANDSHAKE` message as the first message after `connect()`:
+
+```c
+struct shim_handshake {
+    uint32_t protocol_version;     // shim protocol version
+    uint32_t sdk_header_version;   // ROCPROFILER_VERSION from headers
+    uint32_t record_struct_sizes[16]; // sizeof each buffer_tracing_*_record_t
+};
+```
+
+The shim validates the consumer's protocol version and SDK header version against its own. On mismatch, the connection is rejected with an error message. This prevents silent data corruption from version-mismatched consumer/shim pairs.
+
 This is not on any hot path — `tool_initialize` runs exactly once per consumer lifetime.
 
 ## 7. Ring buffer — internal shim transport
@@ -341,11 +355,24 @@ No shim-specific record format. The consumer uses standard `rocprofiler-sdk` hea
 - **Shim watermark** (internal): controls when the shim drains the ring and sends a batch over the socket. Tuned for batch efficiency — shim's decision, not exposed to consumer.
 - **Consumer watermark** (user-facing): the watermark the consumer specified in `create_buffer`. `libroc-shim-consumer.so` honors this — it accumulates records in the user buffer and fires the consumer's callback when the user's watermark is crossed.
 
-**Drop policy:**
+**Drop policy and backpressure:**
 
 - The SDK writes freely into the ring. If the ring fills (consumer too slow to drain), the SDK's next emplace sees a full buffer and increments `events_dropped`.
-- The shim does NOT block the SDK. The watermark callback returns immediately.
-- `events_dropped` is visible to the consumer via `rocprofiler_get_buffer_tracing_info` (proxied).
+- The shim uses **non-blocking `send()`** in its watermark callback. If the socket buffer is full (consumer is slow), the shim drops the batch and increments `events_dropped` rather than blocking. This ensures the SDK's emplace path — and therefore the target's API call — never stalls on socket I/O.
+- `events_dropped` is visible to the consumer via status queries.
+
+**Record type restriction (pointer safety):**
+
+Some SDK record types contain raw pointers into the target process's address space — e.g., `rocprofiler_buffer_tracing_hip_api_ext_record_t` contains `rocprofiler_hip_api_args_t args` which is a union full of `void*`, `char*`, `dim3*`, etc. These pointers are meaningless in the consumer's address space.
+
+**V1 policy:** only **non-ext (pointer-free) buffer tracing record types** are supported for OOP:
+- `rocprofiler_buffer_tracing_hip_api_record_t` (non-ext: scalars + timestamps only) ✓
+- `rocprofiler_buffer_tracing_hsa_api_record_t` ✓
+- `rocprofiler_buffer_tracing_kernel_dispatch_record_t` ✓
+- `rocprofiler_buffer_tracing_memory_copy_record_t` ✓
+- `rocprofiler_buffer_tracing_marker_api_record_t` ✓
+
+The ext record types (`_ext_record_t` with args union) are **rejected** by the shim when the consumer calls `configure_buffer_tracing_service`. The shim validates the requested buffer tracing kind and returns an error for ext-record domains. This is documented as a v1 limitation; a future version could add a serialization pass that replaces pointers with NULL before sending.
 
 ## 9. Detach and cleanup
 
@@ -445,7 +472,12 @@ Same IPC primitives as the earlier design — these are transport-layer choices 
 - Buffer record emplace path (writes to buffer's backing store — if that's a memfd mmap, records go there automatically)
 - Record format (`buffer_tracing_*_record_t` structs are unchanged)
 
-**Estimated SDK changes:** ~100-200 LOC.
+**Estimated SDK changes:** The scope depends on the approach to external buffer storage:
+
+- **If the SDK's `ring_buffer` class can accept an externally-provided mmap region** (new `init_external(void* ptr, size_t size)` path, suppress `munmap` in `destroy()`): ~300-500 LOC touching the buffer infrastructure (`record_header_buffer`, `ring_buffer`, `buffer::instance`). The double-buffering scheme needs rethinking since you cannot double-buffer a single shared memfd region.
+- **Alternative (watermark-callback copy):** The shim's `tool_initialize` creates a normal SDK buffer, and the SDK's watermark callback copies records from the SDK's internal buffer into the shim's memfd ring. This avoids any change to the `ring_buffer` class but adds one extra copy. SDK changes: ~100-150 LOC (watermark callback wiring only).
+
+The alternative is recommended for v1 — minimal SDK disruption, same functional result. The direct external-storage path is a v2 optimization that eliminates the copy.
 
 ## 14. What changes in rocprofiler-register
 
@@ -509,7 +541,13 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 5. **Graceful flush semantics** — when the consumer calls `flush_buffer`, the shim must drain the ring synchronously and deliver all pending records before returning the response. The SDK's `flush_buffer` semantics need to align with this (ensure all in-flight emplaces complete before the flush returns).
 
-6. **API versioning** — the socket protocol needs a version handshake so `libroc-shim.so` and `libroc-shim-consumer.so` can detect mismatches (e.g., consumer built against newer SDK headers than the target's shim).
+6. ~~**API versioning**~~ — **resolved**: a `HANDSHAKE` message is exchanged at connect time (see §6). Protocol version, SDK header version, and record struct sizes are validated; mismatch → connection rejected.
+
+7. **Dormancy cost at scale** — the shim adds one pthread + one abstract socket + one memfd per ROCm process. On a node running 200 MPI ranks, that is 200 sleeping threads + 200 sockets. This is small but not zero — should be measured and documented for HPC deployment guidance.
+
+8. **SDK stays loaded after detach** — after a consumer detaches, the shim returns to dormant but the SDK remains loaded (because `force_configure` is one-shot and the SDK does not unload itself). Dispatch table wrappers stay installed but with all contexts stopped, they hit the noop path. The overhead is the SDK's own "no active context" cost (~10-20 ns per call), not zero. This is the same behavior as detaching an in-process tool today — not a regression, but should be documented.
+
+9. **ext_record pointer safety** — resolved for v1 by restricting to pointer-free record types (see §8). Future versions could add a serialization pass or a "deep-copy at emplace" mode for ext records.
 
 ## 18. Integration risks
 
