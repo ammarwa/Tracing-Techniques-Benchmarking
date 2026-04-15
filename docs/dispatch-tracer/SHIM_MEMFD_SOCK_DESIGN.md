@@ -542,7 +542,7 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 6. ~~**API versioning**~~ — **resolved**: a `HANDSHAKE` message is exchanged at connect time (see §6). Protocol version, SDK header version, and record struct sizes are validated; mismatch → connection rejected.
 
-7. **Dormancy cost at scale** — the shim adds one pthread + one abstract socket + one memfd per ROCm process. On a node running 200 MPI ranks, that is 200 sleeping threads + 200 sockets. This is small but not zero — should be measured and documented for HPC deployment guidance.
+7. **Dormancy cost at scale** — the shim adds one pthread + one abstract socket + one memfd per ROCm process. On a node running 200 MPI ranks, that is 200 sleeping threads + 200 sockets. This is small but not zero — measuring and documenting the overhead at scale is tracked as future work in the rocprofiler-sdk benchmarking suite.
 
 8. **SDK stays loaded after detach** — after a consumer detaches, the shim returns to dormant but the SDK remains loaded (because `force_configure` is one-shot and the SDK does not unload itself). Dispatch table wrappers stay installed but with all contexts stopped, everything is back to noop with effectively zero overhead — the `disabled-sdk-contexts` path has never surfaced measurable overhead in prior benchmarks. This is the same behavior as detaching an in-process tool today.
 
