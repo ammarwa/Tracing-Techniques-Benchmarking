@@ -986,6 +986,47 @@ void rocp_shim_record_and_call(void* orig,
 
 The common case (user wants OOP trace records, not side effects): `rocp_shim_enable_op(h, DOMAIN_HIP, OP_LAUNCH_KERNEL, rocp_shim_record_and_call, NULL)`.
 
+### 13.4 Consumer-provided thread pool for record dispatch
+
+The shim library **never creates its own threads** on the consumer side. The consumer owns every thread involved in record processing — their creation, affinity, priority, naming, and lifetime. This is a deliberate design choice: profiling tools running on HPC clusters or inside containers need to control thread counts, CPU-set masks, and NUMA placement; a library that spawns its own threads behind the consumer's back breaks those contracts.
+
+The consumer can provide a thread pool at attach time:
+
+```c
+/* Thread-pool interface the consumer implements. The shim calls
+ * submit() to hand a batch of records to a worker; the consumer's
+ * pool picks which thread runs the work. */
+typedef struct {
+    void (*submit)(void* pool_ctx,
+                   const rocp_shim_record_t* records,
+                   size_t count,
+                   rocp_shim_record_cb_t cb,
+                   void* cb_user_data);
+    void* pool_ctx;   /* opaque — passed back to every submit() call */
+} rocp_shim_thread_pool_t;
+
+/* Attach with a thread pool. If pool is NULL, rocp_shim_poll runs
+ * the callback synchronously on the calling thread (single-threaded
+ * default). If pool is non-NULL, rocp_shim_poll drains the ring,
+ * partitions records into batches, and hands each batch to
+ * pool->submit(). The pool decides which thread runs the callback. */
+rocp_shim_handle_t rocp_shim_attach_ex(pid_t target_pid,
+                                        const rocp_shim_thread_pool_t* pool);
+```
+
+How it works:
+
+1. `rocp_shim_poll()` wakes on eventfd, drains the ring into a local batch array (same as today).
+2. If no pool was provided: calls `cb(record, user_data)` synchronously for each record. Single-threaded. This is the simple default.
+3. If a pool was provided: splits the batch by thread_id (records from the same target thread go to the same worker — preserves per-thread ordering) and calls `pool->submit()` for each partition. The consumer's worker threads call `cb(record, user_data)` on their own stacks.
+
+The consumer controls:
+- **How many threads** — create a pool with 1 thread and it's serial; create one with 64 and it fans out.
+- **Thread attributes** — `pthread_attr_setaffinity_np`, priority, stack size, naming — all set by the consumer before passing the pool.
+- **Ordering guarantees** — per-thread ordering is preserved (same target thread → same worker). Cross-thread ordering is not guaranteed (records from different target threads may be processed out of timestamp order). Consumer-side merge-sort on TSC if global ordering is needed.
+
+This mirrors how rocprofiler-sdk's buffer-tracing callbacks work today: the SDK's `rocprofiler_flush_buffer` delivers records on a **user-controlled callback thread** (the one that calls flush), not on an SDK-internal thread. The shim extends this pattern to the OOP consumer side.
+
 ## 14. Concurrency model
 
 ### 14.1 Single-controller limit
@@ -1025,14 +1066,29 @@ Minimum validation suite:
 
 ## 16. Open questions / follow-up
 
-- **Multi-threaded consumer-side callback invocation**: the consumer may want its user-supplied callback to run in a thread pool. Today the consumer's `rocp_shim_poll` is single-threaded. Add `rocp_shim_poll_threaded` with a user-provided thread-pool?
+- ~~**Multi-threaded consumer-side callback invocation**~~ — **resolved**: see §13.4 below. The consumer provides a thread pool at attach time; `rocp_shim_poll` dispatches records to that pool. The shim never creates its own profiling threads — the consumer owns all threads and controls their affinity, priority, and lifetime.
 - **Per-op filters**: today `profiler_functor[Op]` is all-or-nothing per op. Real users want filters like "trace only HIP launches whose stream == X". Add a per-op filter in the consumer callback (the trivial answer), or extend the protocol with a filter bitmap per op?
 - ~~**Correlation IDs across shim and in-process SDK**~~ — **resolved**: see §7A. Shim maintains a thread-local internal/external/ancestor stack with identical semantics to the SDK's; when the SDK is loaded, the shim forwards external pushes into the SDK's stack so downstream GPU events carry the same external ID. Cross-library correlation (HIP calling HSA etc.) works via the `ancestor` field.
 - ~~**Argument serialization model**~~ — **resolved**: see §7B. Inline fixed-size typed payload in each record (scalars + handles) + variable-size auxiliary ring keyed by `correlation_internal_id` for strings and deep-copied data. Same two-tier structure the SDK's buffer tracer uses today; schema classification reused from rocprofiler-sdk's existing arg metadata.
 - **Record schema evolution**: the inline typed payload is sourced from SDK headers. Target and consumer link independently; SDK minor versions may add fields (struct sizes are not ABI-stable across ROCm minor releases). **V1 policy**: embed `args_schema_version` (an integer derived from the SDK build-time struct hash) in every record. Consumer checks `args_schema_version` against its own compiled-in value; on mismatch, falls back to inline-only decoding (scalars at fixed offsets are stable; any field beyond the consumer's known size is ignored). This is a best-effort heuristic, not a hard ABI freeze — a full freeze (shim-owned wire structs with translation at the consumer helper) is tracked as a v2 improvement.
 - **Ring size as a consumer option**: consumer may want larger rings for heavy workloads. Today the size is fixed at target startup. A `rocp_shim_resize_ring` query could reallocate if both sides agree, but `F_SEAL_GROW` prevents grow-in-place; would need a secondary memfd + handoff. Not a v1 feature.
 - ~~**Aarch64 validation**~~ — **deferred**: this design targets x86-64 only for now. The +0.8 ns measurement is on AMD EPYC. Aarch64 is out of scope for the initial implementation; if it becomes in-scope, re-measure and adjust the atomic-ordering choices (`LDAR` on ARMv8 is heavier than x86's implicit acquire).
-- **Windows alternative**: `memfd_create`, abstract Unix sockets, and `SCM_RIGHTS` are Linux-specific. A Windows port would need a different IPC primitive (e.g. named shared memory via `CreateFileMapping` + `MapViewOfFile`, with Windows-native authentication via named-pipe `GetNamedPipeClientProcessId` or SID matching). Not a v1 goal but the design should be evaluated for portability when Windows becomes in-scope.
+- **Windows alternative** (not a v1 goal — documented here so the next evaluation doesn't start from scratch):
+
+  The entire IPC layer in this design is Linux-specific: `memfd_create` (anonymous shared memory), abstract Unix domain sockets (rendezvous), `SCM_RIGHTS` (fd handoff), `eventfd` (watermark wake), `SO_PEERCRED` (authentication), `F_SEAL_*` (integrity). None of these exist on Windows.
+
+  A Windows port would need to replace each primitive:
+
+  | Linux primitive | Windows equivalent | Notes |
+  |---|---|---|
+  | `memfd_create` + `mmap` | `CreateFileMapping(INVALID_HANDLE_VALUE, ...)` + `MapViewOfFile` | Named shared memory in the `Global\` or `Local\` namespace. Named → discoverable, unlike memfd's anonymous fd. |
+  | Abstract Unix socket | Named pipe (`\\.\pipe\rocprof-shim_<pid>`) | Pipe provides rendezvous. `ConnectNamedPipe` blocks until a client arrives, analogous to `accept`. |
+  | `SCM_RIGHTS` (fd handoff) | `DuplicateHandle` with target process handle | Requires `PROCESS_DUP_HANDLE` access right on the target, which is same-user by default under Windows ACLs. |
+  | `SO_PEERCRED` (peer auth) | `GetNamedPipeClientProcessId` + SID matching via `OpenProcessToken` / `GetTokenInformation` | More verbose but equivalent: kernel tells you who connected. |
+  | `eventfd` (watermark wake) | `CreateEvent` (named, auto-reset) or `CreateSemaphore` | Consumer `WaitForSingleObject`; target `SetEvent` on watermark. |
+  | `F_SEAL_*` (integrity) | Security descriptor on the file mapping (deny `FILE_MAP_WRITE` to non-owner) | Not equivalent — Windows ACLs are per-object, not per-fd. Sealing is coarser-grained. |
+
+  The shim's hot-path functor, the correlation stack, and the ring-buffer protocol are all platform-independent C — only the IPC bootstrap and the consumer-side `poll` loop would need a Windows backend. Estimated scope: ~500 LOC of platform-specific IPC code behind `#ifdef _WIN32`, plus a named-pipe-based `shim_bg_thread_win.c` replacing the socket+eventfd bg thread.
 
 ## 17. Files that would implement this
 
