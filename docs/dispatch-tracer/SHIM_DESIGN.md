@@ -235,15 +235,29 @@ offset          size          contents
                             - uint32_t record_size
                             - uint32_t reserved
 
-0x00000420    (rest)       Ring buffer data  (records)
-                            record { uint64_t tsc;
-                                     uint32_t kind;
-                                     uint32_t op;
-                                     uint32_t phase;   (ENTER/EXIT)
-                                     uint32_t cpu;
-                                     uint64_t thread_id;
-                                     uint64_t correlation_id;
-                                     uint8_t  args[RECORD_ARG_BYTES]; }
+0x00000420    (rest)       Ring buffer data  (records — see §7A.5 + §7B.1)
+                            rocp_shim_record_t {
+                                uint64_t tsc;
+                                uint32_t kind;          /* rocprofiler_callback_tracing_kind_t */
+                                uint32_t op;            /* rocprofiler_*_id_t within kind */
+                                uint32_t phase;         /* ENTER / EXIT */
+                                uint32_t cpu;
+                                uint64_t thread_id;
+                                rocprofiler_correlation_id_t correlation_id;
+                                        /* { internal, external, ancestor } */
+                                uint32_t arg_overflow;  /* 0 = args inline only,
+                                                           else bytes in variable ring */
+                                uint32_t arg_bytes;     /* valid bytes in args[] */
+                                uint8_t  args[RECORD_ARG_BYTES];
+                                        /* Typed payload — cast to the SDK's
+                                         * rocprofiler_<domain>_api_args_<op>_t. */
+                            }
+
+(second memfd, separate mapping)
+0x00000000    (full)       Variable-size auxiliary ring — strings, deep structs,
+                           kernarg blobs. Each entry is prefixed with
+                           { correlation_internal_id, arg_index, kind, length }
+                           so consumer joins on correlation_id. See §7B.2.
 ```
 
 Sealing: after `F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`:
@@ -376,6 +390,227 @@ Generated via a code-generator that reads the intercept-table schemas from rocpr
 ### 7.1 Alternative: GOTCHA rewrite (optional, Linux-only)
 
 When the consumer has never attached and the process is long-running, the shim can optionally do a one-time GOT rewrite to replace `shim_wrap_*` with `g_orig_*` pointers directly, collapsing the fast-path cost to zero. On consumer attach, rewrite back. This is an optimization; the default path is the always-present wrapper as measured.
+
+## 7A. Correlation IDs — mirror rocprofiler-sdk's model end-to-end
+
+Correlation IDs are how a tool answers "which kernel did this `hipLaunchKernel` call cause?" and "which HSA enqueue came from which HIP entry?" The shim reproduces **exactly** the model rocprofiler-sdk exposes today, so a consumer can join shim records against SDK records on the same ID without any translation layer.
+
+### 7A.1 Three ID spaces, same as SDK
+
+Every record the shim emits carries the same `rocprofiler_correlation_id_t` shape the SDK ships:
+
+```c
+typedef struct {
+    uint64_t                  internal;    /* shim-assigned, thread-local monotonic */
+    rocprofiler_user_data_t   external;    /* user-pushed (Kineto, PyTorch, ...) */
+    uint64_t                  ancestor;    /* internal-id of the enclosing wrapper */
+} rocprofiler_correlation_id_t;
+```
+
+- **internal** — assigned by whichever shim wrapper is the outermost on this thread's stack when the call enters. Monotonic across the whole process. Sole source of truth for "this is a distinct call."
+- **external** — the current top of the thread-local external-correlation stack. The shim exposes `rocprofiler_shim_push_external_correlation_id()` / `rocprofiler_shim_pop_external_correlation_id()` with identical semantics to the SDK's public API.
+- **ancestor** — the `internal` ID of the wrapper one level up the call stack, or `0` at the top. This is what makes **cross-library correlation** work: if `hipMemcpy` internally calls `hsa_memory_copy`, the HSA record's `ancestor` is the HIP record's `internal`. Your consumer reconstructs the call tree by joining `ancestor → internal`.
+
+### 7A.2 Thread-local correlation stack
+
+Each thread owns a small stack (say, 16 entries deep — same as SDK's default) storing `(internal, external)` pairs. The shim's wrapper does:
+
+```c
+static void shim_wrap_<domain>_<op>(args...)
+{
+    uint64_t prof_raw = atomic_load_acquire(&profiler_functor[Op]);
+    void*    orig     = g_orig_<domain>_<op>;
+
+    if (__builtin_expect(prof_raw == 0, 1)) {
+        /* Fast path. NO correlation push — it's bookkeeping we don't need
+         * when nobody is listening. Same saving the SDK takes when no
+         * context is active. Measured +0.8 ns/call; §7 of SHIM_COMPARISON. */
+        __attribute__((musttail)) return ((orig_t)orig)(args);
+    }
+
+    /* Slow path — a consumer is attached. Full correlation bookkeeping
+     * runs here, mirroring the SDK's per-call behavior. */
+    rocprofiler_correlation_id_t corr = shim_push_correlation();
+    /*
+     *  shim_push_correlation() {
+     *      uint64_t id  = ++tls.next_internal;
+     *      uint64_t par = tls.stack_depth ? tls.stack[tls.depth-1].internal : 0;
+     *      rocprofiler_user_data_t ext = tls.stack_depth
+     *              ? tls.stack[tls.depth-1].external
+     *              : g_thread_external_base;
+     *      tls.stack[tls.depth++] = (corr_entry){ id, ext };
+     *      return (rocprofiler_correlation_id_t){ id, ext, par };
+     *  }
+     *
+     * If the SDK is also loaded, this additionally calls
+     * rocprofiler_push_external_correlation_id(ext) so SDK-managed
+     * downstream events (HSA queue dispatch, kernel completion,
+     * counter samples) carry the same external ID. See §7A.4.
+     */
+
+    shim_cb_t prof = (shim_cb_t)(uintptr_t)prof_raw;
+    prof(orig, &corr, args);   /* callback gets the full {internal,ext,anc} */
+
+    shim_pop_correlation();
+}
+```
+
+Cross-library correlation falls out naturally: when `hipMemcpy`'s wrapper is on the stack and HIP internally calls `hsa_memory_copy`, the HSA wrapper pushes its own internal ID, sees the HIP wrapper's entry on the stack beneath it, and stamps `ancestor = hip_internal_id`. The consumer reconstructs the parent-child chain with a hash join.
+
+### 7A.3 External correlation IDs — user-facing API
+
+```c
+/* Public, for PyTorch / Kineto / any higher-level tool. Called BY USER
+ * CODE running inside the target process (same as the SDK's equivalent). */
+int rocprofiler_shim_push_external_correlation_id(rocprofiler_user_data_t id);
+int rocprofiler_shim_pop_external_correlation_id (rocprofiler_user_data_t* out);
+```
+
+Implementation: thread-local stack of `rocprofiler_user_data_t` values. The shim's wrapper reads the current top on each entry and copies it into the correlation-id struct.
+
+If the SDK is loaded in the same process, the shim's push/pop **also** calls the SDK's `rocprofiler_push/pop_external_correlation_id` under the same stack semantics. The two stacks stay synchronized; downstream SDK-emitted events (buffered tracing, kernel dispatch records, HW counter samples) carry the same external ID your shim record carries. **One push from user code, two stacks updated, one ID visible everywhere.** This is the whole point of Option C.
+
+### 7A.4 When rocprofiler-sdk is loaded — GPU-side events
+
+Kernel dispatches, HSA queue events, HW counter samples, PC samples — none of these are host API calls and the shim does not see them directly. But when the SDK is loaded:
+
+- Shim's `shim_push_correlation()` sets its `internal` ID into thread-local storage that the SDK's intercept-table wrappers read.
+- Shim pushes its external ID via the SDK's `rocprofiler_push_external_correlation_id` (or skips if the user did it themselves — the stacks compose).
+- SDK's HSA queue interceptor, at enqueue time, reads thread-local correlation and stamps it on the kernel-dispatch record it emits into its own buffer.
+
+Result: the kernel-dispatch record the SDK writes to its buffer carries `external_id == shim's external_id` and `internal_id == SDK's own internal` (different space, intentional — `internal` is scoped to the emitter). Your consumer joins shim records and SDK kernel-dispatch records on `external_id`.
+
+If the shim is running without the SDK, GPU-side events are simply not captured — same as running rocprofv3 with callback tracing but no buffered tracing today. Documented limitation; same architectural trade-off.
+
+### 7A.5 Summary — what a consumer sees
+
+Every shim record carries:
+
+```
++------------------------------------------------------------+
+| rocp_shim_record_t                                         |
+|   tsc, kind, op, phase, thread_id                          |
+|   correlation_id = { internal, external, ancestor }        |
+|   args = typed payload (see §7B)                           |
++------------------------------------------------------------+
+```
+
+Joins:
+
+- `ancestor → internal` reconstructs cross-library parent chains within the shim's host events.
+- `external_id` reconstructs user-driven scopes (PyTorch module, training iteration, etc.).
+- `external_id` also joins shim records to SDK-emitted GPU events when both coexist.
+
+No new concepts, no translation table. Identical to how rocprofv3's JSON output joins today.
+
+## 7B. Arguments — mirror rocprofiler-sdk's buffer tracing model
+
+For every API the shim wraps, we need to deliver its arguments to a consumer in a different address space. The shim does exactly what the SDK's buffer tracer does: **inline-typed payload for scalars/handles, variable-size auxiliary ring for strings and deep-pointed data.** The schema that classifies each arg is the same one the SDK uses today.
+
+### 7B.1 Typed payload — inline in the record
+
+For every (domain, op), there is a generated typed struct — the **same struct** rocprofiler-sdk emits into its callback-tracing records today. Reuse, don't parallel-define. Source of truth lives in rocprofiler-sdk's headers.
+
+```c
+/* Generated from rocprofiler-sdk/hip/api_args.h — identical layout. */
+typedef struct {
+    const void*  func;
+    dim3         grid;
+    dim3         block;
+    void**       kernarg_ptr;   /* pointer VALUE only, see §7B.3 */
+    size_t       shmem;
+    hipStream_t  stream;        /* opaque handle — pointer value */
+} rocprofiler_hip_api_args_hipLaunchKernel_t;
+```
+
+Every shim ring record reserves a fixed payload area (default 256 bytes) big enough for every wrapped API's packed args. For APIs whose args exceed the inline budget, the record flags the overflow and the extra bytes go in the variable-size ring (§7B.2).
+
+### 7B.2 Variable-size auxiliary ring — same role as SDK's buffered string pool
+
+A second memfd-backed producer-consumer ring, mapped alongside the primary record ring, carrying:
+
+- String-valued args (kernel names, file paths, shader source)
+- Deep-copied structs the API schema marks "copy contents"
+- Kernel argument buffers (for APIs like `hipLaunchKernel` where the `void**` points at a runtime-owned blob of scalar kernel args)
+
+Each variable-size entry is prefixed with `{correlation_internal_id, arg_index, length}` so the consumer joins on correlation_id to the primary record. The SDK's buffer tracer does precisely this today (see `rocprofiler-sdk-tool/buffered_output.cpp`).
+
+Layout:
+
+```
+variable ring entry:
+    uint64_t  correlation_internal_id
+    uint16_t  arg_index          /* which parameter of the API this blob is for */
+    uint16_t  kind               /* STRING / DEEP_STRUCT / KERNARG_BLOB / ... */
+    uint32_t  length
+    uint8_t   payload[length]
+```
+
+### 7B.3 Pointer semantics — same as SDK callback tracing
+
+When an arg is `hipStream_t stream`, the SDK's in-process callback gets the pointer value and can call `hipStreamGetName(stream)` (cheap, in-process). The consumer in the shim's OOP world has the same pointer value but cannot deref — it lives in a different address space.
+
+The policy the shim applies per-arg, from the SDK schema:
+
+| Schema classification | What the shim does | Consumer sees |
+|---|---|---|
+| **SCALAR** (`int`, `size_t`, `dim3`, enum) | Copy by value into the inline payload | Direct field access |
+| **HANDLE** (`hipStream_t`, `hsa_queue_t`, `ihipModule_t*`) | Copy pointer value into the inline payload | Pointer as opaque ID |
+| **FIXED_STRUCT** (`hipMemcpy3DParms`) | Copy struct by value into the inline payload | Direct struct access |
+| **STRING** (`const char*`, null-terminated) | Write blob into variable-size ring | Join on correlation_id, read blob |
+| **DEEP_STRUCT** (schema says "follow pointer, copy contents") | Serialize into variable-size ring | Join + deserialize |
+| **KERNARG_BLOB** (`void** kargs` in `hipLaunchKernel`) | Opt-in per op — when enabled, copy kernel-arg bytes into variable-size ring | Join + deserialize per kernel's signature |
+| **OUTPUT_ONLY** (`hipError_t*` return slot) | Skip at ENTER, capture at EXIT | Populated only on EXIT record |
+
+The same schema classification drives the SDK's own `rocprofiler_iterate_callback_tracing_kind_operation_args` today. The shim's code generator reads that schema and emits per-op serializers; the SDK's generator emits the iterator. Same input, different outputs for different destinations.
+
+### 7B.4 Opt-in serialization — per-op, controlled by consumer
+
+The variable-size ring is cost. Always emitting kernel-name strings for every `hipLaunchKernel` at MHz rates can swamp the consumer. The shim exposes per-op policy:
+
+```c
+/* Consumer side: */
+int rocp_shim_set_arg_policy(rocp_shim_handle_t h,
+                             uint32_t domain, uint32_t op,
+                             rocp_shim_arg_policy_t policy);
+
+enum rocp_shim_arg_policy_t {
+    ROCP_SHIM_ARGS_INLINE_ONLY  = 0,  /* default: scalars + handles only */
+    ROCP_SHIM_ARGS_WITH_STRINGS = 1,  /* plus string args in variable ring */
+    ROCP_SHIM_ARGS_FULL         = 2,  /* plus DEEP_STRUCT / KERNARG_BLOB */
+};
+```
+
+Written as another atomic slot in the memfd header; target reads per-op policy on every call (zero overhead if policy == INLINE_ONLY, which is the default).
+
+### 7B.5 Consumer code — identical to SDK buffer tracing
+
+```c
+static void on_record(const rocp_shim_record_t* rec, ...)
+{
+    if (rec->kind == ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API &&
+        rec->op   == HIPAPI_ID_hipLaunchKernel)
+    {
+        /* Same typed struct the SDK hands you. */
+        const rocprofiler_hip_api_args_hipLaunchKernel_t* a =
+            (const void*)rec->args;
+
+        /* Kernel name: resolved via variable-size ring, joined on
+         * correlation_id. Helper walks the ring for us. */
+        const char* name = rocp_shim_get_string_arg(rec->correlation_id.internal,
+                                                    /* arg_index */ 0);
+
+        printf("[tsc=%" PRIu64 ", corr=%" PRIu64 " (parent %" PRIu64 ")] "
+               "%s grid=%ux%ux%u\n",
+               rec->tsc, rec->correlation_id.internal,
+               rec->correlation_id.ancestor,
+               name ? name : "?",
+               a->grid.x, a->grid.y, a->grid.z);
+    }
+}
+```
+
+Line-for-line the same as a rocprofv3 callback-tracing tool — swap `rocprofiler_callback_tracing_record_t` for `rocp_shim_record_t` and the typed args cast is identical because the struct layout is sourced from the same header.
 
 ## 8. In-process rocprofiler-sdk coexistence
 
@@ -619,6 +854,15 @@ int rocprofiler_shim_present;
 
 /* OMPT entry point — called by the OpenMP runtime at init. */
 ompt_start_tool_result_t* ompt_start_tool(unsigned int, const char*);
+
+/* External-correlation push/pop — called by user code running inside the
+ * target (PyTorch profiler, Kineto, HPCToolkit, ...). Identical semantics
+ * to rocprofiler-sdk's public push/pop. When the SDK is also loaded in
+ * the process, the shim forwards every push/pop to the SDK so the two
+ * external-correlation stacks stay synchronized and downstream GPU
+ * events carry the same external ID. See §7A.3. */
+int rocprofiler_shim_push_external_correlation_id(rocprofiler_user_data_t id);
+int rocprofiler_shim_pop_external_correlation_id (rocprofiler_user_data_t* out);
 ```
 
 ### 13.2 What the consumer-side library exports (visible to OOP tool binaries)
@@ -650,6 +894,21 @@ int rocp_shim_get_stats(rocp_shim_handle_t h, rocp_shim_stats_t* out);
 
 /* Clean detach. */
 int rocp_shim_detach(rocp_shim_handle_t h);
+
+/* Per-op argument serialization policy. Default is INLINE_ONLY (scalars
+ * + handles, zero variable-size ring traffic). See §7B.4. */
+int rocp_shim_set_arg_policy(rocp_shim_handle_t h,
+                             uint32_t domain, uint32_t op,
+                             rocp_shim_arg_policy_t policy);
+
+/* Resolve a variable-size arg (string, deep struct, kernarg blob) from
+ * the auxiliary ring by joining on correlation_internal_id + arg_index.
+ * Called from inside the consumer's record callback. */
+const void* rocp_shim_get_var_arg(rocp_shim_handle_t h,
+                                  uint64_t correlation_internal_id,
+                                  uint16_t arg_index,
+                                  uint32_t* out_length,
+                                  uint16_t* out_kind);
 ```
 
 ### 13.3 User's consumer callback
@@ -657,8 +916,12 @@ int rocp_shim_detach(rocp_shim_handle_t h);
 ```c
 typedef void (*rocp_shim_cb_t)(
     void* orig,                /* original function pointer — can be called */
-    const rocp_shim_context_t* ctx,  /* domain, op, tsc, correlation_id */
-    void* args);                /* domain-specific argument struct */
+    const rocp_shim_context_t* ctx,  /* domain, op, tsc, tid,
+                                      * correlation_id = {internal, external,
+                                      * ancestor} — see §7A */
+    void* args);                /* domain-specific argument struct, same
+                                 * layout as rocprofiler-sdk's
+                                 * rocprofiler_<domain>_api_args_<op>_t — see §7B */
 ```
 
 The callback is invoked **by the target** (not the consumer) with the original function pointer as its first argument. The callback is responsible for:
@@ -718,7 +981,8 @@ Minimum validation suite:
 
 - **Multi-threaded consumer-side callback invocation**: the consumer may want its user-supplied callback to run in a thread pool. Today the consumer's `rocp_shim_poll` is single-threaded. Add `rocp_shim_poll_threaded` with a user-provided thread-pool?
 - **Per-op filters**: today `profiler_functor[Op]` is all-or-nothing per op. Real users want filters like "trace only HIP launches whose stream == X". Add a per-op filter in the consumer callback (the trivial answer), or extend the protocol with a filter bitmap per op?
-- **Correlation IDs across shim and in-process SDK**: the shim and SDK both produce records. A cross-record correlation ID (e.g. a per-thread counter) would let users reconcile traces. Shared by placing a `rocprofiler_correlation_source` pointer in the header?
+- ~~**Correlation IDs across shim and in-process SDK**~~ — **resolved**: see §7A. Shim maintains a thread-local internal/external/ancestor stack with identical semantics to the SDK's; when the SDK is loaded, the shim forwards external pushes into the SDK's stack so downstream GPU events carry the same external ID. Cross-library correlation (HIP calling HSA etc.) works via the `ancestor` field.
+- ~~**Argument serialization model**~~ — **resolved**: see §7B. Inline fixed-size typed payload in each record (scalars + handles) + variable-size auxiliary ring keyed by `correlation_internal_id` for strings and deep-copied data. Same two-tier structure the SDK's buffer tracer uses today; schema classification reused from rocprofiler-sdk's existing arg metadata.
 - **Record schema evolution**: if `record_size` grows in a future version, old consumers parsing with a smaller struct will misread. Handshake `struct_version` handles the easy case (refuse to mmap); a capability bitmap in the handshake would let consumers negotiate record-version per op.
 - **Ring size as a consumer option**: consumer may want larger rings for heavy workloads. Today the size is fixed at target startup. A `rocp_shim_resize_ring` query could reallocate if both sides agree, but `F_SEAL_GROW` prevents grow-in-place; would need a secondary memfd + handoff. Not a v1 feature.
 - **Aarch64 validation**: the +0.8 ns measurement is EPYC-class x86-64. Weakly-ordered architectures may see different absolute costs — the `atomic_load_acquire` maps to a `LDAR` on ARMv8 which is slower than a plain load plus x86's implicit acquire. Re-measure when aarch64 hardware is available.

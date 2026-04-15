@@ -45,6 +45,13 @@
 
 #define SHIM_NUM_OPS 2   /* op0 = my_traced_function, op1 = set_simulated_work_duration */
 
+/* Forward declaration — full definition below in the correlation section. */
+typedef struct {
+    uint64_t internal;
+    uint64_t external;
+    uint64_t ancestor;
+} shim_correlation_id_t;
+
 /* Type-erased function-pointer holders. The shim wrappers cast back to
  * the known signatures at call time. Keep these as plain void* with
  * atomic stores/loads so the "is a profiler attached?" check costs a
@@ -57,11 +64,17 @@ static pthread_mutex_t g_shim_install_lock = PTHREAD_MUTEX_INITIALIZER;
 static int             g_shim_installed[SHIM_NUM_OPS] = { 0, 0 };
 
 /* Profiler function-pointer signatures. Each profiler functor gets the
- * original function pointer as its first argument plus the original
- * call arguments, and is responsible for (optionally) invoking the
- * original. This matches the shim design sketch. */
-typedef void (*shim_prof_op0_t)(void* orig, int a1, uint64_t a2, double a3, void* a4);
-typedef void (*shim_prof_op1_t)(void* orig, unsigned int us);
+ * original function pointer as its first argument, a correlation-id
+ * context, plus the original call arguments, and is responsible for
+ * (optionally) invoking the original. Matches SHIM_DESIGN §7A.5 /
+ * §13.3 — internal/external/ancestor triple, same shape as the SDK's
+ * rocprofiler_correlation_id_t. */
+typedef void (*shim_prof_op0_t)(void* orig,
+                                const shim_correlation_id_t* corr,
+                                int a1, uint64_t a2, double a3, void* a4);
+typedef void (*shim_prof_op1_t)(void* orig,
+                                const shim_correlation_id_t* corr,
+                                unsigned int us);
 
 /* Signatures of the original library entry points. */
 typedef void (*orig_op0_t)(int, uint64_t, double, void*);
@@ -80,15 +93,25 @@ typedef void (*orig_op1_t)(unsigned int);
 /*   jmp    *%rax                             # tail-call original     */
 /* ------------------------------------------------------------------ */
 
+/* Forward declarations so the wrappers above can call the correlation
+ * helpers defined further down. */
+static shim_correlation_id_t shim_push_correlation(void);
+static void                  shim_pop_correlation (void);
+
 static void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 {
     void* prof = atomic_load_explicit(&g_shim_profiler[0], memory_order_acquire);
     void* orig = atomic_load_explicit(&g_shim_orig[0],     memory_order_acquire);
     if (__builtin_expect(prof == NULL, 1)) {
+        /* Fast path — no correlation bookkeeping. */
         ((orig_op0_t)orig)(a1, a2, a3, a4);
         return;
     }
-    ((shim_prof_op0_t)prof)(orig, a1, a2, a3, a4);
+    /* Slow path — profiler attached. Push correlation so the callback
+     * sees internal/external/ancestor, mirroring rocprofiler-sdk. */
+    shim_correlation_id_t corr = shim_push_correlation();
+    ((shim_prof_op0_t)prof)(orig, &corr, a1, a2, a3, a4);
+    shim_pop_correlation();
 }
 
 static void shim_wrap_op1(unsigned int us)
@@ -99,7 +122,9 @@ static void shim_wrap_op1(unsigned int us)
         ((orig_op1_t)orig)(us);
         return;
     }
-    ((shim_prof_op1_t)prof)(orig, us);
+    shim_correlation_id_t corr = shim_push_correlation();
+    ((shim_prof_op1_t)prof)(orig, &corr, us);
+    shim_pop_correlation();
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,6 +233,75 @@ void* shim_get_original(int op)
 {
     if (op < 0 || op >= SHIM_NUM_OPS) return NULL;
     return atomic_load_explicit(&g_shim_orig[op], memory_order_acquire);
+}
+
+/* ------------------------------------------------------------------ */
+/* Correlation IDs — mirrors rocprofiler-sdk's semantics.              */
+/*                                                                    */
+/* Each thread owns:                                                  */
+/*   - a monotonic internal-id counter                                */
+/*   - a small stack of (internal, external) pairs                    */
+/*                                                                    */
+/* On entry to a wrapper whose profiler_functor is non-null, push     */
+/* a new frame; ancestor is the previous top's internal id.           */
+/* On exit, pop. The user-facing push/pop-external API mirrors the    */
+/* SDK's rocprofiler_push_external_correlation_id. See SHIM_DESIGN §7A. */
+/* ------------------------------------------------------------------ */
+
+#define SHIM_CORR_STACK_MAX 16
+
+typedef struct { uint64_t internal; uint64_t external; } shim_corr_frame_t;
+
+static _Thread_local uint64_t         tls_next_internal   = 0;
+static _Thread_local int              tls_corr_depth      = 0;
+static _Thread_local shim_corr_frame_t tls_corr_stack[SHIM_CORR_STACK_MAX];
+static _Thread_local uint64_t         tls_external_base   = 0;  /* current user-pushed */
+
+/* shim_correlation_id_t is forward-declared at the top of this file. */
+
+static inline shim_correlation_id_t shim_push_correlation(void)
+{
+    uint64_t id  = ++tls_next_internal;
+    uint64_t par = tls_corr_depth ? tls_corr_stack[tls_corr_depth - 1].internal : 0;
+    uint64_t ext = tls_corr_depth ? tls_corr_stack[tls_corr_depth - 1].external
+                                  : tls_external_base;
+    if (tls_corr_depth < SHIM_CORR_STACK_MAX) {
+        tls_corr_stack[tls_corr_depth].internal = id;
+        tls_corr_stack[tls_corr_depth].external = ext;
+        tls_corr_depth++;
+    }
+    return (shim_correlation_id_t){ id, ext, par };
+}
+
+static inline void shim_pop_correlation(void)
+{
+    if (tls_corr_depth > 0) tls_corr_depth--;
+}
+
+/* Public — same signature as rocprofiler_sdk's push/pop. Called by user
+ * code running in the target process (PyTorch profiler, Kineto, ...). */
+__attribute__((visibility("default")))
+int rocprofiler_shim_push_external_correlation_id(uint64_t id)
+{
+    /* For the mock we keep a single scalar; the real shim will also
+     * forward this to the SDK's stack when the SDK is loaded. */
+    tls_external_base = id;
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int rocprofiler_shim_pop_external_correlation_id(uint64_t* out)
+{
+    if (out) *out = tls_external_base;
+    tls_external_base = 0;  /* simplified — real impl uses a stack */
+    return 0;
+}
+
+/* Exposed for the benchmark + tests to inspect correlation state. */
+__attribute__((visibility("default")))
+uint64_t shim_current_internal_id(void)
+{
+    return tls_corr_depth ? tls_corr_stack[tls_corr_depth - 1].internal : 0;
 }
 
 /* ------------------------------------------------------------------ */
