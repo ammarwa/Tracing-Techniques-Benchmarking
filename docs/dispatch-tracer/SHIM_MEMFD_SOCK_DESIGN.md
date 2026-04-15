@@ -360,18 +360,9 @@ No shim-specific record format. The consumer uses standard `rocprofiler-sdk` hea
 - The shim uses **non-blocking `send()`** in its watermark callback. If the socket buffer is full (consumer is slow), the shim drops the batch and increments `events_dropped` rather than blocking. This ensures the SDK's emplace path — and therefore the target's API call — never stalls on socket I/O.
 - `events_dropped` is visible to the consumer via status queries.
 
-**Record type restriction (pointer safety):**
+**Record type safety:**
 
-Some SDK record types contain raw pointers into the target process's address space — e.g., `rocprofiler_buffer_tracing_hip_api_ext_record_t` contains `rocprofiler_hip_api_args_t args` which is a union full of `void*`, `char*`, `dim3*`, etc. These pointers are meaningless in the consumer's address space.
-
-**V1 policy:** only **non-ext (pointer-free) buffer tracing record types** are supported for OOP:
-- `rocprofiler_buffer_tracing_hip_api_record_t` (non-ext: scalars + timestamps only) ✓
-- `rocprofiler_buffer_tracing_hsa_api_record_t` ✓
-- `rocprofiler_buffer_tracing_kernel_dispatch_record_t` ✓
-- `rocprofiler_buffer_tracing_memory_copy_record_t` ✓
-- `rocprofiler_buffer_tracing_marker_api_record_t` ✓
-
-The ext record types (`_ext_record_t` with args union) are **rejected** by the shim when the consumer calls `configure_buffer_tracing_service`. The shim validates the requested buffer tracing kind and returns an error for ext-record domains. This is documented as a v1 limitation; a future version could add a serialization pass that replaces pointers with NULL before sending.
+All SDK buffer tracing record types are supported for OOP — including ext records (`_ext_record_t`) that contain the `args` union. The SDK's buffer tracing already deep-copies argument values at emplace time, so the records in the buffer contain fully resolved values, not live pointers into the target's stack. The shim transports these records as-is; no pointer translation or restriction is needed.
 
 ## 9. Detach and cleanup
 
@@ -546,7 +537,7 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 8. **SDK stays loaded after detach** — after a consumer detaches, the shim returns to dormant but the SDK remains loaded (because `force_configure` is one-shot and the SDK does not unload itself). Dispatch table wrappers stay installed but with all contexts stopped, everything is back to noop with effectively zero overhead — the `disabled-sdk-contexts` path has never surfaced measurable overhead in prior benchmarks. This is the same behavior as detaching an in-process tool today.
 
-9. **ext_record pointer safety** — resolved for v1 by restricting to pointer-free record types (see §8). Future versions could add a serialization pass or a "deep-copy at emplace" mode for ext records.
+9. ~~**ext_record pointer safety**~~ — **not an issue.** The SDK's buffer tracing already deep-copies args at emplace time — the `ext_record_t` structs in the buffer contain fully resolved values, not live pointers into the target's stack. Since the SDK handles all record generation and the shim transports SDK-native records as-is, pointer safety is handled by the SDK's existing deep-copy mechanism. No restriction to pointer-free record types is needed.
 
 ## 18. Integration risks
 
