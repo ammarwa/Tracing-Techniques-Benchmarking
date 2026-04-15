@@ -35,6 +35,15 @@ typedef struct {
     char value[SHIM_ARG_STR_MAX];
 } shim_arg_entry_t;
 
+/* ---- Deep-copy support (MODE_RECORD_FULL) ---- */
+
+#define SHIM_DEEP_COPY_MAX 128
+
+/* Called at EXIT time IN THE TARGET to dereference pointer args and
+ * inline pointed-at structs into the record extension area. */
+typedef uint32_t (*shim_deep_copy_fn_t)(const void* packed_args,
+                                        uint8_t* dst, uint32_t dst_size);
+
 /* Per-op arg descriptor (compile-time metadata). The shim's code
  * generator populates one of these per (table, op). */
 typedef struct {
@@ -42,11 +51,18 @@ typedef struct {
     struct {
         const char* name;
         const char* type;
-        /* Formatter: given a pointer to the packed arg struct, write
-         * the string representation of this arg into dst. */
         void (*format)(const void* packed_args, char* dst, uint32_t dst_size);
+        /* format_deep reads from the deep-copy payload (inlined struct copy
+         * appended after packed args in the record). Used only when
+         * MODE_RECORD_FULL is enabled for this op. NULL for scalar args. */
+        void (*format_deep)(const void* deep_payload, char* dst, uint32_t dst_size);
     } args[SHIM_MAX_ARGS_PER_OP];
+    /* Deep-copy function. Called at EXIT in TARGET to dereference pointer
+     * args and inline the pointed-at structs. NULL = all scalar args. */
+    shim_deep_copy_fn_t deep_copy;
 } shim_op_arg_descriptor_t;
+
+/* ---- String serialization support (iterate_args pattern) ---- */
 
 /* Serialize all args of an op into a flat array of shim_arg_entry_t.
  * Returns the number of bytes written (n_args * sizeof(shim_arg_entry_t)). */

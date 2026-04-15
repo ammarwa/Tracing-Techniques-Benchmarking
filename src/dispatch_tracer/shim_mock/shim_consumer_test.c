@@ -64,12 +64,27 @@ static void print_args(const shim_record_t* rec)
 
     /* iterate_args: walk the descriptor, call each formatter on the raw
      * packed-args binary from the record. String conversion happens HERE
-     * in the consumer process, not in the target — matching the SDK. */
+     * in the consumer process, not in the target — matching the SDK.
+     *
+     * If the op has a deep_copy function AND the record has extra data
+     * beyond the basic packed-args size, the deep-copy payload is appended
+     * after the packed args. Pointer-arg formatters use format_deep to
+     * read the inlined struct copy instead of the target-side pointer. */
+    uint32_t packed_size = 0;
+    if (g_con_ctrl && rec->op < SHIM_MAX_TOTAL_OPS)
+        packed_size = g_con_ctrl->op_info[rec->op].arg_total_bytes;
+
+    const uint8_t* deep_payload = NULL;
+    if (desc->deep_copy && rec->arg_bytes > packed_size)
+        deep_payload = rec->args + packed_size;
+
     printf("  (");
     for (uint32_t i = 0; i < desc->n_args; i++) {
         if (i > 0) printf(", ");
-        char val[96];
-        if (desc->args[i].format) {
+        char val[128];
+        if (deep_payload && desc->args[i].format_deep) {
+            desc->args[i].format_deep(deep_payload, val, sizeof(val));
+        } else if (desc->args[i].format) {
             desc->args[i].format(rec->args, val, sizeof(val));
         } else {
             snprintf(val, sizeof(val), "?");
@@ -106,11 +121,14 @@ static void on_record(const shim_record_t* rec, void* user_data)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <pid> [duration_sec]\n", argv[0]);
+        fprintf(stderr, "usage: %s <pid> [duration_sec] [--full]\n", argv[0]);
         return 2;
     }
     pid_t target = atoi(argv[1]);
     int duration = argc > 2 ? atoi(argv[2]) : 5;
+    int full_mode = 0;
+    for (int a = 1; a < argc; a++)
+        if (strcmp(argv[a], "--full") == 0) full_mode = 1;
     signal(SIGINT, on_sigint);
 
     /* 1. Attach (§4) */
@@ -134,14 +152,16 @@ int main(int argc, char** argv)
                t->slot_base, t->slot_base + t->n_ops);
     }
 
-    /* 2. Enable all ops with RECORD mode (§5.1 install-while-off) */
+    /* 2. Enable all ops (§5.1 install-while-off).
+     *    --full: MODE_RECORD_FULL (deep-copy pointed-at structs)
+     *    default: MODE_RECORD (scalars + pointer values only) */
+    uint32_t mode = full_mode ? ROCP_SHIM_MODE_RECORD_FULL : ROCP_SHIM_MODE_RECORD;
+    const char* mode_str = full_mode ? "RECORD_FULL" : "RECORD";
     for (uint32_t i = 0; i < con.ctrl->total_ops; i++) {
-        atomic_store_explicit(&con.ctrl->op_mode[i],
-                              ROCP_SHIM_MODE_RECORD,
-                              memory_order_release);
+        atomic_store_explicit(&con.ctrl->op_mode[i], mode, memory_order_release);
     }
     atomic_fetch_add(&con.ctrl->gen_counter, 1);
-    printf("=== Enabled %u ops, mode=RECORD ===\n", con.ctrl->total_ops);
+    printf("=== Enabled %u ops, mode=%s ===\n", con.ctrl->total_ops, mode_str);
 
     /* 3. Poll loop */
     uint64_t total_records = 0;

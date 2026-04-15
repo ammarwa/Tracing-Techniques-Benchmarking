@@ -221,10 +221,28 @@ static void shim_handle_event(uint32_t op, uint32_t mode,
         }
 
         /* EXIT record — carries the RAW packed-args struct (compact binary).
-         * String conversion happens consumer-side via iterate_args(),
-         * matching rocprofiler-sdk's pattern: the record is compact, the
-         * tool decodes on demand using the shared .def descriptors. */
-        shim_emit_record(op, SHIM_PHASE_EXIT, &corr, packed_args, arg_bytes);
+         * MODE_RECORD_ARGS: packed args only (scalars, handles, pointer values).
+         * MODE_RECORD_FULL: packed args + deep-copied pointed-at structs
+         *   appended after, matching SDK's ext_record_t pattern. */
+        if (mode >= ROCP_SHIM_MODE_RECORD_FULL) {
+            const shim_op_arg_descriptor_t* desc = get_arg_desc(op);
+            if (desc && desc->deep_copy) {
+                uint8_t full_buf[SHIM_RECORD_ARG_BYTES];
+                uint32_t off = 0;
+                if (arg_bytes > 0 && arg_bytes <= sizeof(full_buf)) {
+                    memcpy(full_buf, packed_args, arg_bytes);
+                    off = arg_bytes;
+                }
+                uint32_t deep_sz = desc->deep_copy(packed_args,
+                    full_buf + off, sizeof(full_buf) - off);
+                shim_emit_record(op, SHIM_PHASE_EXIT, &corr,
+                                 full_buf, off + deep_sz);
+            } else {
+                shim_emit_record(op, SHIM_PHASE_EXIT, &corr, packed_args, arg_bytes);
+            }
+        } else {
+            shim_emit_record(op, SHIM_PHASE_EXIT, &corr, packed_args, arg_bytes);
+        }
 
         shim_pop_correlation();
     }
@@ -571,10 +589,23 @@ int mock_sdk_set_api_table(const char* name,
             if (strcmp(name, "mylib") == 0)      { op_names = mylib_names; max_names = 2; }
             else if (strcmp(name, "libA_hsa") == 0) { op_names = liba_names; max_names = 4; }
             else if (strcmp(name, "libB_hip") == 0) { op_names = libb_names; max_names = 4; }
+            /* Per-op packed-arg sizes for deep-copy boundary detection. */
+            static const uint32_t mylib_arg_sizes[]  = { sizeof(packed_op0_args_t), sizeof(packed_op1_args_t) };
+            static const uint32_t liba_arg_sizes[]   = { sizeof(packed_liba_op0_t), sizeof(packed_liba_op1_t),
+                                                          sizeof(packed_liba_op2_t), sizeof(packed_liba_op3_t) };
+            static const uint32_t libb_arg_sizes[]   = { sizeof(packed_libb_op0_t), sizeof(packed_libb_op1_t),
+                                                          sizeof(packed_libb_op2_t), sizeof(packed_libb_op3_t) };
+            const uint32_t* arg_sizes = NULL;
+            if (strcmp(name, "mylib") == 0)         arg_sizes = mylib_arg_sizes;
+            else if (strcmp(name, "libA_hsa") == 0) arg_sizes = liba_arg_sizes;
+            else if (strcmp(name, "libB_hip") == 0) arg_sizes = libb_arg_sizes;
+
             if (op_names) {
                 for (uint32_t i = 0; i < num_fn_entries && i < max_names; i++) {
                     snprintf(g_ipc.ctrl->op_info[base + i].name,
                              SHIM_OP_NAME_MAX, "%s", op_names[i]);
+                    if (arg_sizes)
+                        g_ipc.ctrl->op_info[base + i].arg_total_bytes = arg_sizes[i];
                 }
             }
 
