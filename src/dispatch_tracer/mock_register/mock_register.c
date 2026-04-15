@@ -30,10 +30,12 @@
 #define MAX_REGISTERED_TABLES 16
 #define MAX_LIB_NAMES         16
 
+#define MAX_TABLES_PER_REGISTRATION 4
+
 typedef struct {
     char               name[64];
     uint32_t           version;
-    void**             api_tables;
+    void*              api_tables[MAX_TABLES_PER_REGISTRATION]; /* copied, not stored by pointer */
     uint64_t           api_table_length;
     mock_register_id_t register_id;
     int                in_use;
@@ -238,7 +240,11 @@ int mock_register_library_api_table(const char*         lib_name,
     registered_entry_t* e = &g_registry[slot];
     snprintf(e->name, sizeof(e->name), "%s", lib_name);
     e->version          = lib_version;
-    e->api_tables       = api_tables;
+    /* Copy the table pointers into the registry entry — do NOT store the
+     * caller's pointer, which may be stack-allocated and go stale after
+     * the constructor returns. (Code-review finding: use-after-free) */
+    for (uint64_t ti = 0; ti < api_table_length && ti < MAX_TABLES_PER_REGISTRATION; ti++)
+        e->api_tables[ti] = api_tables[ti];
     e->api_table_length = api_table_length;
     e->register_id      = id;
     e->in_use           = 1;
