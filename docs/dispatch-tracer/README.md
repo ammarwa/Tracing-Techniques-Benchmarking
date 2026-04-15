@@ -20,11 +20,11 @@ See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNE
 | [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) | Survey of all 13 control channel mechanisms evaluated, elimination criteria, and final selection of 4 surviving options |
 | [MMAP.md](MMAP.md) | Design using memory-mapped regular file under `/run/user/<uid>/` — simplest control channel |
 | [SOCKET.md](SOCKET.md) | Design using Unix domain socket with `SO_PEERCRED` — strongest authentication |
-| [MEMFD.md](MEMFD.md) | Design combining Unix socket auth with `memfd_create` anonymous shared memory — best overall for production |
+| [MEMFD_SOCK.md](MEMFD_SOCK.md) | Design combining Unix socket auth with `memfd_create` anonymous shared memory — best overall for production |
 | [SIGNAL.md](SIGNAL.md) | Design using real-time signals as instant notification layered on top of mmap or memfd |
 | [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Measured benchmark results for all 4 options (noop, attach latency, active tracing) on AMD EPYC 9354 |
 | [SHIM_COMPARISON.md](SHIM_COMPARISON.md) | Comparison of our late-load stub design vs. the alternative `rocprofiler-sdk-shim` design, with the memfd+sock hybrid applied to both, and where each breaks/keeps/strengthens the requirements |
-| [SHIM_DESIGN.md](SHIM_DESIGN.md) | End-to-end design for the shim architecture with the memfd+sock channel: library layout, startup + attach + tracing + detach sequences, memfd layout, shim↔SDK ABI contract, OMPT integration, security model, ring-buffer protocol, test plan |
+| [SHIM_MEMFD_SOCK_DESIGN.md](SHIM_MEMFD_SOCK_DESIGN.md) | End-to-end design for the shim architecture with the memfd+sock channel: library layout, startup + attach + tracing + detach sequences, memfd layout, shim↔SDK ABI contract, OMPT integration, security model, ring-buffer protocol, test plan |
 
 ## Quick Comparison
 

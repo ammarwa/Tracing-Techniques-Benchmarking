@@ -579,7 +579,7 @@ Each option is designed in detail in its own document:
 
 - [mmap Design: mmap Regular File](MMAP.md)
 - [socket Design: Unix Domain Socket](SOCKET.md)
-- [memfd Design: Socket + Anonymous Shared Memory](MEMFD.md)
+- [memfd Design: Socket + Anonymous Shared Memory](MEMFD_SOCK.md)
 - [signal Design: Signal-Triggered Data Channel](SIGNAL.md)
 
 ## References

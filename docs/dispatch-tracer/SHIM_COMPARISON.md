@@ -5,7 +5,7 @@ This document compares the two late-attach OOP-profiling designs that have been 
 - **Late-load stub** (the design surveyed in the rest of this directory): a tiny library is `LD_PRELOAD`'d into the target process; it defers loading rocprofiler-sdk until a controller attaches.
 - **rocprofiler-sdk-shim** (the proposal): a shim library is `dlopen`'d unconditionally by rocprofiler-register when it receives a dispatch table, installs a lightweight "maybe-call-profiler" functor over every entry from the start, and flips a pointer at attach time instead of loading the SDK.
 
-Both designs solve the same real problem — late-attach, no-sudo, no-ptrace OOP profiling for HIP/HSA/RCCL/OMPT — but from opposite architectural ends. This doc lays out what is different, what is the same, whether either violates the requirements we set in [CONTROL_CHANNEL_SURVEY.md § Requirements](CONTROL_CHANNEL_SURVEY.md#requirements), and how our preferred IPC hybrid (**memfd + socket**, see [MEMFD.md](MEMFD.md)) plugs into each.
+Both designs solve the same real problem — late-attach, no-sudo, no-ptrace OOP profiling for HIP/HSA/RCCL/OMPT — but from opposite architectural ends. This doc lays out what is different, what is the same, whether either violates the requirements we set in [CONTROL_CHANNEL_SURVEY.md § Requirements](CONTROL_CHANNEL_SURVEY.md#requirements), and how our preferred IPC hybrid (**memfd + socket**, see [MEMFD_SOCK.md](MEMFD_SOCK.md)) plugs into each.
 
 ## TL;DR
 
@@ -18,9 +18,9 @@ Both designs solve the same real problem — late-attach, no-sudo, no-ptrace OOP
 | Does rocprofiler-sdk get loaded for OOP profiling? | **Yes** — at attach | **No** — shim has its own OOP API; SDK stays out of the address space |
 | Coexistence of in-process SDK + OOP shim tool | Awkward — SDK is the only wrapper machinery | Natural — SDK layers its wrappers on top of the shim's `functor` |
 | OMPT handling | Stub exports a silent `ompt_start_tool` (design contract; not in the mock yet) | Shim must do the same — `ompt_start_tool` is a one-shot OpenMP init scan, not a dispatch table |
-| Correlation IDs (internal / external / cross-library ancestor) | Inherits whatever SDK does after attach — no end-to-end story if SDK never loads | **End-to-end parity with rocprofiler-sdk** — shim owns a thread-local internal/external/ancestor stack, identical semantics. Forwards external pushes to SDK's stack when both coexist so GPU events carry the same external ID. See SHIM_DESIGN §7A. |
-| API argument access | Inherits SDK's callback/buffer tracing (only when SDK is loaded) | **Same two-tier model as SDK buffer tracing** — inline typed payload (scalars + handles) plus variable-size auxiliary ring (strings, deep structs) keyed by correlation_id. Schema reused from rocprofiler-sdk arg metadata. See SHIM_DESIGN §7B. |
-| IPC control channel surface (auth, rendezvous, config transport) | memfd+sock hybrid (see [MEMFD.md](MEMFD.md)) | Same IPC survey applies — same memfd+sock hybrid recommended |
+| Correlation IDs (internal / external / cross-library ancestor) | Inherits whatever SDK does after attach — no end-to-end story if SDK never loads | **Equivalent to rocprofiler-sdk for host API records** — shim owns a thread-local internal/external/ancestor stack with the same semantics. Forwards external pushes to SDK's stack when both coexist. GPU-side events require SDK co-load. See SHIM_MEMFD_SOCK_DESIGN §7A. |
+| API argument access | Inherits SDK's callback/buffer tracing (only when SDK is loaded) | **Same two-tier model as SDK buffer tracing for host APIs** — inline typed payload (scalars + handles) plus variable-size auxiliary ring (strings, deep structs) keyed by correlation_id. Schema reused from SDK arg metadata. Kernarg blob capture is best-effort (shim wraps at API entry, not at enqueue — see SHIM_MEMFD_SOCK_DESIGN §7B.3 caveat). See SHIM_MEMFD_SOCK_DESIGN §7B. |
+| IPC control channel surface (auth, rendezvous, config transport) | memfd+sock hybrid (see [MEMFD_SOCK.md](MEMFD_SOCK.md)) | Same IPC survey applies — same memfd+sock hybrid recommended |
 | New code we own and ship | ~20 KiB stub per channel | A new library (`librocprofiler-sdk-shim.so`) with its own OOP API + external shim tool |
 | What gets relaxed relative to requirements | Nothing | "0 ns hot path" → "+0.8 ns measured hot path" (see §7a); "no preload" becomes **stronger** (no preload needed at all) |
 
@@ -107,12 +107,12 @@ This is a real architectural advantage. We'd have to do meaningful extra work in
 
 ## 4. IPC control channel — memfd+sock applies to both
 
-The four-channel survey in this directory (mmap / socket / memfd / signal) is a transport-layer analysis; it is orthogonal to the functor-installation model. Both designs need the same rendezvous, authenticated peer verification, and command/data paths. Our analysis recommended the **socket + memfd hybrid** (see [MEMFD.md](MEMFD.md)) because it combines:
+The four-channel survey in this directory (mmap / socket / memfd / signal) is a transport-layer analysis; it is orthogonal to the functor-installation model. Both designs need the same rendezvous, authenticated peer verification, and command/data paths. Our analysis recommended the **socket + memfd hybrid** (see [MEMFD_SOCK.md](MEMFD_SOCK.md)) because it combines:
 
 - Abstract Unix socket for the one-time authenticated rendezvous (`SO_PEERCRED`, `SCM_RIGHTS`)
 - Anonymous `memfd_create` for fast shared-memory command/response + ring buffer
 - `F_SEAL_SHRINK | F_SEAL_GROW` for integrity of the shared region after handoff
-- Zero persistent filesystem entries (see [MEMFD.md § What "no filesystem footprint" precisely means](MEMFD.md#what-no-filesystem-footprint-precisely-means))
+- Zero persistent filesystem entries (see [MEMFD_SOCK.md § What "no filesystem footprint" precisely means](MEMFD_SOCK.md#what-no-filesystem-footprint-precisely-means))
 
 Here is how the hybrid plugs into **both** designs:
 
@@ -157,7 +157,7 @@ In-process:                                     External shim tool:
 
 The memfd is even better fit for the shim than for our stub because the shim is emitting *records*, not just receiving *commands*. A sealed, known-size ring buffer with a shared watermark and an eventfd-on-kick is a textbook in-process-to-out-of-process producer/consumer pipeline. The abstract socket's job is still one-shot authentication + fd handoff; after that, all data flow is shared-memory + a single eventfd wake.
 
-**Practical consequence:** most of what we wrote in [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) and [MEMFD.md](MEMFD.md) — the elimination rationale for the 9 rejected mechanisms, the canonical protocol shape, the `SO_PEERCRED` + `SCM_RIGHTS` + sealing argument, the security/complexity tables — ports over to his design almost word-for-word. The layer that changes is not the transport.
+**Practical consequence:** most of what we wrote in [CONTROL_CHANNEL_SURVEY.md](CONTROL_CHANNEL_SURVEY.md) and [MEMFD_SOCK.md](MEMFD_SOCK.md) — the elimination rationale for the 9 rejected mechanisms, the canonical protocol shape, the `SO_PEERCRED` + `SCM_RIGHTS` + sealing argument, the security/complexity tables — ports over to his design almost word-for-word. The layer that changes is not the transport.
 
 ## 5. OpenMP / OMPT — same asymmetry, same fix
 
