@@ -516,7 +516,7 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 ## 17. Open questions
 
-1. **Direct ring sharing optimization** — current design sends records over the socket from the shim ring to the consumer. A future optimization could share the ring directly (consumer mmaps the shim's memfd read-only) to eliminate the socket copy for the record data path. This changes the consumer's buffer model and needs careful design for watermark semantics and multi-reader support.
+1. **Direct ring sharing vs. socket delivery** — the current design sends records over the socket from the shim ring to the consumer. This keeps the consumer fully decoupled from the target's critical path. A direct-share model (consumer mmaps the ring) would eliminate the socket copy but introduces a coupling: depending on the ring buffer implementation (e.g., if the ring has a "wait and refill" mode), a slow consumer could directly affect the target's hot path. The socket-based delivery is the safer default; direct sharing remains an option if the ring implementation guarantees the consumer can never block the producer, but this is an implementation-time decision that depends on the final ring buffer design.
 
 2. ~~**In-process + OOP coexistence**~~ — **not an issue.** rocprofiler-sdk already accepts multiple configurations from multiple clients, each with its own buffers and contexts. The shim is just a messenger — it relays `force_configure` as another client. In-process and OOP tools coexist naturally, each with their own buffer destinations.
 
