@@ -68,9 +68,10 @@ add_executable(shim_multilib_test shim_multilib_test.c)
 target_include_directories(shim_multilib_test
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../mylib_dispatch
 )
 target_compile_options(shim_multilib_test PRIVATE -O2 -Wall -Wextra)
-target_link_libraries(shim_multilib_test PRIVATE mock_libB mock_libA mock_register)
+target_link_libraries(shim_multilib_test PRIVATE mock_libB mock_libA mock_register mylib_dispatch)
 set_target_properties(shim_multilib_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )

@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "mock_libB.h"
+#include "mylib_dispatch.h"
 
 static void busy_sleep_us(unsigned int microseconds)
 {
@@ -71,6 +72,10 @@ int main(int argc, char** argv)
         /* 4. Query device properties (libB only, no libA call) */
         libb_device_prop_t prop;
         libb_get_device_properties(&prop, 0);
+
+        /* 5. Call mylib's traced function (has shim wrappers installed,
+         *    so the consumer will see ENTER/EXIT records with args). */
+        my_traced_function(i, (uint64_t)cfg.grid.x, 3.14, (void*)(uintptr_t)i);
 
         if (work_us > 0) busy_sleep_us(work_us);
     }
