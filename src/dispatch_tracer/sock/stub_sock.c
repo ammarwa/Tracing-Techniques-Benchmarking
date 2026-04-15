@@ -124,24 +124,33 @@ static int load_sdk_and_configure(void)
         return -1;
     }
 
-    /* Tool's rocprofiler_configure is now visible via RTLD_DEFAULT. */
+    /* Tool's rocprofiler_configure is now visible via the tool-scope handle. */
     rocprofiler_configure_func_t tool_configure =
         (rocprofiler_configure_func_t)dlsym(g_sdk_handle, "rocprofiler_configure");
     resolve_sdk_symbols();
     if (!p_force_configure || !tool_configure) {
         fprintf(stderr, "[stub_sock] could not resolve SDK/tool symbols\n");
-        return -1;
+        goto fail;
     }
 
     rocprofiler_status_t st = p_force_configure(tool_configure);
     if (st != ROCPROFILER_STATUS_SUCCESS) {
         fprintf(stderr, "[stub_sock] rocprofiler_force_configure returned %d\n",
                 (int)st);
-        return -1;
+        goto fail;
     }
     /* tool_initialize has run by now — it created a context and started it,
      * storing the handle in g_saved_ctx via the accessor. */
     return 0;
+
+fail:
+    /* Release partially-initialized state so a subsequent attempt can retry
+     * cleanly (handle_configure rolls g_sdk_loaded back to 0 on failure). */
+    if (g_sdk_handle) { dlclose(g_sdk_handle); g_sdk_handle = NULL; }
+    p_force_configure = NULL;
+    p_start_context   = NULL;
+    p_stop_context    = NULL;
+    return -1;
 }
 
 /* ---------------- Background thread ---------------- */
@@ -262,6 +271,13 @@ static void* control_loop(void* arg)
             total += (size_t)got;
         }
         if (total != sizeof(cmd)) { close(client); continue; }
+
+        /* Defense-in-depth: if the controller sent an un-terminated string
+         * field in cmd.config (char[256] arrays), force NUL-termination
+         * before anything downstream passes them to fprintf / fopen. */
+        cmd.config.output_path[sizeof(cmd.config.output_path)     - 1] = '\0';
+        cmd.config.filter_pattern[sizeof(cmd.config.filter_pattern) - 1] = '\0';
+        cmd.config.exclude_pattern[sizeof(cmd.config.exclude_pattern)- 1] = '\0';
 
         rocp_response_t resp;
         memset(&resp, 0, sizeof(resp));

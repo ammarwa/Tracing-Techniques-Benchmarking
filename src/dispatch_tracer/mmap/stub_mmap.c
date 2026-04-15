@@ -203,7 +203,7 @@ static void load_sdk_and_configure(void)
     if (!tool_configure || !p_force_configure) {
         fprintf(stderr,
                 "[rocp_stub_mmap] could not resolve tool/SDK symbols\n");
-        return;
+        goto fail;
     }
 
     rocprofiler_status_t st = p_force_configure(tool_configure);
@@ -211,10 +211,18 @@ static void load_sdk_and_configure(void)
         fprintf(stderr,
                 "[rocp_stub_mmap] rocprofiler_force_configure failed: %d\n",
                 (int)st);
-        return;
+        goto fail;
     }
 
     atomic_store_explicit(&g_ctrl->context_active, 1u, memory_order_release);
+    return;
+
+fail:
+    /* Release partially-initialized state so a later attach attempt can retry. */
+    if (g_sdk_handle) { dlclose(g_sdk_handle); g_sdk_handle = NULL; }
+    p_force_configure = NULL;
+    p_start_context   = NULL;
+    p_stop_context    = NULL;
 }
 
 /* ----------------------------------------------------------------- */

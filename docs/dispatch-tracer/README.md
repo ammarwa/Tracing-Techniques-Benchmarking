@@ -27,12 +27,14 @@ See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNE
 
 ## Quick Comparison
 
-| Channel | Hot-Path (no attach) | Hot-Path (active) | Auth Model | Best For |
+| Channel | Hot-Path (no attach) | Hot-Path (active, real SDK proj.) | Auth Model | Best For |
 |--------|----------------------|-------------------|------------|----------|
 | **mmap** (file) | **0 ns** | ~50-200 ns | Dir `0700` + file `0600` | Simplicity |
 | **socket** (Unix domain) | **0 ns** | ~50-200 ns | `SO_PEERCRED` (kernel-verified) | Authentication |
 | **memfd** (socket + anonymous shm) | **0 ns** | ~50-200 ns | `SO_PEERCRED` + anonymous memory | Production |
 | **signal** (+ mmap or memfd) | **0 ns** | ~50-200 ns | `kill()` UID + paired channel | Instant attach |
+
+_The "active" column is the projection for real rocprofiler-sdk (populate_contexts + enter/exit callbacks + ring-buffer emplace). Our mock SDK measures ~2.5 µs per call because it writes a text-file record per event for verification; see [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for the measured numbers._
 
 **Late-load architecture**: A small **stub library** is preloaded that does NOT export `rocprofiler_configure`, so rocprofiler-register sees no tool and does NOT load rocprofiler-sdk. Original function pointers remain in the dispatch tables. The application runs at native speed.
 

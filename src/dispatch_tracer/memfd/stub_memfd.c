@@ -61,6 +61,9 @@
 #ifndef F_SEAL_GROW
 #define F_SEAL_GROW   0x0004
 #endif
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL   0x0001
+#endif
 
 static int compat_memfd_create(const char* name, unsigned int flags)
 {
@@ -234,13 +237,21 @@ static void load_tool_and_configure(void)
     if (!tool_configure || !p_force_configure) {
         fprintf(stderr, "[stub_memfd] missing symbols: tool_configure=%p force_configure=%p\n",
                 (void*)tool_configure, (void*)p_force_configure);
-        return;
+        goto fail;
     }
 
     rocprofiler_status_t st = p_force_configure(tool_configure);
     if (st != ROCPROFILER_STATUS_SUCCESS) {
         fprintf(stderr, "[stub_memfd] rocprofiler_force_configure returned %d\n", (int)st);
+        goto fail;
     }
+    return;
+
+fail:
+    if (g_tool_handle) { dlclose(g_tool_handle); g_tool_handle = NULL; }
+    p_force_configure = NULL;
+    p_start_context   = NULL;
+    p_stop_context    = NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -378,7 +389,11 @@ static int setup_memfd(void)
     g_ctrl->start_time = read_start_time();
 
     /* Seal against size changes. Content remains writable. */
-    if (fcntl(g_memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) != 0) {
+    /* F_SEAL_SEAL included so a malicious same-UID peer with the memfd fd
+     * cannot later add F_SEAL_WRITE and lock the stub out of its own ctrl
+     * region. SHRINK|GROW freeze the size; SEAL freezes the seal set itself. */
+    if (fcntl(g_memfd, F_ADD_SEALS,
+              F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) != 0) {
         /* Non-fatal: sealing is hardening only. */
         fprintf(stderr, "[stub_memfd] F_ADD_SEALS failed (non-fatal): %s\n",
                 strerror(errno));

@@ -219,17 +219,24 @@ static void load_sdk_and_configure(void)
 
     if (!tool_configure || !p_force_configure) {
         fprintf(stderr, "[rocp_stub_signal] could not resolve tool/SDK symbols\n");
-        return;
+        goto fail;
     }
 
     rocprofiler_status_t st = p_force_configure(tool_configure);
     if (st != ROCPROFILER_STATUS_SUCCESS) {
         fprintf(stderr, "[rocp_stub_signal] rocprofiler_force_configure failed: %d\n",
                 (int)st);
-        return;
+        goto fail;
     }
 
     atomic_store_explicit(&g_ctrl->context_active, 1u, memory_order_release);
+    return;
+
+fail:
+    if (g_sdk_handle) { dlclose(g_sdk_handle); g_sdk_handle = NULL; }
+    p_force_configure = NULL;
+    p_start_context   = NULL;
+    p_stop_context    = NULL;
 }
 
 /* ----------------------------------------------------------------- */
@@ -337,8 +344,20 @@ static void stub_atexit(void)
         g_bg_thread_started = 0;
     }
 
-    if (g_wakeup_pipe[0] >= 0) { close(g_wakeup_pipe[0]); g_wakeup_pipe[0] = -1; }
-    if (g_wakeup_pipe[1] >= 0) { close(g_wakeup_pipe[1]); g_wakeup_pipe[1] = -1; }
+    /* Clear the write-end fd BEFORE closing it. sig_handler reads
+     * g_wakeup_pipe[1] after checking >= 0; a signal arriving between
+     * close() and the -1 store could write into a freshly-reallocated
+     * fd belonging to an unrelated object. Reverse the order here. */
+    if (g_wakeup_pipe[1] >= 0) {
+        int fd = g_wakeup_pipe[1];
+        g_wakeup_pipe[1] = -1;
+        close(fd);
+    }
+    if (g_wakeup_pipe[0] >= 0) {
+        int fd = g_wakeup_pipe[0];
+        g_wakeup_pipe[0] = -1;
+        close(fd);
+    }
 
     if (g_ctrl) {
         munmap(g_ctrl, sizeof(rocp_ctrl_t));

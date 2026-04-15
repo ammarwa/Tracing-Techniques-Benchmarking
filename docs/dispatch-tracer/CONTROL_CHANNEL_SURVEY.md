@@ -20,6 +20,16 @@ The existing rocprofiler-sdk already implements a dispatch table with a two-leve
 
 **The noop overhead today** (wrapper installed but no active context): ~10-20 ns per call. `populate_contexts()` iterates active contexts (bitset check), finds none, returns.
 
+### Applicability preconditions — read this before the mechanism
+
+The late-load stub design has three hard preconditions. If any are violated the whole mechanism silently degrades or fails, so they are called out here rather than buried in the failure-mode analysis:
+
+1. **No in-process rocprofiler-sdk tool may already be loaded.** `rocprofiler_force_configure()` checks `get_init_status() != 0` and returns `ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED` if the SDK has already initialized. A user running rocprofv3 *and then* trying to attach our OOP controller cannot succeed — the attach silently fails with a locked-configuration error. Workaround today: do not combine the two; use ptrace attach instead.
+2. **`OMP_TOOL_LIBRARIES` must be unset or set to a compatible tool.** OpenMP's `ompt_start_tool` scan is one-shot and first-match-wins; our stub's future OMPT export would be preempted by any other library preloaded via `OMP_TOOL_LIBRARIES` that also exports the symbol.
+3. **The stub must be `LD_PRELOAD`'d before any runtime init.** If libamdhip64/libhsa-runtime64 has already completed its `rocprofiler_register_library_api_table` call before the stub's constructor runs (e.g., the stub is `dlopen`'d mid-execution), rocprofiler-register will have already scanned for `rocprofiler_configure` and moved on — attach will not work.
+
+Jonathan Madsen's rocprofiler-sdk-shim alternative (see [SHIM_COMPARISON.md](SHIM_COMPARISON.md)) relaxes precondition 1 (natural in-process+OOP coexistence via the shim's `functor` layering) and precondition 3 (the shim is always dlopen'd by register, no user opt-in needed) at the cost of a measured +0.8 ns/call always-on wrapper. For the long-lived product, his design is the right shape; our stub design is appropriate as a mock that validates the control-channel and security properties with zero changes to rocprofiler-sdk/register.
+
 ### Late-Load Design: Defer rocprofiler-sdk Loading Until Attach
 
 The key insight from rocprofiler-sdk's architecture is that there are **two libraries**:
@@ -442,8 +452,8 @@ We applied two hard filters:
 
 ### Overhead Comparison
 
-| Phase | B | F | memfd | signal |
-|-------|---|---|---------|----------|
+| Phase | mmap | sock | memfd | signal |
+|-------|------|------|-------|--------|
 | Init (target side) | ~10 μs (open+mmap) | ~10 μs (socket+bind+listen+thread) | ~15 μs (socket+thread) | ~10 μs (sigaction+paired init) |
 | Attach (controller) | ~5 μs (open+mmap) | ~5 μs (connect+SO_PEERCRED) | ~10 μs (connect+memfd+SCM_RIGHTS) | ~5 μs (paired attach) |
 | Hot-path (no attach) | 0 ns | 0 ns | 0 ns | 0 ns |
@@ -452,8 +462,8 @@ We applied two hard filters:
 
 ### Architecture Fit for rocprofiler-sdk
 
-| Aspect | B | F | memfd | signal |
-|--------|---|---|---------|----------|
+| Aspect | mmap | sock | memfd | signal |
+|--------|------|------|-------|--------|
 | Per-function enable | Existing `rocprofiler_configure_*` at init | Same | Same | Same |
 | Multi-runtime config | Single ctrl file per process | Single socket per process | Single socket + memfd | Single signal + paired channel |
 | Bidirectional (status queries) | Status fields in mmap | Yes (native) | Yes (socket) + fast status (memfd) | Limited |
@@ -547,7 +557,7 @@ The late-load design provides full late configuration without ptrace. Here is th
 
 ### Cross-Platform Considerations
 
-All four surviving control channel options (B, F, memfd, Signal) are **Linux-specific**:
+All four surviving control channel options (mmap, sock, memfd, signal) are **Linux-specific**:
 
 - Abstract Unix sockets (Options F, memfd) are Linux-only (not macOS/BSD)
 - `memfd_create` (memfd) is Linux-only
