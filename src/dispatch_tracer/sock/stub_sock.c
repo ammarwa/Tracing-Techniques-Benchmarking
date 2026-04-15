@@ -51,14 +51,21 @@ static rocprofiler_status_t (*p_stop_context)(rocprofiler_context_id_t)        =
 
 /* ---------------- Exported accessor (used by tool_sock) ---------------- */
 
+static rocp_stub_state_t g_state;
+static void stub_state_init_once(void)
+{
+    g_state.ctrl            = &g_ctrl;
+    g_state.pending_config  = &g_pending_config;
+    g_state.saved_ctx       = &g_saved_ctx;
+}
+
 __attribute__((visibility("default")))
 rocp_stub_state_t* rocp_stub_get_state(void)
 {
-    static rocp_stub_state_t state;
-    state.ctrl            = &g_ctrl;
-    state.pending_config  = &g_pending_config;
-    state.saved_ctx       = &g_saved_ctx;
-    return &state;
+    /* Populate once — see mmap stub for rationale. */
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, stub_state_init_once);
+    return &g_state;
 }
 
 /* ---------------- Helpers ---------------- */

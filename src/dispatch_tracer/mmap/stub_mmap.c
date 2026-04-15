@@ -131,12 +131,22 @@ static void apply_runtime_filter(const rocp_config_t* cfg)
 /* ----------------------------------------------------------------- */
 /* Exported accessor for the tool library                             */
 /* ----------------------------------------------------------------- */
-__attribute__((visibility("default")))
-rocp_stub_state_t* rocp_stub_get_state(void)
+static void stub_state_init_once(void)
 {
     g_state.ctrl           = g_ctrl;
     g_state.pending_config = &g_pending_config;
     g_state.saved_ctx      = &g_saved_ctx;
+}
+
+__attribute__((visibility("default")))
+rocp_stub_state_t* rocp_stub_get_state(void)
+{
+    /* Populate once — g_ctrl / &g_pending_config / &g_saved_ctx are set in
+     * the stub constructor and do not change. Doing the stores once under
+     * pthread_once eliminates the read-write race where two tool threads
+     * entering concurrently could observe a half-written g_state struct. */
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, stub_state_init_once);
     return &g_state;
 }
 
