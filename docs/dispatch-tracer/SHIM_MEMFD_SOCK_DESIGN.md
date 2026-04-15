@@ -178,16 +178,16 @@ eventfd_fd = consumer_ctrl->eventfd_num
   (note: eventfd is also dup'd on the socket via
    SCM_RIGHTS in a second cmsg — see §5.2)
 
-// Enable tracing for chosen ops:
-consumer_ctrl->profiler_functor[OP_hip_launch] =
-    (uint64_t)&my_oop_tool_begin_end;
+// Enable tracing for chosen ops (mode selectors, NOT function pointers):
+consumer_ctrl->op_mode[OP_hip_launch] = ROCP_SHIM_MODE_RECORD;
 atomic_store_release(consumer_ctrl->gen_counter,
                      gen_counter + 1);
-                                                 (target is now emitting
-                                                  records into ring buffer)
+                                                 (target's shim-local handler
+                                                  now emits records into ring)
 
 poll(eventfd_fd, POLLIN, ...)
-                                                 hot path writes record,
+                                                 hot path: shim handler writes
+                                                 record to ring (target-local code),
                                                  if ring crosses watermark:
                                                    eventfd_write(ef, 1)
 wake → drain ring into local consumer callback
@@ -267,33 +267,48 @@ Sealing: after `F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`:
 
 Reads and writes to the body proceed with normal acquire/release atomics on `head`, `tail`, `gen_counter`, `events_traced`, `events_dropped`, and the `profiler_functor[Op]` slots. All other fields are const-after-init.
 
-### 5.1 profiler_functor slot write
+### 5.1 Slot write — mode selectors, NOT function pointers
+
+> **IMPORTANT (P0 erratum from external review):** an earlier revision of this design described `profiler_functor[Op]` as holding a raw function pointer from the consumer's address space. **That does not work.** The consumer is a separate process; its function pointers are addresses in the consumer's virtual memory, meaningless in the target. The target would segfault.
+>
+> The corrected design: slot values are **mode selectors** — small integer tokens or config structs that tell the shim's own built-in target-side code what to do. All code that the target executes is already loaded in the target (it is part of `librocprofiler-sdk-shim.so`). The consumer only writes control data; the consumer never injects code into the target.
 
 When the consumer wants to enable tracing for op `Op` in domain `D`:
 
 ```c
 uint64_t slot_idx = domain_base[D] + Op;
-uint64_t* slot = &ctrl->profiler_functor[slot_idx];
+uint32_t* slot = &ctrl->op_mode[slot_idx];
 
-/* Typical pattern: consumer installs a callback that writes to the
- * ring. The callback lives in the consumer process's address space;
- * the target calls it via the function-pointer value written here. */
-atomic_store_release(slot, (uint64_t)&my_ring_begin_end);
+/* Mode values (built into the shim, not consumer addresses): */
+#define ROCP_SHIM_MODE_OFF           0   /* fast path — tail-call original */
+#define ROCP_SHIM_MODE_RECORD        1   /* write begin/end records to ring */
+#define ROCP_SHIM_MODE_RECORD_ARGS   2   /* records + inline arg payload */
+#define ROCP_SHIM_MODE_RECORD_FULL   3   /* records + args + variable-ring strings */
 
-/* Bump gen_counter so the target can detect that the slot table has
- * changed and potentially flush cached pointers (for future revisions
- * of the shim that read-copy-update the slots). */
+atomic_store_release(slot, ROCP_SHIM_MODE_RECORD);
 atomic_fetch_add(&ctrl->gen_counter, 1);
 ```
 
 To disable tracing:
 
 ```c
-atomic_store_release(slot, 0);
+atomic_store_release(slot, ROCP_SHIM_MODE_OFF);
 atomic_fetch_add(&ctrl->gen_counter, 1);
 ```
 
-Each hot-path call in the target reads `profiler_functor[Op]` with acquire ordering. If null, tail-call original. If non-null, call it with (original, args…) — the consumer's function pointer is responsible for invoking the original if it wants pre/post semantics.
+Each hot-path call in the target reads `op_mode[Op]` with acquire ordering. If `MODE_OFF`, tail-call original. If non-zero, the shim's built-in handler for that mode runs — it is code that is already part of `librocprofiler-sdk-shim.so`, loaded in the target's address space. The handler writes the requested level of detail into the ring buffer.
+
+**What the consumer controls vs. what the target executes:**
+
+| Consumer writes (shared memory) | Target executes (its own code) |
+|---|---|
+| `op_mode[Op] = RECORD` | shim's built-in `shim_emit_record()` — push correlation, write tsc+kind+op+phase to ring |
+| `op_mode[Op] = RECORD_ARGS` | shim's built-in `shim_emit_record_with_args()` — above + inline typed payload |
+| `op_mode[Op] = RECORD_FULL` | shim's built-in `shim_emit_full()` — above + string/deep-struct writes to variable ring |
+| `name_filter[D]` bitmap | shim's built-in bitmap test in the wrapper prologue |
+| `value_predicate_config[Op]` | shim's built-in evaluator (see §13.5 Phase 3 update below) |
+
+No consumer code ever runs in the target. No function pointers cross the process boundary. The consumer is a pure reader of the ring + writer of control slots.
 
 ### 5.2 Eventfd for consumer wake
 
@@ -367,30 +382,58 @@ Ordinary tracing does not use the socket at all after the handshake. Queries cro
 
 ## 7. Hot-path functor anatomy
 
-For each (domain, op) pair we generate a wrapper. In C with `musttail` it looks like:
+For each (domain, op) pair the shim's code generator emits a wrapper. The wrapper reads a **mode selector** (integer token) from shared memory — NOT a function pointer. All code the target executes is part of `librocprofiler-sdk-shim.so`, already loaded in the target's address space.
 
 ```c
 /* Generated once per (domain, op). Example: HIP op "hipLaunchKernel" */
 static void shim_wrap_hip_launch_kernel(hipStream_t s, /* … */)
 {
-    uint64_t prof_raw = atomic_load_explicit(
-        &g_ctrl->profiler_functor[HIP_BASE + OP_LAUNCH_KERNEL],
+    uint32_t mode = atomic_load_explicit(
+        &g_ctrl->op_mode[HIP_BASE + OP_LAUNCH_KERNEL],
         memory_order_acquire);
 
-    void (*orig)(hipStream_t, /* … */) =
-        (void(*)(hipStream_t, /* … */))g_orig_hip_launch_kernel;
-
-    if (__builtin_expect(prof_raw == 0, 1)) {
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
         /* Fast path — one atomic load, one branch, one tail-call.
          * Measured +0.8 ± 0.25 ns on EPYC 9354. */
+        void (*orig)(hipStream_t, /* … */) = g_orig_hip_launch_kernel;
         __attribute__((musttail)) return orig(s, /* … */);
     }
 
-    /* Profiler attached — hand off to consumer-supplied callback,
-     * passing the original so the callback can invoke it. */
-    void (*prof)(void*, hipStream_t, /* … */) =
-        (void(*)(void*, hipStream_t, /* … */))(uintptr_t)prof_raw;
-    prof((void*)orig, s, /* … */);
+    /* Slow path — an OOP consumer set this op's mode to non-OFF.
+     * The shim's own built-in handler runs (target-local code). */
+    shim_handle_event(HIP_BASE + OP_LAUNCH_KERNEL, mode,
+                      g_orig_hip_launch_kernel, &(hip_launch_args_t){s, /*…*/});
+}
+
+/* shim_handle_event is target-local code, part of librocprofiler-sdk-shim.so.
+ * It does NOT call any function pointer from the consumer's address space. */
+static void shim_handle_event(uint32_t slot_idx, uint32_t mode,
+                              void* orig, void* packed_args)
+{
+    rocprofiler_correlation_id_t corr = shim_push_correlation();
+
+    /* ENTER record */
+    rocp_shim_record_t rec = { .tsc = rdtsc(), .kind = ..., .op = ...,
+                               .phase = ENTER, .correlation_id = corr };
+    if (mode >= ROCP_SHIM_MODE_RECORD_ARGS)
+        memcpy(rec.args, packed_args, arg_size[slot_idx]);
+    ring_write(&g_ctrl->ring, &rec);
+
+    /* Call the original runtime function */
+    dispatch_original(slot_idx, orig, packed_args);
+
+    /* EXIT record */
+    rec.tsc   = rdtsc();
+    rec.phase = EXIT;
+    ring_write(&g_ctrl->ring, &rec);
+
+    if (mode >= ROCP_SHIM_MODE_RECORD_FULL)
+        shim_write_var_ring_strings(slot_idx, packed_args, corr.internal);
+
+    shim_pop_correlation();
+
+    if (ring_crossed_watermark(&g_ctrl->ring))
+        eventfd_write(g_ctrl->eventfd, 1);
 }
 ```
 
@@ -650,11 +693,11 @@ runtime call
     ↓
 shim_wrap_hip_op          ← shim's functor
     │
-    │ prof_raw = atomic_load(profiler_functor[Op])
-    │ (if consumer attached, writes to ring)
+    │ mode = atomic_load(op_mode[Op])
+    │ if mode != OFF: shim-local handler writes record to ring
     ↓
-orig (≡ the shim's saved g_orig[Op])
-    ↓
+next_in_chain[Op]         ← initially == runtime_original[Op]
+    ↓                        updated to SDK's wrapper if SDK loads
 sdk_wrap_hip_op           ← installed by SDK's update_table()
     │ SDK's populate_contexts + enter/exit callbacks +
     │ buffer emplace — all its existing machinery
@@ -662,9 +705,12 @@ sdk_wrap_hip_op           ← installed by SDK's update_table()
 real_hip_op               ← the runtime's actual function
 ```
 
-- The shim saves the runtime's original function pointer in `g_orig[Op]` **once**, before any SDK wrapping happens.
-- When the SDK later runs `update_table()`, it rewrites the api_table — but the api_table now already points at `shim_wrap_hip_op`. So SDK saves the shim's wrapper as its original, and installs `sdk_wrap_hip_op` over the top. The shim's wrapper remains in the call chain because nobody has rewritten the api_table again.
-- When the shim's `g_orig[Op]` is called, it goes to the SDK's installed wrapper, which eventually calls what it saved — the shim's wrapper... wait. This would recurse.
+- The shim saves the runtime's original function pointer in `runtime_original[Op]` **once**, at `shim_set_api_table` time. This value never changes.
+- `next_in_chain[Op]` starts pointing at `runtime_original[Op]`. The shim's handler calls `next_in_chain[Op]`, not `runtime_original[Op]` directly.
+- When the SDK later runs `update_table()`, it calls `rocprofiler_shim_get_runtime_original(D, Op)` to get the raw runtime pointer (not the shim wrapper). SDK saves that as its own original and installs `sdk_wrap_hip_op` into the api_table. The shim then updates `next_in_chain[Op]` to point at the SDK's wrapper.
+- No recursion: the shim's wrapper calls `next_in_chain` (→ SDK wrapper), the SDK's wrapper calls its saved original (→ raw runtime function). Two layers, no cycles.
+
+> **P1b acknowledgment (from external review)**: the SDK's `update_table()` runs in every domain-specific path (`hip.cpp:492`, `hsa.cpp:792`, `marker.cpp:371`, `rccl.cpp:389`, `registration.cpp:1129`). Each path snapshots originals and installs wrappers independently. Making them all shim-aware (call `rocprofiler_shim_get_runtime_original` instead of reading the api_table directly) is **not** a ~100 LOC change as originally estimated — it touches every domain path in the SDK. Realistic estimate: ~500–800 LOC of SDK changes, with per-domain testing. The effort is justified by the architectural cleanness but should not be understated.
 
 **Correct ABI contract** (the subtlety flagged in SHIM_COMPARISON.md §6): the shim must expose a way for the SDK's `update_table()` to distinguish "raw runtime function" from "shim wrapper". Two options:
 
@@ -716,7 +762,9 @@ shim_ompt_initialize(ompt_function_lookup_t lookup,
 }
 ```
 
-On consumer attach, if `profiler_functor[OMPT_BASE + Kind]` goes non-null, the shim's bg thread invokes `g_ompt_set_callback(Kind, &shim_ompt_cb)` to install a callback that writes OMPT events into the ring. On detach (slot set back to null), the shim calls `g_ompt_set_callback(Kind, NULL)` to unregister.
+On consumer attach, if `op_mode[OMPT_BASE + Kind]` goes non-OFF, the shim's bg thread invokes `g_ompt_set_callback(Kind, &shim_ompt_cb)` to install a shim-local callback that writes OMPT events into the ring. On detach (mode set back to OFF), the shim calls `g_ompt_set_callback(Kind, NULL)` to unregister.
+
+**OMPT and existing SDK coexistence**: the SDK already exports `ompt_start_tool` (`ompt.cpp:243`) and provides `rocprofiler_ompt_start_tool()` (`ompt.h:76`) as a delegation API for tools that export their own `ompt_start_tool` but want the SDK's OMPT backend. The shim must **not** also export a competing `ompt_start_tool` that races with the SDK's. Instead, if the SDK is loaded, the shim delegates to `rocprofiler_ompt_start_tool()` and layers its OMPT record-writing on top of the SDK's OMPT callbacks. If the SDK is not loaded, the shim exports `ompt_start_tool` as the sole owner.
 
 **OMPT + correlation IDs**: unlike dispatch-table wrappers (§7A.2), OMPT callbacks are invoked by the OpenMP runtime on worker threads, not through the shim's wrapper chain. The shim's `shim_ompt_cb` must therefore call `shim_push_correlation()` / `shim_pop_correlation()` explicitly around its ring write, so OMPT records carry proper `{internal, external, ancestor}` values. The `ancestor` field links OMPT events to a parent HIP/HSA dispatch entry if the same thread happens to be inside a wrapped API call (e.g. `hipLaunchKernel` → OpenMP target offload → OMPT callback) — the push sees the HIP entry on the thread-local stack and stamps it. If the OMPT callback fires on a pure OpenMP thread with no dispatch-table parent, `ancestor = 0`.
 
@@ -762,20 +810,19 @@ consumer atomic_store(tail, new_tail)
 consumer                                target-shim
 ────────                                ──────────
 atomic_store_release(
-    profiler_functor[NewOp], &cb2);
+    op_mode[NewOp], ROCP_SHIM_MODE_RECORD_ARGS);
+atomic_store_release(
+    op_mode[OldOp], ROCP_SHIM_MODE_OFF);
 atomic_fetch_add(gen_counter, 1);
                                         next call to NewOp:
-                                          shim_wrap reads non-null slot
-                                          → invokes cb2
+                                          shim_wrap reads non-OFF mode
+                                          → shim-local handler emits record
                                         next call to OldOp:
-                                          shim_wrap reads null slot
+                                          shim_wrap reads MODE_OFF
                                           → tail-calls original
-
-(optional) atomic_store(
-    profiler_functor[OldOp], 0);
 ```
 
-No socket traffic. Zero latency between consumer's store and target's observation — each target thread sees the new slot on its next call via the acquire load.
+No socket traffic. No function pointers cross the boundary. Zero latency between consumer's mode-store and target's observation — each target thread sees the new mode on its next call via the acquire load.
 
 ### 10.3 Detach
 
@@ -784,7 +831,7 @@ consumer                                target-shim
 ────────                                ──────────
 for each Op that was enabled:
   atomic_store_release(
-    profiler_functor[Op], 0);
+    op_mode[Op], ROCP_SHIM_MODE_OFF);
 atomic_fetch_add(gen_counter, 1);
 
 (optional) send SHIM_Q_DETACH
@@ -807,8 +854,8 @@ close(memfd)
 
 | Who crashes | What happens in the target | What happens in the consumer |
 |---|---|---|
-| Consumer SIGKILL mid-session | All `profiler_functor[Op]` slots still point at the dead consumer's callback addresses. **Target will segfault on next call.** Primary defense: target's bg thread monitors the consumer's control socket via `poll(POLLHUP)` — kernel delivers HUP within **microseconds** of the consumer dying, at which point the bg thread atomically zeros all profiler_functor slots. This replaces the earlier 1 Hz heartbeat design and closes the ~1 s dangerous window. | N/A |
-| Consumer SIGSEGV | Same as above — `POLLHUP` fires on process death regardless of signal. | N/A |
+| Consumer SIGKILL mid-session | `op_mode[Op]` slots are integers (mode selectors), not function pointers — so stale non-zero modes cause the shim to keep emitting records into a ring nobody is draining, **not** a segfault. The ring fills, `events_dropped` increments, the target continues at the cost of the per-call record write (~50 ns). Primary defense: target's bg thread monitors the consumer's control socket via `poll(POLLHUP)` — kernel delivers HUP within **microseconds** of the consumer dying, at which point the bg thread atomically zeros all `op_mode` slots, and the target returns to the fast path. | N/A |
+| Consumer SIGSEGV | Same as above — `POLLHUP` fires on process death regardless of signal. No segfault risk in the target. | N/A |
 | Consumer clean exit without DETACH | Same POLLHUP mechanism — TCP-like close propagates to the server side. Slots zeroed within µs. | N/A |
 | Target SIGKILL | memfd refcount drops, anonymous memory freed. eventfd refcount drops. abstract socket dies with bound-socket close. | Consumer's mmap becomes zero-filled (kernel unmaps the backing pages). Consumer's `poll(eventfd)` returns EPOLLHUP. Consumer detects and exits. |
 
@@ -923,10 +970,13 @@ rocp_shim_handle_t rocp_shim_attach(pid_t target_pid);
 int rocp_shim_get_capabilities(rocp_shim_handle_t h,
                                rocp_shim_caps_t* out);
 
-/* Enable / disable tracing for a specific (domain, op). */
+/* Enable / disable tracing for a specific (domain, op).
+ * mode is ROCP_SHIM_MODE_RECORD, _RECORD_ARGS, or _RECORD_FULL.
+ * The shim's own target-local handler emits records into the ring;
+ * no consumer function pointer crosses the process boundary. */
 int rocp_shim_enable_op(rocp_shim_handle_t h,
                         uint32_t domain, uint32_t op,
-                        rocp_shim_cb_t cb, void* user_data);
+                        rocp_shim_mode_t mode);
 
 int rocp_shim_disable_op(rocp_shim_handle_t h,
                          uint32_t domain, uint32_t op);
@@ -959,41 +1009,45 @@ const void* rocp_shim_get_var_arg(rocp_shim_handle_t h,
                                   uint16_t* out_kind);
 ```
 
-### 13.3 User's consumer callback
+### 13.3 User's record callback (runs in the consumer process)
+
+> **P0 correction**: all earlier revisions described a callback invoked "by the target." That was wrong — a consumer-side function pointer cannot be called by a different process. The corrected model: the target writes records into the ring using its own shim-local code; the **consumer** reads records from the ring and calls the user's callback in its own address space. No consumer code ever runs in the target.
 
 ```c
-typedef void (*rocp_shim_cb_t)(
-    void* orig,                /* original function pointer — can be called */
-    const rocp_shim_context_t* ctx,
-    void* args);
+/* Called by rocp_shim_poll() in the CONSUMER's address space. */
+typedef void (*rocp_shim_record_cb_t)(
+    const rocp_shim_record_t* record,   /* read from the ring */
+    void* user_data);
 
-/* rocp_shim_context_t — passed to the callback on every event.
- * Subsumes the per-event metadata; args is the typed payload (§7B). */
+/* rocp_shim_record_t — what the shim's target-side handler wrote to the ring.
+ * The consumer reads it via mmap. */
 typedef struct {
+    uint64_t                         tsc;
     uint32_t                         kind;           /* domain */
     uint32_t                         op;             /* op within domain */
-    uint64_t                         tsc;            /* timestamp counter */
+    uint32_t                         phase;          /* ENTER / EXIT / SHIM_EXIT_UNREACHED */
+    uint32_t                         cpu;
     uint64_t                         thread_id;
-    rocprofiler_correlation_id_t     correlation_id; /* {internal, external, ancestor} — see §7A */
-} rocp_shim_context_t;
-/* args casts to the SDK's rocprofiler_<domain>_api_args_<op>_t — see §7B */
+    rocprofiler_correlation_id_t     correlation_id; /* {internal, external, ancestor} — §7A */
+    uint32_t                         arg_overflow;   /* ARG_TRUNCATED if var-ring was full */
+    uint32_t                         arg_bytes;      /* valid bytes in args[] */
+    uint8_t                          args[RECORD_ARG_BYTES]; /* shim-owned wire format — §7B */
+} rocp_shim_record_t;
 ```
 
-The callback is invoked **by the target** (not the consumer) with the original function pointer as its first argument. The callback is responsible for:
-- Optionally invoking the original (pre/post semantics)
-- Writing a record into the ring if it wants the consumer to see this event
-- Returning; long-running callbacks stall the target
+The callback runs in the consumer's address space on the consumer's thread (the one that called `rocp_shim_poll`, or a thread from the consumer-provided pool — see §13.4). It has no access to the target's runtime state, no ability to invoke the original function, and no ability to modify the target's behavior. It is a pure **record reader**.
 
-For records-only consumers, the shim provides a helper:
+For consumers that want to do more:
 
 ```c
-/* Prebuilt consumer callback that just writes a record and calls orig. */
-void rocp_shim_record_and_call(void* orig,
-                               const rocp_shim_context_t* ctx,
-                               void* args);
-```
+/* Enable all HIP ops at RECORD level — the common case. */
+rocp_shim_enable_domain(h, ROCP_SHIM_DOMAIN_HIP_API, ROCP_SHIM_MODE_RECORD);
 
-The common case (user wants OOP trace records, not side effects): `rocp_shim_enable_op(h, DOMAIN_HIP, OP_LAUNCH_KERNEL, rocp_shim_record_and_call, NULL)`.
+/* Or enable just one op with full arg+string serialization. */
+rocp_shim_enable_op(h, ROCP_SHIM_DOMAIN_HIP_API,
+                    HIPAPI_ID_hipLaunchKernel,
+                    ROCP_SHIM_MODE_RECORD_FULL);
+```
 
 ### 13.4 Consumer-provided thread pool for record dispatch
 
@@ -1088,42 +1142,54 @@ This filter is **resolved entirely at install time** — it turns into the same 
 
 The consumer can filter on **runtime argument values**. Example: "trace only `hipMemcpyAsync` where `sizeBytes > 1048576`" or "trace only `hipLaunchKernel` where `stream == 0x7f...`". This requires inspecting the actual arguments at call time — the only phase that adds per-call cost beyond the bitmap test.
 
-The consumer installs a **predicate function** that runs in the target's address space, receives the typed args struct (same layout as §7B.1), and returns accept/reject:
+> **P0 correction**: an earlier revision described a consumer-supplied predicate function pointer called by the target. That is the same cross-process function-pointer bug fixed in §5.1. The corrected design: value filters are **declarative rules** written to the memfd as structured data, evaluated by the shim's built-in comparator code running in the target.
+
+The consumer writes a filter rule into a per-op slot in the memfd:
 
 ```c
-/* Predicate signature — called in the target's hot path.
- * Must be fast, must not allocate, must not call wrapped APIs
- * (re-entrancy). Return 1 to accept (emit record), 0 to reject. */
-typedef int (*rocp_shim_value_predicate_t)(
-    uint32_t domain,
-    uint32_t op,
-    const void* args,    /* typed args struct per §7B.1 */
-    void* predicate_ctx);
+/* Declarative value-filter rule. Written by the consumer into the
+ * memfd's value_filter region. Evaluated by the shim's built-in
+ * comparator — no consumer code runs in the target. */
+typedef struct {
+    uint16_t  arg_index;     /* which parameter to test (0-based) */
+    uint16_t  comparison;    /* ROCP_SHIM_CMP_GT, _LT, _EQ, _NEQ, _BITMASK */
+    uint64_t  operand;       /* the value to compare against */
+} rocp_shim_value_rule_t;
 
+/* Consumer API: */
 int rocp_shim_set_value_filter(rocp_shim_handle_t h,
                                uint32_t domain, uint32_t op,
-                               rocp_shim_value_predicate_t pred,
-                               void* predicate_ctx);
+                               const rocp_shim_value_rule_t* rules,
+                               size_t num_rules);
 ```
 
-Example consumer-side predicate:
+Example:
 
 ```c
-static int only_large_memcpy(uint32_t domain, uint32_t op,
-                             const void* args, void* ctx)
-{
-    (void)domain; (void)op; (void)ctx;
-    const rocprofiler_hip_api_args_hipMemcpyAsync_t* a = args;
-    return a->sizeBytes > 1048576;   /* 1 MB threshold */
-}
-
-rocp_shim_set_value_filter(h, HIP_API, OP_hipMemcpyAsync,
-                           only_large_memcpy, NULL);
+/* Trace only hipMemcpyAsync where sizeBytes > 1 MB: */
+rocp_shim_value_rule_t rule = {
+    .arg_index  = 3,                    /* sizeBytes is the 4th arg (0-indexed) */
+    .comparison = ROCP_SHIM_CMP_GT,
+    .operand    = 1048576,
+};
+rocp_shim_set_value_filter(h, HIP_API, OP_hipMemcpyAsync, &rule, 1);
 ```
 
-Hot-path cost of Phase 3: one indirect call to the predicate function per traced call that passed Phases 1+2. The predicate runs in the target's context (same thread, same address space) and must be async-signal-safe-ish (no allocation, no re-entrancy into wrapped APIs). Expected cost: 2–10 ns depending on predicate complexity — well below the ~50 ns cost of a full record write.
+The shim's built-in evaluator reads the rule from the memfd and compares the argument at `arg_index` against `operand` using the `comparison` operator. Multiple rules per op are AND'd. The arg is read from the packed inline payload (§7B.1) so the evaluator knows the byte offset from the code-generated arg-struct layout.
 
-If no value predicate is set for an op, Phase 3 is skipped (the slot is NULL and the branch is not taken).
+Supported comparisons:
+
+| `comparison` | Semantics |
+|---|---|
+| `ROCP_SHIM_CMP_EQ` | `arg[i] == operand` |
+| `ROCP_SHIM_CMP_NEQ` | `arg[i] != operand` |
+| `ROCP_SHIM_CMP_GT` | `arg[i] > operand` (unsigned) |
+| `ROCP_SHIM_CMP_LT` | `arg[i] < operand` (unsigned) |
+| `ROCP_SHIM_CMP_BITMASK` | `(arg[i] & operand) != 0` |
+
+Hot-path cost of Phase 3: the shim's built-in loop iterates the rule array (typically 1–3 rules) and does one comparison per rule. Expected cost: ~2–5 ns for 1 rule, ~5–15 ns for 3 rules — well below the ~50 ns cost of a full record write. No indirect call, no consumer code running in the target.
+
+If no value filter is set for an op, Phase 3 is skipped.
 
 #### Filter evaluation order in the hot path
 
@@ -1134,25 +1200,28 @@ static void shim_wrap_<domain>_<op>(args...)
     if (!filter_bitmap_test(g_ctrl->name_filter[DOMAIN], OP))
         goto fast_path;
 
-    /* profiler_functor load — is anyone listening at all? */
-    void* prof = atomic_load_acquire(&profiler_functor[OP]);
-    if (prof == NULL)
+    /* mode check — is anyone listening at all? */
+    uint32_t mode = atomic_load_acquire(&op_mode[OP]);
+    if (mode == ROCP_SHIM_MODE_OFF)
         goto fast_path;
 
-    /* Phase 3: value predicate (if installed for this op). */
-    void* pred = atomic_load_acquire(&value_predicate[OP]);
-    if (pred && !((predicate_t)pred)(DOMAIN, OP, &packed_args, pred_ctx))
-        goto fast_path;
+    /* Phase 3: value filter (if rules installed for this op). */
+    if (g_ctrl->value_filter_count[OP] > 0) {
+        void* packed_args = ...;  /* built from call args */
+        if (!shim_evaluate_value_rules(OP, packed_args))
+            goto fast_path;
+    }
 
-    /* All three phases passed — push correlation, call callback, emit record. */
-    ...
+    /* All three phases passed — shim-local handler emits record. */
+    shim_handle_event(OP, mode, orig, packed_args);
+    return;
 
 fast_path:
     orig(args);
 }
 ```
 
-The bitmap test (Phase 1+2) is **before** the `profiler_functor` load, so ops filtered out by name or type never even check whether a consumer is attached. This is the cheapest possible rejection path — one bit test + branch, same cache line as the functor slot.
+The bitmap test (Phase 1+2) is **before** the mode load, so ops filtered out by name or type never even check whether a consumer is attached. This is the cheapest possible rejection path — one bit test + branch, same cache line as the mode slot.
 
 #### Summary
 
@@ -1160,9 +1229,32 @@ The bitmap test (Phase 1+2) is **before** the `profiler_functor` load, so ops fi
 |---|---|---|---|---|
 | 1 — Name | Function name (glob/regex) | Install time → bitmap | ~0.3 ns (bit test) | `rocp_shim_set_name_filter` |
 | 2 — Arg type | Ops whose signature includes a given type | Install time → same bitmap | 0 ns (folded into Phase 1 bitmap) | `rocp_shim_set_type_filter` |
-| 3 — Arg value | Runtime argument values (predicate function) | Each call | ~2–10 ns (indirect call) | `rocp_shim_set_value_filter` |
+| 3 — Arg value | Runtime argument values (declarative rules) | Each call (shim-built-in evaluator) | ~2–5 ns per rule | `rocp_shim_set_value_filter` |
 
-All three phases are optional and composable. A consumer that only wants name filtering pays ~0.3 ns per filtered-out call. A consumer that also wants value filtering pays an additional ~2–10 ns per call that passed the name filter. Calls that match all three phases proceed to the full callback + record-write path.
+All three phases are optional and composable. A consumer that only wants name filtering pays ~0.3 ns per filtered-out call. A consumer that also wants value filtering pays an additional ~2–5 ns per rule per call that passed the name filter. Calls that match all three phases proceed to the shim's built-in record-write handler. **No consumer code ever runs in the target.**
+
+### 13.6 Library-instance dimension (P2a from external review)
+
+rocprofiler-register assigns per-library-instance identities (`lib_instance` in `rocprofiler_register.cpp:661`) and passes them through to the SDK in `registration.cpp:1095`. The same runtime (e.g. HIP) can register multiple times with different instance values (HIP runtime table + HIP compiler table are separate registrations with separate major/minor versions).
+
+The shim's flat `op_mode[slot_idx]` table does not inherently distinguish instances. **V1 approach**: the shim assigns separate slot ranges per `(name, lib_instance)` pair at registration time. The slot-index formula becomes `slot_idx = instance_base[name][lib_instance] + op`. The memfd header carries a table-of-tables listing each registered `(name, lib_instance, major_version, minor_version, slot_base, n_ops)`:
+
+```c
+/* In the memfd header, after the global fields: */
+typedef struct {
+    char     name[32];           /* "hip_runtime", "hip_compiler", "hsa_core", ... */
+    uint32_t lib_instance;       /* matches register's lib_instance */
+    uint32_t major_version;      /* e.g. HIP_RUNTIME_API_TABLE_MAJOR_VERSION */
+    uint32_t minor_version;      /* e.g. HIP_RUNTIME_API_TABLE_MINOR_VERSION */
+    uint32_t slot_base;          /* offset into op_mode[] for this table */
+    uint32_t n_ops;              /* number of ops in this table */
+} shim_table_registration_t;
+
+uint32_t n_registrations;
+shim_table_registration_t registrations[MAX_REGISTRATIONS];
+```
+
+Consumer reads this at attach time and can enable/disable ops on a per-table basis. The handshake message (§6.2) carries `n_registrations` so the consumer knows how many tables to expect. This preserves the per-instance identity the current SDK stack maintains, without flattening away the distinction.
 
 ## 14. Concurrency model
 
@@ -1207,26 +1299,15 @@ Minimum validation suite:
 - ~~**Per-op filters**~~ — **resolved**: see §13.5 below. Three-phase filter chain: (1) function-name matching, (2) argument-type matching, (3) argument-value matching. All phases run in the target's hot path before emitting a record; filtered calls never touch the ring.
 - ~~**Correlation IDs across shim and in-process SDK**~~ — **resolved**: see §7A. Shim maintains a thread-local internal/external/ancestor stack with identical semantics to the SDK's; when the SDK is loaded, the shim forwards external pushes into the SDK's stack so downstream GPU events carry the same external ID. Cross-library correlation (HIP calling HSA etc.) works via the `ancestor` field.
 - ~~**Argument serialization model**~~ — **resolved**: see §7B. Inline fixed-size typed payload in each record (scalars + handles) + variable-size auxiliary ring keyed by `correlation_internal_id` for strings and deep-copied data. Same two-tier structure the SDK's buffer tracer uses today; schema classification reused from rocprofiler-sdk's existing arg metadata.
-- ~~**Record schema evolution**~~ — **resolved**: the runtimes already ship major-version constants that govern their dispatch-table layout — `HIP_RUNTIME_API_TABLE_MAJOR_VERSION` (CLR/HIP), `HSA_CORE_API_TABLE_MAJOR_VERSION` (ROCR), `RCCL_API_TABLE_MAJOR_VERSION`, etc. The shim captures each runtime's major version at `shim_set_api_table` time (register passes it as the `version` argument) and embeds it in the memfd header as a per-domain version tuple:
+- ~~**Record schema evolution**~~ — **resolved**: versioning is **per-table, not per-domain**, because a single runtime can register multiple tables (e.g. HIP ships both a runtime table and a compiler table, each with its own major and minor version). The `shim_table_registration_t` entries in §13.6 carry both `major_version` and `minor_version` per table. The consumer reads these at attach time and compares against its compile-time constants:
 
-  ```c
-  /* In the memfd header, after the profiler_functor table: */
-  struct {
-      uint32_t hip_api_table_major;
-      uint32_t hsa_api_table_major;
-      uint32_t rccl_api_table_major;
-      /* ... one per domain ... */
-  } domain_versions;
-  ```
+  - **Same major + minor**: full arg-struct decoding.
+  - **Same major, different minor**: minor additions are append-only per the runtime's ABI contract. Consumer decodes fields it knows; any field beyond its known `sizeof` is ignored.
+  - **Different major**: the arg-struct layout may have changed incompatibly. Consumer falls back to scalars-only decoding (scalars at fixed offsets are stable; struct-level fields beyond the consumer's `sizeof` are skipped). Consumer library logs: `"HIP runtime table v3.2 → consumer built against v2.4 — arg decoding limited to scalars."`
 
-  The consumer reads these at attach time (from the mmap'd header) and compares against the constants it was compiled against. Per-domain rules:
+  > **P2b acknowledgment (from external review)**: reusing SDK arg structs as the cross-process wire format is brittle when producer and consumer are independently built. The v1 per-table version check is a necessary minimum but not sufficient for strict ABI safety. A v2 improvement is tracked: freeze a shim-owned wire schema with explicit field offsets (flatbuffer-style), and generate translation code between the SDK's native structs and the wire format. This eliminates the "independently built struct cast" hazard entirely but requires more code generation.
 
-  - **Same major version**: the arg-struct layout is guaranteed compatible (the runtime's own ABI contract). Consumer decodes the full inline typed payload.
-  - **Different major version**: the arg-struct layout may have changed. Consumer falls back to inline-only decoding (scalars at fixed offsets are stable across majors; struct-level fields beyond the consumer's known `sizeof` are skipped). The consumer library logs a warning: "HIP API table major version mismatch: target=N, consumer=M — arg decoding limited to scalars."
-
-  This piggybacks on an ABI contract the runtimes already maintain — we don't invent our own version number or struct hash. When a runtime bumps its table major version, the consumer's compile-time constant changes too (it comes from the same header), and the mismatch is detected deterministically at attach time rather than silently mid-stream.
-
-  The handshake message (§6.2) also carries these versions so the consumer can bail early if the mismatch is unacceptable, before mmap'ing the full memfd.
+  The handshake message (§6.2) carries per-table version tuples so the consumer can bail early if the mismatch is unacceptable, before mmap'ing the full memfd.
 - **Ring size as a consumer option (v2)**: a consumer-side resize after startup would require a secondary memfd + handoff because `F_SEAL_GROW` prevents grow-in-place. Tracked for v2. **V1 mitigation**: the shim reads `ROCP_SHIM_RING_SIZE_MB` from the environment at constructor time (before any runtime registers a table). If set, it overrides the default 1 MiB ring size. The value is clamped to `[1, 256]` MiB and rounded up to the next power of two (the ring protocol requires a power-of-two mask). Example: `ROCP_SHIM_RING_SIZE_MB=16 ./my_hip_app`. Because the memfd is `ftruncate`'d and sealed in the shim's constructor, the env var must be set before the process starts — it cannot be changed mid-run. Between this, the per-op filter chain (§13.5, which keeps uninteresting events out of the ring entirely), and the consumer-controlled watermark threshold, the fixed-at-startup ring should be adequate for most v1 workloads.
 - ~~**Aarch64 validation**~~ — **deferred**: this design targets x86-64 only for now. The +0.8 ns measurement is on AMD EPYC. Aarch64 is out of scope for the initial implementation; if it becomes in-scope, re-measure and adjust the atomic-ordering choices (`LDAR` on ARMv8 is heavier than x86's implicit acquire).
 - **Windows alternative** (not a v1 goal — documented here so the next evaluation doesn't start from scratch):
