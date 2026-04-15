@@ -42,6 +42,11 @@
 - [§15. Test and verification plan](#15-test-and-verification-plan)
 - [§16. Open questions](#16-open-questions)
 - [§17. Files that would implement this](#17-files-that-would-implement-this)
+- [§18. Integration risks and implementation notes](#18-integration-risks-and-implementation-notes)
+  - [§18.1 rocprofiler-register semantic change](#181-rocprofiler-register-semantic-change)
+  - [§18.2 HSA attach / proxy-queue coexistence](#182-hsa-attach--proxy-queue-path-coexistence)
+  - [§18.3 Slot-index normalization](#183-slot-index-normalization)
+  - [§18.4 SDK integration scope](#184-sdk-integration-scope)
 - [Appendix A: Why shim over late-load stub](#appendix-a-why-shim-over-late-load-stub)
 
 ## 0. Scope
@@ -1441,11 +1446,59 @@ src/
 
 Approximate effort: ~3 KLOC of shim library, ~1 KLOC of consumer library, ~500-800 LOC of SDK integration (every domain-specific `copy_table`/`update_table` path must become shim-aware — see §8). The generated wrappers (`shim_wrappers_gen.c`) come from the same schemas that drive today's SDK dispatch-table generator and scale linearly with the API surface.
 
-> **Note on rocprofiler-register**: the design assumes register unconditionally dlopens the shim from its constructor. Today register only scans/loads profiler libraries when a tool is detected or `ROCPROFILER_REGISTER_FORCE_LOAD` is set (`rocprofiler_register.cpp:333`). Implementing this design requires a deliberate semantic change to rocprofiler-register — adding an unconditional shim-load path before the tool scan. This is a small code change but a real behavioral change that needs buy-in from the register maintainers. It also needs a disable mechanism (e.g. `ROCPROFILER_SHIM_DISABLE=1`) for environments where the +0.8 ns overhead is unacceptable.
+## 18. Integration risks and implementation notes
 
-> **Note on HSA attach/proxy-queue path**: rocprofiler-register has special handling for HSA when `_activate_rocprofiler` is false — it calls `rocprofiler_attach_set_api_table` via a separate attach path (`rocprofiler_register.cpp:808`). If the shim becomes the always-active recipient of all registrations, this branch may not run. The shim design must explicitly decide: (a) the shim subsumes the HSA attach path (the shim's own handler replaces the proxy-queue mechanism), or (b) the shim passes through to the existing attach path when HSA is detected and the SDK is loaded. Option (b) is the safer v1 choice — the shim wraps the table entries and the existing HSA attach mechanism runs on top, layered via `next_in_chain`. This needs verification against the actual HSA queue interception code during implementation.
+This section collects the known integration risks, behavioral changes to existing components, and implementation-time decisions that are deferred from the design level but must be resolved before shipping.
 
-> **Note on slot_idx normalization**: throughout this document, pseudocode uses `Op` as shorthand for the slot index. In reality, with per-instance slot ranges (§13.6), every reference to `op_mode[Op]` is actually `op_mode[slot_idx]` where `slot_idx = registrations[table_idx].slot_base + op_within_table`. Filter bitmaps, consumer API calls, and test code must all use `slot_idx`, not raw `Op`. The simplified `Op` notation is used in pseudocode for readability; the implementation maps through the registration table.
+### 18.1 rocprofiler-register semantic change
+
+The design assumes register unconditionally dlopens `librocprofiler-sdk-shim.so` from its constructor. Today register only scans/loads profiler libraries when a tool is detected or `ROCPROFILER_REGISTER_FORCE_LOAD` is set (`rocprofiler_register.cpp:333`). Implementing this design requires a **deliberate semantic change** to rocprofiler-register — adding an unconditional shim-load path before the tool scan.
+
+This is a small code change but a real behavioral change:
+- Every ROCm process now loads the shim at startup, whether or not any profiling is requested.
+- The +0.8 ns per-call overhead is always present.
+- The shim's memfd + abstract socket are always allocated.
+
+**Mitigation**: a `ROCPROFILER_SHIM_DISABLE=1` environment variable that register checks before loading the shim. When set, register skips the shim and falls back to today's behavior. This gives users a kill switch for environments where the overhead or resource usage is unacceptable.
+
+**Adoption path**: needs buy-in from the rocprofiler-register maintainers and a packaging decision (is the shim a separate `.so` shipped alongside register, or embedded into register itself?).
+
+### 18.2 HSA attach / proxy-queue path coexistence
+
+rocprofiler-register has special handling for HSA when `_activate_rocprofiler` is false — it calls `rocprofiler_attach_set_api_table` via a separate attach path (`rocprofiler_register.cpp:808`). This path sets up proxy queues for HSA queue interception, which is how the SDK intercepts kernel dispatches and HW counter collection.
+
+If the shim becomes the always-active recipient of all registrations, this branch may not run. The shim design must explicitly decide:
+
+- **(a) Shim subsumes the HSA attach path**: the shim's own handler replaces the proxy-queue mechanism. This is a large scope increase and is not recommended for v1.
+- **(b) Shim passes through to the existing attach path**: the shim wraps the table entries with its mode-selector wrappers, and the existing HSA attach mechanism runs on top, layered via `next_in_chain[Op]`. When the SDK loads and `update_table()` installs its own wrappers (including proxy-queue setup), those wrappers go into `next_in_chain` and the shim calls through them.
+
+**V1 recommendation**: option (b) — pass-through. The shim is a thin layer; HSA queue interception remains the SDK's responsibility. This needs verification against the actual HSA queue interception code (`hsa.cpp:792`, `registration.cpp:1073-1075`) during implementation.
+
+### 18.3 Slot-index normalization
+
+Throughout this document, pseudocode uses `Op` as shorthand for the slot index. In reality, with per-instance slot ranges (§13.6), every reference to `op_mode[Op]` is actually:
+
+```
+slot_idx = registrations[table_idx].slot_base + op_within_table
+```
+
+Filter bitmaps (`name_filter`, `value_filter`), consumer API calls (`rocp_shim_enable_op`), and test code must all use `slot_idx`, not raw `Op`. The simplified `Op` notation is used in pseudocode for readability; the implementation maps through the registration table at every entry point.
+
+The consumer-side library resolves `(domain, op)` → `slot_idx` internally by walking the `registrations[]` table in the memfd header. The consumer never needs to compute `slot_idx` manually — the API takes `(domain, op)` and the library does the lookup.
+
+### 18.4 SDK integration scope
+
+The "~100 LOC of SDK changes" estimate in earlier revisions was wrong. The SDK's "capture original then wrap" logic is spread across:
+
+- `registration.cpp:1129` (central dispatch)
+- `hip.cpp:492` (HIP runtime + compiler tables)
+- `hsa.cpp:792` (HSA core + AMD ext + image ext tables)
+- `marker.cpp:371` (ROCTx marker)
+- `rccl.cpp:389` (RCCL)
+
+If the shim wraps first, each of these `save-and-wrap` paths must call `rocprofiler_shim_get_runtime_original(D, Op)` to get the raw runtime function instead of reading the api_table directly (which now points at shim wrappers). Each path must also call `shim_set_next_in_chain(Op, sdk_wrapper)` after installing its own wrapper.
+
+Realistic estimate: **~500-800 LOC** of SDK changes with per-domain testing. The effort is justified by the architectural cleanness but should not be understated in planning.
 
 ## Appendix A: Why shim over late-load stub
 
