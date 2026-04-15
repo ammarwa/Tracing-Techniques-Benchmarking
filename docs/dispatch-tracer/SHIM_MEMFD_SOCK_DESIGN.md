@@ -24,7 +24,6 @@
 - [§17. Open questions](#17-open-questions)
 - [§18. Integration risks](#18-integration-risks)
 - [Appendix A: What the shim owns vs. what it does NOT own](#appendix-a-what-the-shim-owns-vs-what-it-does-not-own)
-- [Appendix B: Comparison with previous design](#appendix-b-comparison-with-previous-design)
 
 ## 0. Scope
 
@@ -585,24 +584,6 @@ The request/response protocol between `libroc-shim.so` and `libroc-shim-consumer
 | Context management logic | **rocprofiler-sdk** |
 | Buffer tracing service configuration | **rocprofiler-sdk** |
 | Which services to enable | **Consumer** (via standard `rocprofiler_*` API) |
-
-## Appendix B: Comparison with previous design
-
-The earlier design (documented in the `shim_mock/` code) had the shim wrapping dispatch tables, generating its own records, managing its own correlation IDs, and serializing args. That design was a functional prototype that validated the IPC transport (memfd+sock, ring buffer, eventfd wake, POLLHUP recovery, per-table registration, SO_PEERCRED auth).
-
-| Aspect | Previous design | Current design |
-|---|---|---|
-| Who wraps dispatch tables | Shim | **SDK** |
-| Who generates records | Shim (custom format) | **SDK** (native `buffer_tracing_*` format) |
-| Who manages correlation IDs | Shim (thread-local stack) | **SDK** (existing correlation infrastructure) |
-| Who serializes args | Shim (per-op formatters) | **SDK** (existing arg iteration) |
-| Consumer API | Shim-specific (mode selectors, filter bitmaps) | **Standard `rocprofiler_*` API** (source-compatible) |
-| What the shim does | Profiling + IPC | **IPC only** |
-| Consumer needs to know about shim? | Yes (shim-specific types, protocols) | **No** (programs against SDK headers) |
-| Ring buffer contents | Shim-format records | **SDK-native records** |
-| Supported services | All (shim intercepted everything) | **Buffered services only** (callback tracing is in-process only) |
-
-The IPC transport layer (memfd+sock, ring buffer, eventfd, POLLHUP, SO_PEERCRED) carries over unchanged. The profiling-logic layer is removed from the shim entirely — the SDK handles it.
 
 ---
 
