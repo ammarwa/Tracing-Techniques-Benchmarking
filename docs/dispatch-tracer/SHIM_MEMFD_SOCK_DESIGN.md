@@ -320,12 +320,21 @@ iovec[0]:        struct shim_hello {
                     uint32_t n_ops;
                     uint32_t watermark_bytes;
                     uint64_t start_time;     // /proc/self/stat field 22
+                    /* Per-domain API-table major versions — the target
+                     * captured these from the runtime's register call.
+                     * Consumer compares against its compile-time constants
+                     * to detect arg-struct layout mismatches (§16). */
+                    uint32_t hip_api_table_major;
+                    uint32_t hsa_api_table_major;
+                    uint32_t rccl_api_table_major;
+                    uint32_t ompt_api_version;
+                    uint32_t reserved[4];
                  };
 cmsg[0]:         SCM_RIGHTS, fd = memfd
 cmsg[1]:         SCM_RIGHTS, fd = eventfd
 ```
 
-Consumer verifies `magic == "SHIM"` and `struct_version` is compatible, then mmaps the memfd. The `start_time` in the handshake must match `start_time` in the mmap'd header (PID-reuse defense: if a malicious peer bound the same abstract name on a reused PID, the start_time in procfs will not match).
+Consumer verifies `magic == "SHIM"` and `struct_version` is compatible. It then compares the per-domain `*_api_table_major` fields against its own compile-time constants (e.g. `HIP_RUNTIME_API_TABLE_MAJOR_VERSION`). On mismatch, the consumer can bail early ("incompatible HIP table version") or proceed with degraded decoding (scalars-only, skip structured arg fields beyond the known `sizeof`). The `start_time` in the handshake must match `start_time` in the mmap'd header (PID-reuse defense: if a malicious peer bound the same abstract name on a reused PID, the start_time in procfs will not match).
 
 ### 6.3 Query commands (post-bootstrap, both directions)
 
@@ -1198,7 +1207,26 @@ Minimum validation suite:
 - ~~**Per-op filters**~~ — **resolved**: see §13.5 below. Three-phase filter chain: (1) function-name matching, (2) argument-type matching, (3) argument-value matching. All phases run in the target's hot path before emitting a record; filtered calls never touch the ring.
 - ~~**Correlation IDs across shim and in-process SDK**~~ — **resolved**: see §7A. Shim maintains a thread-local internal/external/ancestor stack with identical semantics to the SDK's; when the SDK is loaded, the shim forwards external pushes into the SDK's stack so downstream GPU events carry the same external ID. Cross-library correlation (HIP calling HSA etc.) works via the `ancestor` field.
 - ~~**Argument serialization model**~~ — **resolved**: see §7B. Inline fixed-size typed payload in each record (scalars + handles) + variable-size auxiliary ring keyed by `correlation_internal_id` for strings and deep-copied data. Same two-tier structure the SDK's buffer tracer uses today; schema classification reused from rocprofiler-sdk's existing arg metadata.
-- **Record schema evolution**: the inline typed payload is sourced from SDK headers. Target and consumer link independently; SDK minor versions may add fields (struct sizes are not ABI-stable across ROCm minor releases). **V1 policy**: embed `args_schema_version` (an integer derived from the SDK build-time struct hash) in every record. Consumer checks `args_schema_version` against its own compiled-in value; on mismatch, falls back to inline-only decoding (scalars at fixed offsets are stable; any field beyond the consumer's known size is ignored). This is a best-effort heuristic, not a hard ABI freeze — a full freeze (shim-owned wire structs with translation at the consumer helper) is tracked as a v2 improvement.
+- ~~**Record schema evolution**~~ — **resolved**: the runtimes already ship major-version constants that govern their dispatch-table layout — `HIP_RUNTIME_API_TABLE_MAJOR_VERSION` (CLR/HIP), `HSA_CORE_API_TABLE_MAJOR_VERSION` (ROCR), `RCCL_API_TABLE_MAJOR_VERSION`, etc. The shim captures each runtime's major version at `shim_set_api_table` time (register passes it as the `version` argument) and embeds it in the memfd header as a per-domain version tuple:
+
+  ```c
+  /* In the memfd header, after the profiler_functor table: */
+  struct {
+      uint32_t hip_api_table_major;
+      uint32_t hsa_api_table_major;
+      uint32_t rccl_api_table_major;
+      /* ... one per domain ... */
+  } domain_versions;
+  ```
+
+  The consumer reads these at attach time (from the mmap'd header) and compares against the constants it was compiled against. Per-domain rules:
+
+  - **Same major version**: the arg-struct layout is guaranteed compatible (the runtime's own ABI contract). Consumer decodes the full inline typed payload.
+  - **Different major version**: the arg-struct layout may have changed. Consumer falls back to inline-only decoding (scalars at fixed offsets are stable across majors; struct-level fields beyond the consumer's known `sizeof` are skipped). The consumer library logs a warning: "HIP API table major version mismatch: target=N, consumer=M — arg decoding limited to scalars."
+
+  This piggybacks on an ABI contract the runtimes already maintain — we don't invent our own version number or struct hash. When a runtime bumps its table major version, the consumer's compile-time constant changes too (it comes from the same header), and the mismatch is detected deterministically at attach time rather than silently mid-stream.
+
+  The handshake message (§6.2) also carries these versions so the consumer can bail early if the mismatch is unacceptable, before mmap'ing the full memfd.
 - **Ring size as a consumer option**: consumer may want larger rings for heavy workloads. Today the size is fixed at target startup. A `rocp_shim_resize_ring` query could reallocate if both sides agree, but `F_SEAL_GROW` prevents grow-in-place; would need a secondary memfd + handoff. Not a v1 feature.
 - ~~**Aarch64 validation**~~ — **deferred**: this design targets x86-64 only for now. The +0.8 ns measurement is on AMD EPYC. Aarch64 is out of scope for the initial implementation; if it becomes in-scope, re-measure and adjust the atomic-ordering choices (`LDAR` on ARMv8 is heavier than x86's implicit acquire).
 - **Windows alternative** (not a v1 goal — documented here so the next evaluation doesn't start from scratch):
