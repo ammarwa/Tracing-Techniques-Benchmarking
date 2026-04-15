@@ -83,6 +83,13 @@ static inline _Atomic uint32_t* shim_op_mode_ptr(int op)
     return &g_local_op_mode[op];
 }
 
+/* Runtime-assigned slot bases — set dynamically when mock_sdk_set_api_table
+ * is called for each library. Wrappers read these to compute their global
+ * slot index (slot_idx = base + local_op_index). */
+static uint32_t g_mylib_base = 0;
+static uint32_t g_liba_base  = 0;
+static uint32_t g_libb_base  = 0;
+
 /* Book-keeping. Not touched on the hot path. */
 static pthread_mutex_t g_shim_install_lock = PTHREAD_MUTEX_INITIALIZER;
 static int             g_shim_installed[SHIM_NUM_OPS] = { 0, 0 };
@@ -233,32 +240,32 @@ call_original:
 
 static void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 {
-    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(0), memory_order_acquire);
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(g_mylib_base + 0), memory_order_acquire);
     if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
-        void* orig = atomic_load_explicit(&g_runtime_original[0],
+        void* orig = atomic_load_explicit(&g_runtime_original[g_mylib_base + 0],
                                           memory_order_acquire);
         ((orig_op0_t)orig)(a1, a2, a3, a4);
         return;
     }
-    void* orig = atomic_load_explicit(&g_runtime_original[0],
+    void* orig = atomic_load_explicit(&g_runtime_original[g_mylib_base + 0],
                                       memory_order_acquire);
     packed_op0_args_t args = { a1, a2, a3, a4 };
-    shim_handle_event(0, mode, orig, &args, sizeof(args));
+    shim_handle_event(g_mylib_base + 0, mode, orig, &args, sizeof(args));
 }
 
 static void shim_wrap_op1(unsigned int us)
 {
-    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(1), memory_order_acquire);
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(g_mylib_base + 1), memory_order_acquire);
     if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
-        void* orig = atomic_load_explicit(&g_runtime_original[1],
+        void* orig = atomic_load_explicit(&g_runtime_original[g_mylib_base + 1],
                                           memory_order_acquire);
         ((orig_op1_t)orig)(us);
         return;
     }
-    void* orig = atomic_load_explicit(&g_runtime_original[1],
+    void* orig = atomic_load_explicit(&g_runtime_original[g_mylib_base + 1],
                                       memory_order_acquire);
     packed_op1_args_t args = { us };
-    shim_handle_event(1, mode, orig, &args, sizeof(args));
+    shim_handle_event(g_mylib_base + 1, mode, orig, &args, sizeof(args));
 }
 
 /* ================================================================== */
@@ -275,7 +282,7 @@ typedef struct { liba_memory_region_t region; uint64_t size; void** out_ptr; } p
 typedef struct { liba_queue_t queue; const liba_dispatch_packet_t* pkt; liba_signal_t completion; } packed_liba_op2_t;
 typedef struct { liba_signal_t signal; uint64_t timeout_ns; } packed_liba_op3_t;
 
-#define SHIM_LIBA_BASE 2
+#define SHIM_LIBA_BASE g_liba_base
 
 static liba_status_t shim_wrap_liba_queue_create(liba_agent_t agent, uint32_t size, liba_queue_t* out)
 {
@@ -343,7 +350,7 @@ typedef struct { void* dst; const void* src; uint64_t size; libb_stream_t stream
 typedef struct { libb_stream_t stream; } packed_libb_op2_t;
 typedef struct { libb_device_prop_t* prop; int device_id; } packed_libb_op3_t;
 
-#define SHIM_LIBB_BASE 6
+#define SHIM_LIBB_BASE g_libb_base
 
 static libb_error_t shim_wrap_libb_launch_kernel(const libb_launch_config_t* cfg)
 {
@@ -447,7 +454,7 @@ static void shim_install_mylib_table(void** slots, uint64_t num_entries)
     if (num_entries > 0 && !g_shim_installed[0]) {
         void* cur = slots[0];
         if (cur != (void*)&shim_wrap_op0) {
-            atomic_store_explicit(&g_runtime_original[0], cur,
+            atomic_store_explicit(&g_runtime_original[g_mylib_base + 0], cur,
                                   memory_order_release);
             atomic_store_explicit(&g_next_in_chain[0], cur,
                                   memory_order_release);
@@ -461,7 +468,7 @@ static void shim_install_mylib_table(void** slots, uint64_t num_entries)
     if (num_entries > 1 && !g_shim_installed[1]) {
         void* cur = slots[1];
         if (cur != (void*)&shim_wrap_op1) {
-            atomic_store_explicit(&g_runtime_original[1], cur,
+            atomic_store_explicit(&g_runtime_original[g_mylib_base + 1], cur,
                                   memory_order_release);
             atomic_store_explicit(&g_next_in_chain[1], cur,
                                   memory_order_release);
@@ -498,18 +505,30 @@ int mock_sdk_set_api_table(const char* name,
     void**   fn_slots      = (void**)((char*)table_struct + sizeof(size_t));
     uint64_t num_fn_entries = (table_size - sizeof(size_t)) / sizeof(void*);
 
+    /* Allocate a slot range in the memfd for this table FIRST, so the
+     * runtime base is known before wrapper installation. */
+    uint32_t base = 0;
+    if (g_ipc_ok && g_ipc.ctrl) {
+        base = g_ipc.ctrl->total_ops;
+    }
+
+    /* Set the runtime slot base for this library and install wrappers. */
+    static void* mylib_wrappers[] = { (void*)&shim_wrap_op0, (void*)&shim_wrap_op1 };
     if (strcmp(name, "mylib") == 0) {
-        shim_install_mylib_table(fn_slots, num_fn_entries);
+        g_mylib_base = base;
+        shim_install_generic_table(fn_slots, num_fn_entries, base,
+                                   mylib_wrappers, 2);
     } else if (strcmp(name, "libA_hsa") == 0) {
-        shim_install_generic_table(fn_slots, num_fn_entries, SHIM_LIBA_BASE,
+        g_liba_base = base;
+        shim_install_generic_table(fn_slots, num_fn_entries, base,
                                    g_wrapper_table_liba, 4);
     } else if (strcmp(name, "libB_hip") == 0) {
-        shim_install_generic_table(fn_slots, num_fn_entries, SHIM_LIBB_BASE,
+        g_libb_base = base;
+        shim_install_generic_table(fn_slots, num_fn_entries, base,
                                    g_wrapper_table_libb, 4);
     }
 
-    /* Register every table's metadata in the memfd header so the consumer
-     * can see per-table registrations with name, version, slot range. */
+    /* Register table metadata + op names in the memfd header. */
     if (g_ipc_ok && g_ipc.ctrl) {
         uint32_t idx = g_ipc.ctrl->n_registrations;
         if (idx < SHIM_MAX_REGISTRATIONS) {
@@ -518,13 +537,15 @@ int mock_sdk_set_api_table(const char* name,
             reg->lib_instance  = (uint32_t)lib_instance;
             reg->major_version = (uint32_t)(lib_version / 10000);
             reg->minor_version = (uint32_t)((lib_version / 100) % 100);
-            uint32_t base = g_ipc.ctrl->total_ops;
-            reg->slot_base = base;
-            reg->n_ops     = (uint32_t)num_fn_entries;
+            reg->slot_base     = base;
+            reg->n_ops         = (uint32_t)num_fn_entries;
             g_ipc.ctrl->n_registrations = idx + 1;
             g_ipc.ctrl->total_ops += (uint32_t)num_fn_entries;
 
             /* Register op names for this table. */
+            static const char* mylib_names[] = {
+                "my_traced_function", "set_simulated_work_duration"
+            };
             static const char* liba_names[] = {
                 "liba_queue_create", "liba_memory_allocate",
                 "liba_kernel_dispatch", "liba_signal_wait"
@@ -534,10 +555,12 @@ int mock_sdk_set_api_table(const char* name,
                 "libb_stream_synchronize", "libb_get_device_properties"
             };
             const char** op_names = NULL;
-            if (strcmp(name, "libA_hsa") == 0) op_names = liba_names;
-            else if (strcmp(name, "libB_hip") == 0) op_names = libb_names;
+            uint32_t max_names = 0;
+            if (strcmp(name, "mylib") == 0)      { op_names = mylib_names; max_names = 2; }
+            else if (strcmp(name, "libA_hsa") == 0) { op_names = liba_names; max_names = 4; }
+            else if (strcmp(name, "libB_hip") == 0) { op_names = libb_names; max_names = 4; }
             if (op_names) {
-                for (uint32_t i = 0; i < num_fn_entries && i < 4; i++) {
+                for (uint32_t i = 0; i < num_fn_entries && i < max_names; i++) {
                     snprintf(g_ipc.ctrl->op_info[base + i].name,
                              SHIM_OP_NAME_MAX, "%s", op_names[i]);
                 }
@@ -700,33 +723,11 @@ static void shim_register_ctor(void)
      * the benchmark's fast-path measurement, just no IPC. */
     if (shim_ipc_init(&g_ipc) == 0) {
         g_ipc_ok = 1;
-        /* Register mylib as a table in the memfd header (§13.6). */
-        if (g_ipc.ctrl->n_registrations < SHIM_MAX_REGISTRATIONS) {
-            uint32_t idx = g_ipc.ctrl->n_registrations;
-            shim_table_registration_t* reg = &g_ipc.ctrl->registrations[idx];
-            snprintf(reg->name, SHIM_TABLE_NAME_MAX, "mylib");
-            reg->lib_instance  = 0;
-            reg->major_version = 1;
-            reg->minor_version = 0;
-            reg->slot_base     = 0;
-            reg->n_ops         = SHIM_NUM_OPS;
-            g_ipc.ctrl->n_registrations = idx + 1;
-            g_ipc.ctrl->total_ops       = SHIM_NUM_OPS;
-            /* Register op metadata — names + arg sizes */
-            snprintf(g_ipc.ctrl->op_info[0].name, SHIM_OP_NAME_MAX,
-                     "my_traced_function");
-            g_ipc.ctrl->op_info[0].n_args = 4;
-            g_ipc.ctrl->op_info[0].arg_total_bytes = sizeof(packed_op0_args_t);
-
-            snprintf(g_ipc.ctrl->op_info[1].name, SHIM_OP_NAME_MAX,
-                     "set_simulated_work_duration");
-            g_ipc.ctrl->op_info[1].n_args = 1;
-            g_ipc.ctrl->op_info[1].arg_total_bytes = sizeof(packed_op1_args_t);
-
-            /* Enable all ops in the name-filter bitmap by default */
-            for (uint32_t i = 0; i < SHIM_NUM_OPS; i++)
-                shim_filter_set(g_ipc.ctrl->name_filter, i);
-        }
+        /* Do NOT pre-register tables here. Table registration happens
+         * naturally when mock_register calls back into mock_sdk_set_api_table
+         * for each runtime that registers. Pre-registering caused duplicate
+         * mylib entries and slot-base mismatches with the compile-time
+         * SHIM_LIBA_BASE / SHIM_LIBB_BASE constants. */
     }
 
     mock_register_set_api_table_fn = &mock_sdk_set_api_table;
