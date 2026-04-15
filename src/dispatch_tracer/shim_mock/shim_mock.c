@@ -100,15 +100,19 @@ static void                  shim_pop_correlation (void);
 
 static void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 {
+    /* Fast path is exactly: one load, one branch, one load, one tail-call.
+     * g_shim_orig is loaded INSIDE each branch so the NULL-profiler path
+     * has only the minimum dependency chain (load_profiler → test → jz →
+     * load_orig → jmp *orig). See code-review S1. */
     void* prof = atomic_load_explicit(&g_shim_profiler[0], memory_order_acquire);
-    void* orig = atomic_load_explicit(&g_shim_orig[0],     memory_order_acquire);
     if (__builtin_expect(prof == NULL, 1)) {
-        /* Fast path — no correlation bookkeeping. */
+        void* orig = atomic_load_explicit(&g_shim_orig[0], memory_order_acquire);
         ((orig_op0_t)orig)(a1, a2, a3, a4);
         return;
     }
     /* Slow path — profiler attached. Push correlation so the callback
      * sees internal/external/ancestor, mirroring rocprofiler-sdk. */
+    void* orig = atomic_load_explicit(&g_shim_orig[0], memory_order_acquire);
     shim_correlation_id_t corr = shim_push_correlation();
     ((shim_prof_op0_t)prof)(orig, &corr, a1, a2, a3, a4);
     shim_pop_correlation();
@@ -117,11 +121,12 @@ static void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 static void shim_wrap_op1(unsigned int us)
 {
     void* prof = atomic_load_explicit(&g_shim_profiler[1], memory_order_acquire);
-    void* orig = atomic_load_explicit(&g_shim_orig[1],     memory_order_acquire);
     if (__builtin_expect(prof == NULL, 1)) {
+        void* orig = atomic_load_explicit(&g_shim_orig[1], memory_order_acquire);
         ((orig_op1_t)orig)(us);
         return;
     }
+    void* orig = atomic_load_explicit(&g_shim_orig[1], memory_order_acquire);
     shim_correlation_id_t corr = shim_push_correlation();
     ((shim_prof_op1_t)prof)(orig, &corr, us);
     shim_pop_correlation();
@@ -248,52 +253,95 @@ void* shim_get_original(int op)
 /* SDK's rocprofiler_push_external_correlation_id. See SHIM_DESIGN §7A. */
 /* ------------------------------------------------------------------ */
 
-#define SHIM_CORR_STACK_MAX 16
+#define SHIM_CORR_STACK_MAX 32   /* deep enough for HIP→HSA→RCCL chains
+                                   * plus profiler-side tracing helpers that
+                                   * re-enter wrapped APIs. (Review C1) */
 
 typedef struct { uint64_t internal; uint64_t external; } shim_corr_frame_t;
 
-static _Thread_local uint64_t         tls_next_internal   = 0;
-static _Thread_local int              tls_corr_depth      = 0;
+/* The internal-id counter is PROCESS-wide to keep `internal` values
+ * unique across threads — §7A.1 of SHIM_DESIGN says "monotonic across the
+ * whole process". A relaxed fetch_add on the slow path is cheap; the hot
+ * path does not touch it. (Review S6) */
+static _Atomic uint64_t                g_next_internal     = 0;
+
+static _Thread_local int               tls_corr_depth      = 0;
+static _Thread_local int               tls_corr_dropped    = 0;  /* frames lost to overflow */
 static _Thread_local shim_corr_frame_t tls_corr_stack[SHIM_CORR_STACK_MAX];
-static _Thread_local uint64_t         tls_external_base   = 0;  /* current user-pushed */
+
+/* Proper stack for rocprofiler_shim_push_external_correlation_id so
+ * nested PyTorch-style push(A); push(B); pop()==B; pop()==A works.
+ * (Review C2) */
+static _Thread_local int      tls_ext_depth = 0;
+static _Thread_local uint64_t tls_ext_stack[SHIM_CORR_STACK_MAX];
 
 /* shim_correlation_id_t is forward-declared at the top of this file. */
 
+static inline uint64_t shim_current_external(void)
+{
+    return tls_ext_depth ? tls_ext_stack[tls_ext_depth - 1] : 0;
+}
+
 static inline shim_correlation_id_t shim_push_correlation(void)
 {
-    uint64_t id  = ++tls_next_internal;
+    /* Process-wide monotonic internal id. Relaxed is fine: ordering with
+     * record emission is provided by the ring's own release store. */
+    uint64_t id  = atomic_fetch_add_explicit(&g_next_internal, 1,
+                                             memory_order_relaxed) + 1;
     uint64_t par = tls_corr_depth ? tls_corr_stack[tls_corr_depth - 1].internal : 0;
-    uint64_t ext = tls_corr_depth ? tls_corr_stack[tls_corr_depth - 1].external
-                                  : tls_external_base;
+    uint64_t ext = shim_current_external();
+
+    /* Overflow handling: if the frame stack is saturated, count the push
+     * so the matching pop decrements that counter first instead of popping
+     * a real stack entry. Without this, push/pop pairing drifts and the
+     * ancestor chain corrupts for every enclosing call. (Review C1) */
     if (tls_corr_depth < SHIM_CORR_STACK_MAX) {
         tls_corr_stack[tls_corr_depth].internal = id;
         tls_corr_stack[tls_corr_depth].external = ext;
         tls_corr_depth++;
+    } else {
+        tls_corr_dropped++;
     }
     return (shim_correlation_id_t){ id, ext, par };
 }
 
 static inline void shim_pop_correlation(void)
 {
+    if (tls_corr_dropped > 0) {
+        tls_corr_dropped--;
+        return;
+    }
     if (tls_corr_depth > 0) tls_corr_depth--;
 }
 
 /* Public — same signature as rocprofiler_sdk's push/pop. Called by user
- * code running in the target process (PyTorch profiler, Kineto, ...). */
+ * code running in the target process (PyTorch profiler, Kineto, ...).
+ *
+ * Mock simplification: the SDK's real signature takes
+ * `rocprofiler_user_data_t` (a union); we take uint64_t. (Review S3)
+ * Open design question (Finding 1): the full shim is expected to
+ * forward each push into the SDK's own push/pop when the SDK is loaded,
+ * but doing that here in the mock would require linking the SDK. The
+ * mock restricts itself to shim-local behavior and documents the gap. */
 __attribute__((visibility("default")))
 int rocprofiler_shim_push_external_correlation_id(uint64_t id)
 {
-    /* For the mock we keep a single scalar; the real shim will also
-     * forward this to the SDK's stack when the SDK is loaded. */
-    tls_external_base = id;
-    return 0;
+    if (tls_ext_depth < SHIM_CORR_STACK_MAX) {
+        tls_ext_stack[tls_ext_depth++] = id;
+        return 0;
+    }
+    return -1;   /* overflow — caller should not expect a matching pop to succeed */
 }
 
 __attribute__((visibility("default")))
 int rocprofiler_shim_pop_external_correlation_id(uint64_t* out)
 {
-    if (out) *out = tls_external_base;
-    tls_external_base = 0;  /* simplified — real impl uses a stack */
+    if (tls_ext_depth == 0) {
+        if (out) *out = 0;
+        return -1;
+    }
+    tls_ext_depth--;
+    if (out) *out = tls_ext_stack[tls_ext_depth];
     return 0;
 }
 
