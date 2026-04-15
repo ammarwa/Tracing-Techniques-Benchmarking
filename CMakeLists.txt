@@ -29,7 +29,7 @@ if(NOT WIN32)
 endif()
 
 message("${Cyan}========================================${ColorReset}")
-message("${Cyan}  eBPF vs LTTng Comparison Build${ColorReset}")
+message("${Cyan}  Tracing Techniques Benchmarking${ColorReset}")
 message("${Cyan}========================================${ColorReset}")
 
 # ============================================================================
