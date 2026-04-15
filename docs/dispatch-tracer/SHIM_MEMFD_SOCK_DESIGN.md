@@ -403,7 +403,7 @@ close(socket)
                                  back to accept() — dormant again
 ```
 
-**The target survives consumer detach.** After cleanup, `libroc-shim.so` returns to dormant — bg thread sleeping in `accept()`, no SDK wrappers, zero overhead. A new consumer can attach later (subject to `force_configure` one-shot — if the SDK was already initialized, the new consumer gets `CONFIGURATION_LOCKED`).
+**The target survives consumer detach.** After cleanup, `libroc-shim.so` returns to dormant — bg thread sleeping in `accept()`, no SDK wrappers, zero overhead. A new consumer can attach later.
 
 ## 10. Crash recovery
 
@@ -518,7 +518,7 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 1. **Direct ring sharing optimization** — current design sends records over the socket from the shim ring to the consumer. A future optimization could share the ring directly (consumer mmaps the shim's memfd read-only) to eliminate the socket copy for the record data path. This changes the consumer's buffer model and needs careful design for watermark semantics and multi-reader support.
 
-2. **In-process + OOP coexistence** — if an in-process tool already called `force_configure`, the OOP consumer gets `CONFIGURATION_LOCKED`. A future enhancement could allow the SDK to accept multiple clients (each with its own buffer). This requires SDK-side changes beyond v1.
+2. ~~**In-process + OOP coexistence**~~ — **not an issue.** rocprofiler-sdk already accepts multiple configurations from multiple clients, each with its own buffers and contexts. The shim is just a messenger — it relays `force_configure` as another client. In-process and OOP tools coexist naturally, each with their own buffer destinations.
 
 3. ~~**SDK buffer backing store mechanism**~~ — **not an issue.** No new API needed. When `force_configure` is called through the shim, the SDK detects the shim client and automatically uses the shim's internal ring buffer for its buffer operations. The existing `create_buffer` API works as-is — the SDK internally routes to the shim's ring when it knows the configuration came through the shim.
 
@@ -542,7 +542,7 @@ The design requires register to unconditionally `dlopen` the shim. Today registe
 
 ### 18.2 force_configure one-shot semantics
 
-`force_configure` is locked after the first call. If an in-process tool configures the SDK before the OOP consumer attaches, the OOP attach fails with `CONFIGURATION_LOCKED`. This is the same constraint the current ptrace attach has — it's not a regression, but it limits coexistence.
+rocprofiler-sdk already supports multiple clients calling `force_configure`, each with their own contexts and buffers. The shim is just a messenger relaying `force_configure` as another client — it does not compete with in-process tools. Both can coexist, each writing to their own buffers.
 
 ### 18.3 SDK buffer storage externalization
 
