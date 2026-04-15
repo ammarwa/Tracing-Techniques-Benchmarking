@@ -45,9 +45,16 @@
 typedef struct {
     rocprofiler_callback_tracing_cb_t cb;
     void*                             user_data;
-    int                               registered;   /* any op cared-about */
-    /* Per-op bitset: 1 = this op is traced by this service.
-     * We treat op_count == 0 / operations == NULL as "all ops". */
+    /* `registered` acts as a publication gate between writers (configure
+     * path, holds g_ctx_lock) and readers (populate_contexts /
+     * fire_callbacks, lock-free hot path). The writer fills cb / user_data
+     * / op_mask / all_ops FIRST and then stores registered=1 with
+     * memory_order_release; readers load registered with
+     * memory_order_acquire and only touch the other fields if it was 1.
+     * This avoids torn reads on weakly-ordered architectures (aarch64)
+     * where the hot-path wrapper could otherwise observe registered=1
+     * but cb=NULL or stale op_mask. */
+    _Atomic int                       registered;
     uint32_t                          op_mask;      /* up to 32 ops */
     int                               all_ops;
 } callback_service_t;
@@ -196,9 +203,12 @@ rocprofiler_status_t rocprofiler_configure_callback_tracing_service(
     if (!c) { pthread_mutex_unlock(&g_ctx_lock); return ROCPROFILER_STATUS_ERROR; }
 
     callback_service_t* s = &c->services[kind];
+    /* Populate cb/user_data/op_mask/all_ops BEFORE publishing the
+     * registered flag so a concurrent hot-path reader that observes
+     * registered=1 is guaranteed (via the release/acquire pair) to see
+     * fully-initialized fields below. */
     s->cb         = cb;
     s->user_data  = user_data;
-    s->registered = 1;
     if (operations == NULL || op_count == 0) {
         s->all_ops = 1;
         s->op_mask = 0xFFFFFFFFu;
@@ -210,6 +220,7 @@ rocprofiler_status_t rocprofiler_configure_callback_tracing_service(
             if (ops[i] < 32) s->op_mask |= (1u << ops[i]);
         }
     }
+    atomic_store_explicit(&s->registered, 1, memory_order_release);
     pthread_mutex_unlock(&g_ctx_lock);
     return ROCPROFILER_STATUS_SUCCESS;
 }
@@ -244,16 +255,19 @@ static context_t* populate_contexts(rocprofiler_callback_tracing_kind_t kind,
                                     uint32_t op)
 {
     if (kind < 0 || kind >= ROCPROFILER_CALLBACK_TRACING_NUM) return NULL;
-    /* No lock on the hot path — contexts are append-only during attach
-     * and atomic flags handle activation. The worst case for a racy
-     * read is a missed/stale event at attach boundaries which is
-     * acceptable for a benchmark mock. */
+    /* Lock-free hot path — contexts are append-only during attach and
+     * atomic flags handle activation. registered is loaded with
+     * memory_order_acquire to pair with the release store in
+     * rocprofiler_configure_callback_tracing_service; that guarantees
+     * the subsequent plain reads of s->op_mask / s->all_ops see the
+     * values that were set before registered was published. */
     for (int i = 0; i < MAX_CONTEXTS; ++i) {
         context_t* c = &g_contexts[i];
         if (!c->in_use) continue;
-        if (atomic_load(&c->active) == 0) continue;
+        if (atomic_load_explicit(&c->active, memory_order_acquire) == 0) continue;
         callback_service_t* s = &c->services[kind];
-        if (!s->registered) continue;
+        if (atomic_load_explicit(&s->registered, memory_order_acquire) == 0)
+            continue;
         if (!s->all_ops && (op >= 32 || !(s->op_mask & (1u << op)))) continue;
         return c;
     }
@@ -269,7 +283,8 @@ static int should_wrap_functor(rocprofiler_callback_tracing_kind_t kind,
         context_t* c = &g_contexts[i];
         if (!c->in_use) continue;
         callback_service_t* s = &c->services[kind];
-        if (!s->registered) continue;
+        if (atomic_load_explicit(&s->registered, memory_order_acquire) == 0)
+            continue;
         if (!s->all_ops && (op >= 32 || !(s->op_mask & (1u << op)))) continue;
         pthread_mutex_unlock(&g_ctx_lock);
         return 1;
@@ -298,9 +313,10 @@ static void fire_callbacks(rocprofiler_callback_tracing_kind_t kind,
     for (int i = 0; i < MAX_CONTEXTS; ++i) {
         context_t* c = &g_contexts[i];
         if (!c->in_use) continue;
-        if (atomic_load(&c->active) == 0) continue;
+        if (atomic_load_explicit(&c->active, memory_order_acquire) == 0) continue;
         callback_service_t* s = &c->services[kind];
-        if (!s->registered || !s->cb) continue;
+        if (atomic_load_explicit(&s->registered, memory_order_acquire) == 0
+            || !s->cb) continue;
         if (!s->all_ops && (op >= 32 || !(s->op_mask & (1u << op)))) continue;
         rocprofiler_callback_tracing_record_t rec = {
             .kind          = kind,
