@@ -21,7 +21,7 @@ The key insight from analyzing rocprofiler-sdk's existing code: **the existing f
 
 > **Precise reading of "preloaded":** the user sets `LD_PRELOAD=librocp_stub_mmap.so`. That is the only library preloaded. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL and loads automatically; rocprofiler-sdk is neither preloaded nor linked at startup and is only `dlopen`'d later by the stub at attach. See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not).
 >
-> **OpenMP / OMPT** uses a different registration model; the stub also exports a minimal `ompt_start_tool` that silently saves `ompt_set_callback` at OMPT init and installs real callbacks only at controller attach. See [CONTROL_CHANNEL_SURVEY.md § OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
+> **OpenMP / OMPT** uses a different registration model; the stub will also export a minimal `ompt_start_tool` (planned — not in the current mock) that silently saves `ompt_set_callback` at OMPT init and installs real callbacks only at controller attach. See [CONTROL_CHANNEL_SURVEY.md § OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
 
 1. **Stub library** (preloaded via `LD_PRELOAD`): does NOT export `rocprofiler_configure`. Sets up the mmap control file and spawns a background thread. Because no `rocprofiler_configure` symbol exists, rocprofiler-register's symbol scan finds no tool and does NOT `dlopen` rocprofiler-sdk. The dispatch tables keep their original function pointers — **0 ns hot-path overhead**.
 
@@ -524,7 +524,7 @@ static void tool_finalize(void* tool_data) {
 |-------|------|--------|
 | Stub init | ~10-50 μs | mkdir + open + ftruncate + mmap + pthread_create. No SDK loaded yet. |
 | **Hot-path before any attach** | **0 ns** | rocprofiler-sdk not loaded, no wrappers installed, original function pointers in dispatch tables |
-| Controller attach + first configure | ~5-50 ms | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table for all registered runtime API tables |
+| Controller attach + first configure | ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms) | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table for all registered runtime API tables |
 | **Hot-path (active, callback emits)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
 | **Hot-path (active, runtime filter rejects)** | **~30-50 ns** | `populate_contexts()` + callback fires + atomic load of filter mask + return |
 | Reconfigure (change runtime filter) | ~1 ms | Atomic stores to `g_runtime_filter` — effect immediate on next event |

@@ -112,6 +112,46 @@ static void replay_all_locked(void)
     }
 }
 
+/* ---------------------------------------------------------------- */
+/* Early-load constructor: when MOCK_REGISTER_LIB is set, dlopen the  */
+/* override library BEFORE any runtime calls register_library. This   */
+/* mirrors Jonathan Madsen's proposed shim model where rocprofiler-   */
+/* register unconditionally loads the shim at startup. Without this,  */
+/* tool_present() would return NULL and the conditional dlopen in     */
+/* maybe_load_sdk_locked would never trigger for a tool that only     */
+/* exports its own rocprofiler_configure (like libshim_mock.so).      */
+/*                                                                    */
+/* We deliberately do NOT hold g_registry_lock here to avoid a        */
+/* deadlock: the dlopen'd library's constructor is free to register   */
+/* its own set_api_table callback via the published global; if it     */
+/* also tried mock_register_invoke_all_registrations(), that is a     */
+/* no-op because no runtimes have registered yet.                     */
+/* ---------------------------------------------------------------- */
+
+__attribute__((constructor))
+static void mock_register_early_load(void)
+{
+    const char* lib = getenv("MOCK_REGISTER_LIB");
+    if (!lib || !lib[0]) return;
+
+    void* h = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) {
+        fprintf(stderr, "[mock_register] MOCK_REGISTER_LIB dlopen(%s) failed: %s\n",
+                lib, dlerror());
+        return;
+    }
+    /* Publish the handle + the set_api_table fn (if not already set by the
+     * lib's own constructor) so subsequent registrations go through it. */
+    pthread_mutex_lock(&g_registry_lock);
+    if (g_sdk_handle == NULL) g_sdk_handle = h;
+    if (mock_register_set_api_table_fn == NULL) {
+        void* sym = dlsym(h, "mock_sdk_set_api_table");
+        if (sym) mock_register_set_api_table_fn =
+                     (mock_register_set_api_table_fn_t)sym;
+    }
+    pthread_mutex_unlock(&g_registry_lock);
+}
+
 int mock_register_library_api_table(const char* name,
                                     uint32_t version,
                                     void** api_tables,
@@ -143,19 +183,22 @@ int mock_register_library_api_table(const char* name,
     if ((size_t)slot + 1 > g_registry_count) g_registry_count = slot + 1;
 
     /* Is a tool present in the image? If so, make sure the SDK is loaded
-     * and hand off this (and any previously-deferred) registration. */
+     * and hand off this (and any previously-deferred) registration.
+     * In shim-mode the set_api_table callback has already been published
+     * by the early-load constructor, so we can skip the tool_present probe
+     * and the dlopen entirely — just replay this table through the shim. */
     int rc;
-    if (tool_present()) {
+    if (mock_register_set_api_table_fn != NULL) {
+        mock_register_set_api_table_fn(e->name, e->version,
+                                       e->api_tables, e->num_tables);
+        rc = MOCK_REGISTER_OK;
+    } else if (tool_present()) {
         maybe_load_sdk_locked();
         if (mock_register_set_api_table_fn != NULL) {
-            /* Replay *this* table immediately; others were already
-             * replayed when the SDK loaded. To keep semantics simple
-             * and deterministic, replay just this one here. */
             mock_register_set_api_table_fn(e->name, e->version,
                                            e->api_tables, e->num_tables);
             rc = MOCK_REGISTER_OK;
         } else {
-            /* Tool visible but SDK failed to load. */
             rc = MOCK_REGISTER_NO_TOOL;
         }
     } else {

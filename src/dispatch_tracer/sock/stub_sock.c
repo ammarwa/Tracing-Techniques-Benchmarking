@@ -126,7 +126,7 @@ static int load_sdk_and_configure(void)
 
     /* Tool's rocprofiler_configure is now visible via RTLD_DEFAULT. */
     rocprofiler_configure_func_t tool_configure =
-        (rocprofiler_configure_func_t)dlsym(RTLD_DEFAULT, "rocprofiler_configure");
+        (rocprofiler_configure_func_t)dlsym(g_sdk_handle, "rocprofiler_configure");
     resolve_sdk_symbols();
     if (!p_force_configure || !tool_configure) {
         fprintf(stderr, "[stub_sock] could not resolve SDK/tool symbols\n");

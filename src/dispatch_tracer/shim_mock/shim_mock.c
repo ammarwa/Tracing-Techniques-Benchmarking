@@ -111,23 +111,31 @@ static void shim_install_mylib_table(void** slots, uint64_t num_entries)
 {
     pthread_mutex_lock(&g_shim_install_lock);
 
-    /* Slot 0: my_traced_function. */
+    /* Slot 0: my_traced_function. The slot-pointer store must be
+     * release-ordered with respect to the g_shim_orig store so an app
+     * thread that observes the new wrapper address in the slot is
+     * guaranteed to also observe the saved original — otherwise the
+     * wrapper's first call could read a NULL original and NULL-deref
+     * on weakly-ordered architectures like aarch64. */
     if (num_entries > 0 && !g_shim_installed[0]) {
         void* cur = slots[0];
-        /* Guard against re-install if mock_register replays the table. */
         if (cur != (void*)&shim_wrap_op0) {
             atomic_store_explicit(&g_shim_orig[0], cur, memory_order_release);
-            slots[0] = (void*)&shim_wrap_op0;
+            atomic_store_explicit((_Atomic(void*)*)&slots[0],
+                                  (void*)&shim_wrap_op0,
+                                  memory_order_release);
         }
         g_shim_installed[0] = 1;
     }
 
-    /* Slot 1: set_simulated_work_duration. */
+    /* Slot 1: set_simulated_work_duration. Same ordering requirement. */
     if (num_entries > 1 && !g_shim_installed[1]) {
         void* cur = slots[1];
         if (cur != (void*)&shim_wrap_op1) {
             atomic_store_explicit(&g_shim_orig[1], cur, memory_order_release);
-            slots[1] = (void*)&shim_wrap_op1;
+            atomic_store_explicit((_Atomic(void*)*)&slots[1],
+                                  (void*)&shim_wrap_op1,
+                                  memory_order_release);
         }
         g_shim_installed[1] = 1;
     }
@@ -148,13 +156,14 @@ int mock_sdk_set_api_table(const char* name,
     (void)version;
     if (!name || !api_tables || num_tables == 0) return -1;
 
-    /* For this mock we know only one runtime: "mylib". Extend to HIP /
-     * HSA / RCCL / OMPT the same way mock_sdk_set_api_table does in
-     * the full SDK mock (one set of wrappers per runtime × per op). */
-    if (strcmp(name, "mylib") == 0 && api_tables[0]) {
-        uint64_t num_entries =
-            sizeof(mylib_api_table_t) / sizeof(void*);
-        shim_install_mylib_table((void**)api_tables[0], num_entries);
+    /* For this mock we know only one runtime: "mylib". mylib_dispatch
+     * passes `api_tables = (void**)&g_api_table` and `num_tables` is the
+     * number of slots (function pointers) in that table — so we treat
+     * api_tables as the slot array directly, matching mock_sdk's
+     * convention. Extend to HIP / HSA / RCCL / OMPT by switching on
+     * name and installing per-runtime wrappers. */
+    if (strcmp(name, "mylib") == 0) {
+        shim_install_mylib_table(api_tables, num_tables);
     }
 
     return 0;
@@ -211,6 +220,12 @@ void* shim_get_original(int op)
 __attribute__((constructor))
 static void shim_register_ctor(void)
 {
+    /* Publish our set_api_table callback so mock_register hands us every
+     * subsequent table registration. We deliberately do NOT call
+     * mock_register_invoke_all_registrations() here: this constructor
+     * runs while mock_register's early-load dlopen holds the registry
+     * lock, so a recursive lock attempt would deadlock on a non-
+     * recursive mutex. The post-shim mock_register path replays
+     * registrations through us naturally (see mock_register.c). */
     mock_register_set_api_table_fn = &mock_sdk_set_api_table;
-    mock_register_invoke_all_registrations();
 }

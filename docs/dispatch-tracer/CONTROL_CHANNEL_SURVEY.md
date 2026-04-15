@@ -532,7 +532,7 @@ The late-load design provides full late configuration without ptrace. Here is th
 | Add domain not in first-attach config | No (subsequent force_configure locked) | Yes (re-injects fresh SDK) |
 | Privileges required | None | `CAP_SYS_PTRACE` (or appropriate ptrace_scope) |
 | Architecture | Any | x86-64 only |
-| Attach latency | ~5-50 ms (dlopen + force_configure + propagation) | ~10-50 ms (ptrace + injection) |
+| Attach latency | ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms) (dlopen + force_configure + propagation) | ~10-50 ms (ptrace + injection) |
 
 ### Use Case Matrix
 

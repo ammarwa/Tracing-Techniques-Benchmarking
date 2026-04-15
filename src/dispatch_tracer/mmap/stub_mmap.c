@@ -189,7 +189,7 @@ static void load_sdk_and_configure(void)
     }
 
     rocprofiler_configure_func_t tool_configure =
-        (rocprofiler_configure_func_t)dlsym(RTLD_DEFAULT, "rocprofiler_configure");
+        (rocprofiler_configure_func_t)dlsym(g_sdk_handle, "rocprofiler_configure");
     p_force_configure =
         (rocprofiler_status_t(*)(rocprofiler_configure_func_t))
         dlsym(RTLD_DEFAULT, "rocprofiler_force_configure");

@@ -8,7 +8,7 @@ This option provides the **strongest authentication model** of all options: the 
 
 ## Integration with rocprofiler-sdk
 
-> **Precise reading of "preloaded":** `LD_PRELOAD=librocp_stub_sock.so` — only the stub. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL (auto-loaded); rocprofiler-sdk is neither preloaded nor linked and is only `dlopen`'d at attach. OMPT is handled via a silent `ompt_start_tool` in the stub. See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not) and [§ OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
+> **Precise reading of "preloaded":** `LD_PRELOAD=librocp_stub_sock.so` — only the stub. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL (auto-loaded); rocprofiler-sdk is neither preloaded nor linked and is only `dlopen`'d at attach. OMPT will be handled via a silent `ompt_start_tool` in the stub (planned — see survey § OMPT for status). See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not) and [§ OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
 
 Same as all options — uses the **late-load design** described in [mmap](MMAP.md#what-changes-minimal--late-load-architecture):
 
@@ -18,7 +18,7 @@ Same as all options — uses the **late-load design** described in [mmap](MMAP.m
 
 The **only difference from mmap** is the IPC mechanism: a Unix domain socket where the stub's background thread blocks on `accept()`/`recv()` and responds to commands directly. The protocol carries `CMD_CONFIGURE` (full config payload), `CMD_ACTIVATE`, `CMD_DEACTIVATE`, `CMD_RECONFIGURE`, and `CMD_STATUS`.
 
-**Advantage over mmap**: the socket is inherently bidirectional, so the controller can synchronously wait for `CMD_CONFIGURE` to complete (including dlopen + force_configure + propagation, ~5-50 ms) and receive a confirmation ACK with event counters.
+**Advantage over mmap**: the socket is inherently bidirectional, so the controller can synchronously wait for `CMD_CONFIGURE` to complete (including dlopen + force_configure + propagation, ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms)) and receive a confirmation ACK with event counters.
 
 ## Architecture
 
@@ -155,7 +155,7 @@ Controller                      Stub bg thread
     │                               │ rocprofiler_force_configure() →
     │                               │ SDK init, wrappers install,
     │                               │ tool_initialize creates ctx
-    │     {OK, ctx_id}              │ (blocks ~5-50 ms)
+    │     {OK, ctx_id}              │ (blocks ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms))
     │<──────────────────────────────┤
     │                               │
     │  CMD_ACTIVATE                 │
@@ -563,7 +563,7 @@ static void tool_finalize(void* tool_data) {
 | Controller connect | ~3-5 μs | `socket` + `connect` |
 | SO_PEERCRED check | ~1 μs | `getsockopt` |
 | Command send/recv | ~1-5 μs | Per command (kernel copies data between socket buffers) |
-| Controller attach + first CMD_CONFIGURE | ~5-50 ms | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table for all registered runtime API tables |
+| Controller attach + first CMD_CONFIGURE | ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms) | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table for all registered runtime API tables |
 | **Hot-path (active, callback emits)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
 | **Hot-path (active, runtime filter rejects)** | **~30-50 ns** | `populate_contexts()` + callback fires + atomic load of filter mask + return |
 | Reconfigure (change runtime filter) | ~5 μs | Socket round-trip + atomic stores to `g_runtime_filter` |

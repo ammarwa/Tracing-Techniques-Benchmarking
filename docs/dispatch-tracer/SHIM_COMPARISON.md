@@ -13,14 +13,14 @@ Both designs solve the same real problem — late-attach, no-sudo, no-ptrace OOP
 |---|---|---|
 | How the tracer enters the process | `LD_PRELOAD=librocp_stub_<channel>.so` | None — rocprofiler-register always `dlopen`s the shim when a runtime registers a table |
 | State of dispatch tables before any OOP attach | Original pointers, never wrapped | Wrapped from process start by a shim `functor(args...)` |
-| Hot-path cost when no OOP attached | **Genuine 0 ns** (verified 20×1M-iter, stub-vs-baseline indistinguishable at 95% CI) | **One atomic load + one well-predicted branch** per call (Jonathan argues noise-equivalent, citing prior `disabled-sdk-contexts` measurements) |
+| Hot-path cost when no OOP attached | **Genuine 0 ns** (verified 20×1M-iter, stub-vs-baseline indistinguishable at 95% CI) | **+0.8 ns measured** (20×1M-iter, Δ=+0.804 ± 0.251 ns, distinguishable at 95% — below noise for real-SDK use, above it for our mock's sample size) |
 | Attach cost | ~1.8 ms (`dlopen` tool library + `rocprofiler_force_configure` + `update_table()` propagation) | ≈ single atomic store into `profiler_functor` slot |
 | Does rocprofiler-sdk get loaded for OOP profiling? | **Yes** — at attach | **No** — shim has its own OOP API; SDK stays out of the address space |
 | Coexistence of in-process SDK + OOP shim tool | Awkward — SDK is the only wrapper machinery | Natural — SDK layers its wrappers on top of the shim's `functor` |
 | OMPT handling | Stub exports a silent `ompt_start_tool` (design contract; not in the mock yet) | Shim must do the same — `ompt_start_tool` is a one-shot OpenMP init scan, not a dispatch table |
 | IPC control channel surface (auth, rendezvous, config transport) | memfd+sock hybrid (see [MEMFD.md](MEMFD.md)) | Same IPC survey applies — same memfd+sock hybrid recommended |
 | New code we own and ship | ~20 KiB stub per channel | A new library (`librocprofiler-sdk-shim.so`) with its own OOP API + external shim tool |
-| What gets relaxed relative to requirements | Nothing | "0 ns hot path" → "noise-equivalent hot path"; "no preload" becomes **stronger** (no preload needed at all) |
+| What gets relaxed relative to requirements | Nothing | "0 ns hot path" → "+0.8 ns measured hot path" (see §7a); "no preload" becomes **stronger** (no preload needed at all) |
 
 ## 1. How each design installs its wrappers
 
@@ -70,9 +70,9 @@ Hot path pre-attach:
     → tail call to original
 ```
 
-**Claim:** the atomic-load + branch is "indistinguishable from noise". Plausible on modern OoO cores — the load hits L1, the branch is monotonically not-taken so the predictor handles it for free, and the tail call fuses with the surrounding frame. Empirically it is at most a couple of cycles; Jonathan backs it up with prior `disabled-sdk-contexts` measurements from rocprofiler-sdk where the equivalent "check if a context is active, none are" path has never surfaced above noise.
+**Claim:** the atomic-load + branch is "indistinguishable from noise". Jonathan backed it up with prior `disabled-sdk-contexts` measurements from rocprofiler-sdk where the equivalent "check if a context is active, none are" path has never surfaced above noise. Our direct measurement (§7a) finds the fast path costs **+0.8 ± 0.25 ns** at 20×1M-iter resolution on AMD EPYC 9354 — cheap (2–3 cycles), well below real-SDK active-tracing cost, but measurably nonzero. The qualitative claim is right; the strict "zero" was an overreach.
 
-The two designs trade a hard 0 for an argued-noise-equivalent cost in exchange for getting rid of `LD_PRELOAD`.
+The two designs trade a hard 0 for a measured ~0.8 ns in exchange for getting rid of `LD_PRELOAD`.
 
 ## 2. Attach and detach
 
@@ -190,15 +190,15 @@ Rules from [CONTROL_CHANNEL_SURVEY.md § Requirements](CONTROL_CHANNEL_SURVEY.md
 | Multi-runtime (HIP/HSA/RCCL/OMPT) | ✓ | ✓ |
 | No binary rewriting / no uprobe placement | ✓ | ✓ in default path; GOTCHA is his optional Linux-only optimization that would be a form of binary rewriting if enabled |
 | Cross-architecture | ✓ | ✓ in default path |
-| **0 ns hot path when no controller attached** | **Genuine 0** (statistically verified) | **Relaxed** to "one atomic load + branch, noise-equivalent" |
+| **0 ns hot path when no controller attached** | **Genuine 0** (statistically verified) | **Relaxed** to "+0.8 ns measured, distinguishable at 95% CI" (see §7a) |
 | **No `LD_PRELOAD` required** | **Broken** — requires `LD_PRELOAD=librocp_stub_*.so` | **Stronger** — never required |
 | In-process SDK + OOP tool coexistence | Broken — `init_status` locks out `force_configure` | **Stronger** — natural layering |
 | rocprofiler-sdk loaded into every OOP-profiled process | Yes, at attach | **Stronger** — never loaded for OOP-only use |
 | New code to design and maintain | ~20 KiB stub per channel; reuses SDK as-is | `librocprofiler-sdk-shim.so` + external shim tool + new shim ABI |
 
-Net: Jonathan's design relaxes "genuine 0 ns" to "noise-equivalent" and takes on the cost of designing and shipping a new library with its own ABI. In return it strengthens four other properties (no preload, no SDK for OOP, coexistence, attach cost). The IPC-channel survey we've already done applies to both with the same recommended hybrid.
+Net: Jonathan's design relaxes "genuine 0 ns" to "+0.8 ns measured per call" (see §7a) and takes on the cost of designing and shipping a new library with its own ABI. In return it strengthens four other properties (no preload, no SDK for OOP, coexistence, attach cost). The IPC-channel survey we've already done applies to both with the same recommended hybrid.
 
-## 7a. Measured: the shim fast path *is* noise-equivalent
+## 7a. Measured: the shim fast path adds +0.8 ns/call
 
 Rather than leave "indistinguishable from noise" as a claim, this repo now ships a validation mock — `src/dispatch_tracer/shim_mock/` — that implements exactly the `atomic_load + branch + tail_call` shape against our existing `mylib_dispatch` / `sample_app_dispatch` harness. It is loaded by `mock_register` via a new `MOCK_REGISTER_LIB` env var, with **no `LD_PRELOAD`** on the sample app, mirroring the production "register always dlopens the shim" assumption. The shim rewrites `mylib_dispatch`'s api_table with wrappers of the form:
 
@@ -219,14 +219,20 @@ void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 
 | Config | Mean (ns) | Stdev | 95% CI | Δ vs baseline | Distinguishable at 95%? |
 |---|---:|---:|---:|---:|:---|
-| Baseline (no stub, no shim)  | 3.578 | 0.339 | ±0.149 | — | — |
-| stub mmap                    | 3.502 | 0.339 | ±0.149 | −0.076 ± 0.210 | no |
-| stub sock                    | 3.504 | 0.365 | ±0.160 | −0.074 ± 0.218 | no |
-| stub memfd                   | 3.443 | 0.018 | ±0.008 | −0.135 ± 0.149 | no |
-| stub signal                  | 3.438 | 0.004 | ±0.002 | −0.139 ± 0.149 | no |
-| **shim (profiler=NULL)**     | **3.483** | 0.164 | ±0.072 | **−0.095 ± 0.165** | **no** |
+| Baseline (no stub, no shim)  | 3.438 | 0.045 | ±0.020 | — | — |
+| stub mmap                    | 3.481 | 0.268 | ±0.117 | +0.043 ± 0.119 | no |
+| stub sock                    | 3.409 | 0.084 | ±0.037 | −0.029 ± 0.042 | no |
+| stub memfd                   | 3.555 | 0.345 | ±0.151 | +0.117 ± 0.153 | no |
+| stub signal                  | 3.452 | 0.023 | ±0.010 | +0.014 ± 0.022 | no |
+| **shim (profiler=NULL)**     | **4.242** | 0.570 | ±0.250 | **+0.804 ± 0.251** | **yes** |
 
-The shim's delta is well inside the 95% two-sample margin; its absolute mean sits between the most-active stub (mmap, 3.502) and the quietest stub (signal, 3.438). Empirically there is no cost you can measure for the `atomic-load + branch + tail-call` path on this hardware. Jonathan's claim holds on AMD EPYC 9354 at 1M-iteration sample sizes; the 0 ns story is preserved.
+**Honest interpretation — revised.** The four late-load stubs are statistically indistinguishable from baseline, as their design predicts (no wrappers installed, original dispatch pointers preserved). The **shim fast path is not** — it adds ~0.8 ns/call, which is roughly 2–3 CPU cycles at this hardware's clock rate and exceeds the two-sample 95% margin. Jonathan's "noise-equivalent" claim is partially refuted at this sample size: the path is cheap, but not free.
+
+Why it isn't zero: every call performs two atomic-acquire loads (`g_shim_profiler[op]`, `g_shim_orig[op]`), a branch, and a tail call — rather than a single indirect call through an unmodified function-pointer slot. The branch predictor handles the always-taken fast path well, but each atomic load is still a memory access that the compiler cannot elide, and the second one (the `orig`) is only strictly necessary because this mock keeps originals in a separate atomic-pointer array. A production shim that bakes the original address into the wrapper as a PC-relative symbol (or uses a GOTCHA-style trampoline) would likely erase most of the remaining 0.8 ns.
+
+**The caveat that survives**: 0.8 ns/call is still an order of magnitude below rocprofiler-sdk's measured active-tracing cost (~50–200 ns in real SDK, ~2,500–2,900 ns in our mock), so the shim design remains practically viable. But the "genuine 0" property of the late-load stub approach is a real advantage that should be acknowledged, not hand-waved away. The right framing is: "the shim design trades ~0.8 ns always-on for better UX (no LD_PRELOAD) and better in-process-SDK coexistence."
+
+_An earlier version of this table reported 3.483 ns / −0.095 ± 0.165 for the shim and claimed indistinguishability. That measurement was invalid — the shim library was not actually loading (nothing exported `rocprofiler_configure` at registration time, so `mock_register`'s conditional dlopen never triggered). Commit of `mock_register.c`'s `MOCK_REGISTER_LIB` early-load constructor fixed the load path; this table is the corrected measurement._
 
 Raw data: `report/dispatch_noise.json` (includes per-run samples for all six configurations).
 

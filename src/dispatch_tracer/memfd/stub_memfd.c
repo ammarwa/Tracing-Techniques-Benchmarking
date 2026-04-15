@@ -220,7 +220,7 @@ static void load_tool_and_configure(void)
     /* Resolve SDK entry points. force_configure/start/stop live in
      * libmock_sdk.so (pulled in as a dependency of the tool lib). */
     rocprofiler_configure_func_t tool_configure =
-        (rocprofiler_configure_func_t)dlsym(RTLD_DEFAULT, "rocprofiler_configure");
+        (rocprofiler_configure_func_t)dlsym(g_tool_handle, "rocprofiler_configure");
     p_force_configure =
         (rocprofiler_status_t (*)(rocprofiler_configure_func_t))
         dlsym(RTLD_DEFAULT, "rocprofiler_force_configure");

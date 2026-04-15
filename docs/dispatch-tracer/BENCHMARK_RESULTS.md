@@ -29,11 +29,11 @@ python3 -u scripts/benchmark_noop_noise.py --iters 1000000 --runs 20
 
 | Config | Mean (ns) | Stdev | 95% CI | Δ vs baseline | Distinguishable at 95%? |
 |--------|----------:|------:|-------:|--------------:|:---|
-| Baseline (no stub)  | **3.604** | 0.521 | ±0.228 | —        | — |
-| stub mmap           | 3.537     | 0.356 | ±0.156 | −0.068 ± 0.277 | no |
-| stub sock           | 3.421     | 0.080 | ±0.035 | −0.184 ± 0.231 | no |
-| stub memfd          | 3.450     | 0.203 | ±0.089 | −0.154 ± 0.245 | no |
-| stub signal         | 3.433     | 0.007 | ±0.003 | −0.171 ± 0.228 | no |
+| Baseline (no stub)  | **3.438** | 0.045 | ±0.020 | —        | — |
+| stub mmap           | 3.481     | 0.268 | ±0.117 | +0.043 ± 0.119 | no |
+| stub sock           | 3.409     | 0.084 | ±0.037 | −0.029 ± 0.042 | no |
+| stub memfd          | 3.555     | 0.345 | ±0.151 | +0.117 ± 0.153 | no |
+| stub signal         | 3.452     | 0.023 | ±0.010 | +0.014 ± 0.022 | no |
 
 **Interpretation.** With 20 million-iteration samples per config, the two-sample 95% confidence margin for each stub-vs-baseline delta exceeds |Δ|. We **cannot reject the null hypothesis that stub-loaded hot-path cost equals baseline** — which is exactly what the late-load design predicts: the stub exports no `rocprofiler_configure`, so rocprofiler-register's symbol scan finds no tool, rocprofiler-sdk is never `dlopen`'d, `update_table()` never runs, and `api_table[op]` retains the original function pointers. The hot path is a single indirect call through the unmodified table in every configuration; the 0.07–0.18 ns differences are attributable to ASLR-dependent I-cache alignment, P-state jitter, and `clock_gettime` resolution (~20 ns per sample over a ~3.6 ms loop).
 

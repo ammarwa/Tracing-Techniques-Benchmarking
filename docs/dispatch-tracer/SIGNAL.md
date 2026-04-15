@@ -6,13 +6,13 @@ This design uses a **real-time signal** (`SIGRTMIN+n`) as an instant notificatio
 
 This is not a standalone channel — it's an **enhancement** layered on top of mmap (file) or memfd (socket + anonymous shm) to add instant, zero-CPU-cost notification for configuration changes.
 
-> **Precise reading of "preloaded":** `LD_PRELOAD=librocp_stub_signal.so` — only the stub. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL (auto-loaded); rocprofiler-sdk is neither preloaded nor linked and is only `dlopen`'d at attach. OMPT is handled via a silent `ompt_start_tool` in the stub. See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not) and [§ OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
+> **Precise reading of "preloaded":** `LD_PRELOAD=librocp_stub_signal.so` — only the stub. rocprofiler-register is already a `DT_NEEDED` dependency of HIP/HSA/OpenMP/RCCL (auto-loaded); rocprofiler-sdk is neither preloaded nor linked and is only `dlopen`'d at attach. OMPT will be handled via a silent `ompt_start_tool` in the stub (planned — see survey § OMPT for status). See [CONTROL_CHANNEL_SURVEY.md § What Exactly Gets LD_PRELOAD'd](CONTROL_CHANNEL_SURVEY.md#what-exactly-gets-ld_preloadd--and-what-does-not) and [§ OpenMP / OMPT](CONTROL_CHANNEL_SURVEY.md#openmp--ompt--a-different-registration-path).
 
 ## Why Signals?
 
 Under the late-load architecture (see [mmap](MMAP.md#what-changes-minimal--late-load-architecture)), **before any controller attaches, no wrappers exist** — rocprofiler-sdk is not loaded, the dispatch tables still point at original function pointers, and the hot path cost is **0 ns**. There is no `populate_contexts()` check happening per call yet, because the SDK has not been configured.
 
-Signals become valuable precisely because of this architecture: the first attach (`CMD_CONFIGURE`) triggers heavy one-shot work — `dlopen("librocprofiler-sdk-tool.so")`, symbol resolution, `rocprofiler_force_configure()`, runtime API-table re-propagation, and `update_table()` wrapper installation. This work typically takes **~5-50 ms** and must happen off the hot path on a background thread. A sleeping `poll()`-based background thread costs 0 CPU; a real-time signal wakes it within ~1-5 μs of the controller's `sigqueue()`, so attach latency is dominated by the unavoidable dlopen work, not by polling interval.
+Signals become valuable precisely because of this architecture: the first attach (`CMD_CONFIGURE`) triggers heavy one-shot work — `dlopen("librocprofiler-sdk-tool.so")`, symbol resolution, `rocprofiler_force_configure()`, runtime API-table re-propagation, and `update_table()` wrapper installation. This work typically takes **~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms)** and must happen off the hot path on a background thread. A sleeping `poll()`-based background thread costs 0 CPU; a real-time signal wakes it within ~1-5 μs of the controller's `sigqueue()`, so attach latency is dominated by the unavoidable dlopen work, not by polling interval.
 
 Signals are also valuable for:
 
@@ -68,7 +68,7 @@ Signals are also valuable for:
 │  │    cmd = atomic_load(&ctrl->command)                       │  │
 │  │    switch (cmd) {                                          │  │
 │  │      case CMD_CONFIGURE:                                   │  │
-│  │        // First attach: heavy work ~5-50 ms                │  │
+│  │        // First attach: heavy work ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms)                │  │
 │  │        if (!sdk_loaded) load_sdk_and_configure();          │  │
 │  │        else apply_runtime_filter(&ctrl->config);           │  │
 │  │      case CMD_ACTIVATE:                                    │  │
@@ -325,7 +325,7 @@ static void* control_poll_loop(void* arg) {
             if (__atomic_compare_exchange_n(&sdk_loaded, &expected, true,
                                             false, __ATOMIC_ACQ_REL,
                                             __ATOMIC_ACQUIRE)) {
-                load_sdk_and_configure();  /* heavy: ~5-50 ms */
+                load_sdk_and_configure();  /* heavy: ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms) */
                 __atomic_store_n(&ctrl->context_active, 1, __ATOMIC_RELEASE);
             } else {
                 apply_runtime_filter(&ctrl->config);
@@ -395,7 +395,7 @@ if (ret < 0) {
 | **Hot-path before any attach** | **0 ns** | rocprofiler-sdk not loaded, no wrappers installed, original function pointers in dispatch tables |
 | Signal handler execution | ~0.5-2 μs | Handler writes 1 byte to wakeup pipe (async-signal-safe only) |
 | Background thread wakeup | ~1-3 μs | `poll()` returns + drain pipe |
-| Controller attach + first CMD_CONFIGURE | ~5-50 ms | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table. Runs on bg thread, NOT in signal handler. |
+| Controller attach + first CMD_CONFIGURE | ~1-2 ms (mock; real SDK dlopen would make this ~5-50 ms) | dlopen rocprofiler-sdk-tool (brings rocprofiler-sdk as link dep) + force_configure + propagation + update_table. Runs on bg thread, NOT in signal handler. |
 | **Hot-path (active, callback emits)** | **~50-200 ns** | `populate_contexts()` + enter callbacks + original call + exit callbacks + buffer emplace |
 | **Hot-path (active, runtime filter rejects)** | **~30-50 ns** | `populate_contexts()` + callback fires + atomic load of filter mask + return |
 | Reconfigure (CMD_RECONFIGURE) | ~1 μs + signal wake | Atomic stores to runtime filter — effect immediate on next event |
