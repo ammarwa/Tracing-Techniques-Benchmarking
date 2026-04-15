@@ -325,7 +325,24 @@ Sealing: after `F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`:
 - Size cannot grow (GROW) — protects the target from the consumer inflating the fd (we want a fixed, known-size region)
 - Seal set itself is frozen (SEAL) — a malicious same-UID peer cannot subsequently add `F_SEAL_WRITE` to lock the target out of its own state
 
-Reads and writes to the body proceed with normal acquire/release atomics on `head`, `tail`, `gen_counter`, `events_traced`, `events_dropped`, and the `op_mode[Op]` slots. All other fields are const-after-init.
+Reads and writes to the body proceed with normal acquire/release atomics on `head`, `tail`, `gen_counter`, `events_traced`, `events_dropped`, and the `op_mode[Op]` slots.
+
+**Mutable control fields and their publication protocol**: beyond `op_mode`, several fields are consumer-written and hot-path-read at runtime:
+
+- `name_filter[D]` bitmaps (§13.5 Phase 1)
+- `value_filter_count[Op]` and per-op rule arrays (§13.5 Phase 3)
+- `arg_policy[Op]` (§7B.4)
+
+These are **not** const-after-init. A consumer reconfiguring filters mid-session could race with the hot path reading a partially-updated bitmap or rule array. The publication protocol is **install-while-off**:
+
+1. Consumer sets `op_mode[Op] = ROCP_SHIM_MODE_OFF` (release store).
+2. Consumer updates `name_filter`, `value_filter_count`, rule arrays, `arg_policy` for that op. These are plain (non-atomic) writes — safe because the hot path skips this op entirely while mode is OFF.
+3. Consumer sets `op_mode[Op] = ROCP_SHIM_MODE_RECORD` (release store). The hot path's acquire-load of `op_mode` pairs with this release, guaranteeing all filter/rule writes from step 2 are visible before the first record is emitted.
+4. Consumer bumps `gen_counter`.
+
+For **initial attach** (all ops start at MODE_OFF), this is automatic — the consumer writes all filters before setting any mode to non-OFF. For **mid-session reconfigure**, the consumer must briefly disable the op (step 1), update, then re-enable (step 3). The brief disable window (< 1 µs) means at most a few calls on fast-path threads skip tracing during the transition — acceptable for a profiling tool.
+
+All other header fields (magic, version, pid, start_time, registrations[], ring layout) are genuinely const-after-init.
 
 ### 5.1 Slot write
 
@@ -1372,7 +1389,7 @@ Minimum validation suite:
 
   - **Same major + minor**: full arg-struct decoding.
   - **Same major, different minor**: minor additions are append-only per the runtime's ABI contract. Consumer decodes fields it knows; any field beyond its known `sizeof` is ignored.
-  - **Different major**: the arg-struct layout may have changed incompatibly. Consumer falls back to scalars-only decoding (scalars at fixed offsets are stable; struct-level fields beyond the consumer's `sizeof` are skipped). Consumer library logs: `"HIP runtime table v3.2 → consumer built against v2.4 — arg decoding limited to scalars."`
+  - **Different major**: the arg-struct layout may have changed incompatibly. **V1 policy: reject the table for arg decoding** — the consumer library logs `"HIP runtime table v3.x → consumer built against v2.x — arg decoding disabled for this table"` and treats the `args[]` payload as opaque bytes (no field access). Records are still emitted with tsc/kind/op/phase/correlation for event-count and timeline analysis, but the consumer cannot safely cast `args` to a typed struct. This is the same conservative posture the SDK's own `registration.cpp:1306` takes for RCCL table validation — reject on incompatible layout rather than guess. A future v2 frozen wire schema (flatbuffer-style with explicit field offsets) can relax this to degraded decoding; for v1, exact-major-match is required for typed arg access.
 
   > **P2b acknowledgment (from external review)**: reusing SDK arg structs as the cross-process wire format is brittle when producer and consumer are independently built. The v1 per-table version check is a necessary minimum but not sufficient for strict ABI safety. A v2 improvement is tracked: freeze a shim-owned wire schema with explicit field offsets (flatbuffer-style), and generate translation code between the SDK's native structs and the wire format. This eliminates the "independently built struct cast" hazard entirely but requires more code generation.
 
