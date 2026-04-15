@@ -1027,6 +1027,134 @@ The consumer controls:
 
 This mirrors how rocprofiler-sdk's buffer-tracing callbacks work today: the SDK's `rocprofiler_flush_buffer` delivers records on a **user-controlled callback thread** (the one that calls flush), not on an SDK-internal thread. The shim extends this pattern to the OOP consumer side.
 
+### 13.5 Per-op filter chain
+
+Today `profiler_functor[Op]` is all-or-nothing: either an op is traced or it isn't. Real profiling sessions need finer control — "trace only `hipLaunchKernel`", "trace only HIP calls that take a `hipStream_t`", "trace only `hipMemcpyAsync` where `sizeBytes > 1 MB`". The shim provides a three-phase filter chain that runs **in the target's hot path** before any record is emitted, so filtered calls never touch the ring and pay only the filter-evaluation cost.
+
+#### Phase 1 — Function name filter (cheapest, always evaluated first)
+
+The consumer specifies a set of function names (or glob/regex patterns) to include or exclude. The shim maps each name to its `(domain, op)` index at filter-install time using the same name→op lookup table rocprofiler-sdk ships (the `rocprofiler_iterate_callback_tracing_kind_operation_names` family). At runtime the filter is a **per-op bit** in a bitmap stored in the memfd header — one bit per op, one bitmap per domain. The hot path checks this bit before the `profiler_functor` load:
+
+```c
+/* Inside shim_wrap_<domain>_<op>: */
+if (!filter_bitmap_test(g_ctrl->name_filter[DOMAIN], OP))
+    goto fast_path;   /* filtered out — tail-call original, no record */
+```
+
+Cost: one cache-line-resident bit test per call. ~0.3 ns on x86-64 (the bitmap lives in the same memfd header cache line the wrapper already touches for `profiler_functor`).
+
+Consumer API:
+
+```c
+/* Include only the named functions. Names use the SDK's canonical
+ * operation-name strings (e.g. "hipLaunchKernel", "hsa_queue_create").
+ * Glob patterns accepted: "hip*", "hsa_memory_*". */
+int rocp_shim_set_name_filter(rocp_shim_handle_t h,
+                              uint32_t domain,
+                              const char* const* include_names,
+                              size_t include_count,
+                              const char* const* exclude_names,
+                              size_t exclude_count);
+```
+
+This is the same pattern rocprofiler-sdk uses today when the user passes `--hip-api hipLaunchKernel,hipMemcpyAsync` to rocprofv3 — a name→op resolution at tool init, then a per-op bitmask at runtime. Zero overhead for non-matching ops because the bit test short-circuits before any callback or ring write.
+
+#### Phase 2 — Argument-type filter (medium cost, evaluated only for ops that passed Phase 1)
+
+The consumer can restrict tracing to ops whose signature contains a specific argument type. Example: "trace only HIP functions that take a `hipStream_t` argument." The shim's code generator knows every op's argument types from the SDK schema (same source of truth as §7B). At filter-install time, the consumer specifies type names; the shim resolves them to the set of ops whose signatures include that type and sets the Phase 1 bitmap accordingly.
+
+```c
+/* Restrict the traced set to ops whose signature includes arg_type_name.
+ * Intersects with the current name filter (if set). */
+int rocp_shim_set_type_filter(rocp_shim_handle_t h,
+                              uint32_t domain,
+                              const char* arg_type_name);
+/* Example: rocp_shim_set_type_filter(h, HIP_API, "hipStream_t")
+ *   → enables only ops that have a hipStream_t parameter */
+```
+
+This filter is **resolved entirely at install time** — it turns into the same per-op bitmap as Phase 1. Zero additional hot-path cost beyond the bitmap test.
+
+#### Phase 3 — Argument-value filter (highest cost, evaluated only for ops that passed Phases 1+2)
+
+The consumer can filter on **runtime argument values**. Example: "trace only `hipMemcpyAsync` where `sizeBytes > 1048576`" or "trace only `hipLaunchKernel` where `stream == 0x7f...`". This requires inspecting the actual arguments at call time — the only phase that adds per-call cost beyond the bitmap test.
+
+The consumer installs a **predicate function** that runs in the target's address space, receives the typed args struct (same layout as §7B.1), and returns accept/reject:
+
+```c
+/* Predicate signature — called in the target's hot path.
+ * Must be fast, must not allocate, must not call wrapped APIs
+ * (re-entrancy). Return 1 to accept (emit record), 0 to reject. */
+typedef int (*rocp_shim_value_predicate_t)(
+    uint32_t domain,
+    uint32_t op,
+    const void* args,    /* typed args struct per §7B.1 */
+    void* predicate_ctx);
+
+int rocp_shim_set_value_filter(rocp_shim_handle_t h,
+                               uint32_t domain, uint32_t op,
+                               rocp_shim_value_predicate_t pred,
+                               void* predicate_ctx);
+```
+
+Example consumer-side predicate:
+
+```c
+static int only_large_memcpy(uint32_t domain, uint32_t op,
+                             const void* args, void* ctx)
+{
+    (void)domain; (void)op; (void)ctx;
+    const rocprofiler_hip_api_args_hipMemcpyAsync_t* a = args;
+    return a->sizeBytes > 1048576;   /* 1 MB threshold */
+}
+
+rocp_shim_set_value_filter(h, HIP_API, OP_hipMemcpyAsync,
+                           only_large_memcpy, NULL);
+```
+
+Hot-path cost of Phase 3: one indirect call to the predicate function per traced call that passed Phases 1+2. The predicate runs in the target's context (same thread, same address space) and must be async-signal-safe-ish (no allocation, no re-entrancy into wrapped APIs). Expected cost: 2–10 ns depending on predicate complexity — well below the ~50 ns cost of a full record write.
+
+If no value predicate is set for an op, Phase 3 is skipped (the slot is NULL and the branch is not taken).
+
+#### Filter evaluation order in the hot path
+
+```c
+static void shim_wrap_<domain>_<op>(args...)
+{
+    /* Phase 1: name/type bitmap (resolved at install time). */
+    if (!filter_bitmap_test(g_ctrl->name_filter[DOMAIN], OP))
+        goto fast_path;
+
+    /* profiler_functor load — is anyone listening at all? */
+    void* prof = atomic_load_acquire(&profiler_functor[OP]);
+    if (prof == NULL)
+        goto fast_path;
+
+    /* Phase 3: value predicate (if installed for this op). */
+    void* pred = atomic_load_acquire(&value_predicate[OP]);
+    if (pred && !((predicate_t)pred)(DOMAIN, OP, &packed_args, pred_ctx))
+        goto fast_path;
+
+    /* All three phases passed — push correlation, call callback, emit record. */
+    ...
+
+fast_path:
+    orig(args);
+}
+```
+
+The bitmap test (Phase 1+2) is **before** the `profiler_functor` load, so ops filtered out by name or type never even check whether a consumer is attached. This is the cheapest possible rejection path — one bit test + branch, same cache line as the functor slot.
+
+#### Summary
+
+| Phase | What it filters | When resolved | Hot-path cost | Consumer API |
+|---|---|---|---|---|
+| 1 — Name | Function name (glob/regex) | Install time → bitmap | ~0.3 ns (bit test) | `rocp_shim_set_name_filter` |
+| 2 — Arg type | Ops whose signature includes a given type | Install time → same bitmap | 0 ns (folded into Phase 1 bitmap) | `rocp_shim_set_type_filter` |
+| 3 — Arg value | Runtime argument values (predicate function) | Each call | ~2–10 ns (indirect call) | `rocp_shim_set_value_filter` |
+
+All three phases are optional and composable. A consumer that only wants name filtering pays ~0.3 ns per filtered-out call. A consumer that also wants value filtering pays an additional ~2–10 ns per call that passed the name filter. Calls that match all three phases proceed to the full callback + record-write path.
+
 ## 14. Concurrency model
 
 ### 14.1 Single-controller limit
@@ -1067,7 +1195,7 @@ Minimum validation suite:
 ## 16. Open questions / follow-up
 
 - ~~**Multi-threaded consumer-side callback invocation**~~ — **resolved**: see §13.4 below. The consumer provides a thread pool at attach time; `rocp_shim_poll` dispatches records to that pool. The shim never creates its own profiling threads — the consumer owns all threads and controls their affinity, priority, and lifetime.
-- **Per-op filters**: today `profiler_functor[Op]` is all-or-nothing per op. Real users want filters like "trace only HIP launches whose stream == X". Add a per-op filter in the consumer callback (the trivial answer), or extend the protocol with a filter bitmap per op?
+- ~~**Per-op filters**~~ — **resolved**: see §13.5 below. Three-phase filter chain: (1) function-name matching, (2) argument-type matching, (3) argument-value matching. All phases run in the target's hot path before emitting a record; filtered calls never touch the ring.
 - ~~**Correlation IDs across shim and in-process SDK**~~ — **resolved**: see §7A. Shim maintains a thread-local internal/external/ancestor stack with identical semantics to the SDK's; when the SDK is loaded, the shim forwards external pushes into the SDK's stack so downstream GPU events carry the same external ID. Cross-library correlation (HIP calling HSA etc.) works via the `ancestor` field.
 - ~~**Argument serialization model**~~ — **resolved**: see §7B. Inline fixed-size typed payload in each record (scalars + handles) + variable-size auxiliary ring keyed by `correlation_internal_id` for strings and deep-copied data. Same two-tier structure the SDK's buffer tracer uses today; schema classification reused from rocprofiler-sdk's existing arg metadata.
 - **Record schema evolution**: the inline typed payload is sourced from SDK headers. Target and consumer link independently; SDK minor versions may add fields (struct sizes are not ABI-stable across ROCm minor releases). **V1 policy**: embed `args_schema_version` (an integer derived from the SDK build-time struct hash) in every record. Consumer checks `args_schema_version` against its own compiled-in value; on mismatch, falls back to inline-only decoding (scalars at fixed offsets are stable; any field beyond the consumer's known size is ignored). This is a best-effort heuristic, not a hard ABI freeze — a full freeze (shim-owned wire structs with translation at the consumer helper) is tracked as a v2 improvement.
