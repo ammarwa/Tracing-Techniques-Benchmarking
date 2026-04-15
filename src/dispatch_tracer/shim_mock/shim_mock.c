@@ -44,6 +44,15 @@
 #include "mock_libB.h"
 #include "shim_protocol.h"
 #include "shim_ipc.h"
+#include "shim_arg_info.h"
+
+/* Arg descriptors defined in shim_arg_descriptors.c */
+extern const shim_op_arg_descriptor_t g_mylib_arg_descs[];
+extern const shim_op_arg_descriptor_t g_liba_arg_descs[];
+extern const shim_op_arg_descriptor_t g_libb_arg_descs[];
+
+/* Forward declaration — get_arg_desc is defined after g_ipc. */
+static const shim_op_arg_descriptor_t* get_arg_desc(uint32_t slot_idx);
 
 /* ------------------------------------------------------------------ */
 /* Per-op state                                                        */
@@ -211,9 +220,21 @@ static void shim_handle_event(uint32_t op, uint32_t mode,
             ((orig_op1_t)next)(a->us);
         }
 
-        /* EXIT record — args captured AFTER orig() returns, so output
-         * params (out_queue, prop, etc.) have their final values. */
-        shim_emit_record(op, SHIM_PHASE_EXIT, &corr, packed_args, arg_bytes);
+        /* EXIT record — use arg descriptors to serialize each arg as a
+         * (name, type, value_str) triple, matching rocprofiler-sdk's
+         * iterate_callback_tracing_kind_operation_args pattern.
+         * Output params have their final values because orig() ran. */
+        uint8_t serialized_args[SHIM_RECORD_ARG_BYTES];
+        uint32_t serialized_len = 0;
+        const shim_op_arg_descriptor_t* desc = get_arg_desc(op);
+        if (desc) {
+            serialized_len = shim_serialize_args(desc, packed_args,
+                                                 serialized_args,
+                                                 sizeof(serialized_args));
+        }
+        shim_emit_record(op, SHIM_PHASE_EXIT, &corr,
+                         serialized_len > 0 ? serialized_args : packed_args,
+                         serialized_len > 0 ? serialized_len : arg_bytes);
 
         shim_pop_correlation();
     }
@@ -732,4 +753,23 @@ static void shim_register_ctor(void)
     }
 
     mock_register_set_api_table_fn = &mock_sdk_set_api_table;
+}
+
+/* get_arg_desc — defined here because it needs g_ipc (declared above). */
+static const shim_op_arg_descriptor_t* get_arg_desc(uint32_t slot_idx)
+{
+    if (!g_ipc_ok || !g_ipc.ctrl) return NULL;
+    for (uint32_t i = 0; i < g_ipc.ctrl->n_registrations; i++) {
+        const shim_table_registration_t* t = &g_ipc.ctrl->registrations[i];
+        if (slot_idx >= t->slot_base && slot_idx < t->slot_base + t->n_ops) {
+            uint32_t local_op = slot_idx - t->slot_base;
+            if (strcmp(t->name, "mylib") == 0 && local_op < 2)
+                return &g_mylib_arg_descs[local_op];
+            if (strcmp(t->name, "libA_hsa") == 0 && local_op < 4)
+                return &g_liba_arg_descs[local_op];
+            if (strcmp(t->name, "libB_hip") == 0 && local_op < 4)
+                return &g_libb_arg_descs[local_op];
+        }
+    }
+    return NULL;
 }

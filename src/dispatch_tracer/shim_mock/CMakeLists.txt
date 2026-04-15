@@ -8,6 +8,7 @@ message("${Green}[dispatch_tracer/shim_mock] Building shim-design validation${Co
 add_library(shim_mock SHARED
     shim_mock.c
     shim_ipc.c
+    shim_arg_descriptors.c
 )
 target_include_directories(shim_mock
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
