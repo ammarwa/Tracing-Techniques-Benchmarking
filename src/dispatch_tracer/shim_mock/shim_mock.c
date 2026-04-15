@@ -307,6 +307,30 @@ int mock_sdk_set_api_table(const char* name,
     if (strcmp(name, "mylib") == 0) {
         shim_install_mylib_table(api_tables, num_tables);
     }
+    /* For libA_hsa and libB_hip, we register their tables in the memfd
+     * header (for the consumer to see) but do NOT install typed wrappers
+     * (we'd need per-op code-generated wrappers for each function
+     * signature, which the real shim does but the mock doesn't). Instead
+     * the tables stay unwrapped and calls go through directly. The
+     * correlation chain still works because libB's real implementation
+     * calls libA's public entry points, which go through the dispatch
+     * table — if mylib's table IS wrapped, the cross-library chain fires.
+     * For the multi-lib test, both libA and libB are registered for
+     * metadata visibility but only mylib gets actual wrappers. */
+    if (g_ipc_ok && g_ipc.ctrl) {
+        uint32_t idx = g_ipc.ctrl->n_registrations;
+        if (idx < SHIM_MAX_REGISTRATIONS) {
+            shim_table_registration_t* reg = &g_ipc.ctrl->registrations[idx];
+            snprintf(reg->name, SHIM_TABLE_NAME_MAX, "%s", name);
+            reg->lib_instance  = 0;
+            reg->major_version = version;
+            reg->minor_version = 0;
+            reg->slot_base     = g_ipc.ctrl->total_ops;
+            reg->n_ops         = (uint32_t)num_tables;
+            g_ipc.ctrl->n_registrations = idx + 1;
+            g_ipc.ctrl->total_ops += (uint32_t)num_tables;
+        }
+    }
     return 0;
 }
 

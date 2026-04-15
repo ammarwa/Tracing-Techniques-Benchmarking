@@ -38,3 +38,40 @@ set_target_properties(shim_consumer_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 message("${Green}  ✓ shim_consumer_test${ColorReset}")
+
+# ----- mock_libA.so (HSA/ROCR analogue) ----------------------------------
+add_library(mock_libA SHARED mock_libA.c)
+target_include_directories(mock_libA
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_options(mock_libA PRIVATE -O2 -Wall -Wextra -fPIC)
+target_link_libraries(mock_libA PRIVATE mock_register)
+set_target_properties(mock_libA PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+# ----- mock_libB.so (HIP analogue, calls libA) ---------------------------
+add_library(mock_libB SHARED mock_libB.c)
+target_include_directories(mock_libB
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_options(mock_libB PRIVATE -O2 -Wall -Wextra -fPIC)
+target_link_libraries(mock_libB PRIVATE mock_register mock_libA)
+set_target_properties(mock_libB PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+# ----- shim_multilib_test (cross-library correlation test) ----------------
+add_executable(shim_multilib_test shim_multilib_test.c)
+target_include_directories(shim_multilib_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_options(shim_multilib_test PRIVATE -O2 -Wall -Wextra)
+target_link_libraries(shim_multilib_test PRIVATE mock_libB mock_libA mock_register)
+set_target_properties(shim_multilib_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+message("${Green}  ✓ mock_libA + mock_libB + shim_multilib_test${ColorReset}")
