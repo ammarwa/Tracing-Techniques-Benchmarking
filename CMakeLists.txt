@@ -124,8 +124,9 @@ endif()
 if(BUILD_EBPF)
     message("${Green}[4/4] Building eBPF Tracer...${ColorReset}")
 
-    # Check for required tools
-    find_program(CLANG clang)
+    # Check for required tools. Prefer clang-14 (has BPF backend) over
+    # the system clang which may be ROCm's clang (no BPF target).
+    find_program(CLANG NAMES clang-14 clang-15 clang-16 clang-17 clang-18 clang)
     find_program(BPFTOOL bpftool)
 
     # Use pkg-config for libbpf to get proper paths (OPTIMIZED for libbpf 1.7.0)
