@@ -31,9 +31,7 @@ typedef struct { liba_agent_t agent; uint32_t size; liba_queue_t* out; } packed_
 static void fmt_liba_op0_agent(const void* p, char* d, uint32_t s) { snprintf(d,s,"0x%" PRIx64, ((packed_liba_op0_t*)p)->agent.handle); }
 static void fmt_liba_op0_size(const void* p, char* d, uint32_t s) { snprintf(d,s,"%u", ((packed_liba_op0_t*)p)->size); }
 static void fmt_liba_op0_out(const void* p, char* d, uint32_t s) {
-    liba_queue_t* q = ((packed_liba_op0_t*)p)->out;
-    if (q) snprintf(d,s,"&{handle=0x%" PRIx64 "}", q->handle);
-    else   snprintf(d,s,"NULL");
+    snprintf(d,s,"%p", (void*)((packed_liba_op0_t*)p)->out);
 }
 
 /* ---- libA op1: memory_allocate(region, size, **out_ptr) ---- */
@@ -45,21 +43,14 @@ static void fmt_liba_op1_region(const void* p, char* d, uint32_t s) {
 }
 static void fmt_liba_op1_size(const void* p, char* d, uint32_t s) { snprintf(d,s,"%" PRIu64, ((packed_liba_op1_t*)p)->size); }
 static void fmt_liba_op1_out(const void* p, char* d, uint32_t s) {
-    void** pp = ((packed_liba_op1_t*)p)->out_ptr;
-    if (pp) snprintf(d,s,"&(%p)", *pp);
-    else    snprintf(d,s,"NULL");
+    snprintf(d,s,"%p", (void*)((packed_liba_op1_t*)p)->out_ptr);
 }
 
 /* ---- libA op2: kernel_dispatch(queue, *packet, completion) ---- */
 typedef struct { liba_queue_t queue; const liba_dispatch_packet_t* pkt; liba_signal_t completion; } packed_liba_op2_t;
 static void fmt_liba_op2_queue(const void* p, char* d, uint32_t s) { snprintf(d,s,"0x%" PRIx64, ((packed_liba_op2_t*)p)->queue.handle); }
 static void fmt_liba_op2_pkt(const void* p, char* d, uint32_t s) {
-    const liba_dispatch_packet_t* pk = ((packed_liba_op2_t*)p)->pkt;
-    if (pk) snprintf(d,s,"{grid=%ux%ux%u,wg=%ux%ux%u,kernel=0x%" PRIx64 "}",
-                     pk->grid_size_x, pk->grid_size_y, pk->grid_size_z,
-                     pk->workgroup_size_x, pk->workgroup_size_y, pk->workgroup_size_z,
-                     pk->kernel_object);
-    else    snprintf(d,s,"NULL");
+    snprintf(d,s,"%p", (void*)((packed_liba_op2_t*)p)->pkt);
 }
 static void fmt_liba_op2_comp(const void* p, char* d, uint32_t s) { snprintf(d,s,"0x%" PRIx64, ((packed_liba_op2_t*)p)->completion.handle); }
 
@@ -71,11 +62,11 @@ static void fmt_liba_op3_timeout(const void* p, char* d, uint32_t s) { snprintf(
 /* ---- libB op0: launch_kernel(*config) ---- */
 typedef struct { const libb_launch_config_t* config; } packed_libb_op0_t;
 static void fmt_libb_op0_config(const void* p, char* d, uint32_t s) {
-    const libb_launch_config_t* c = ((packed_libb_op0_t*)p)->config;
-    if (c) snprintf(d,s,"{func=%p,grid={%u,%u,%u},block={%u,%u,%u},shmem=%" PRIu64 ",stream=0x%" PRIx64 "}",
-                    c->func, c->grid.x, c->grid.y, c->grid.z,
-                    c->block.x, c->block.y, c->block.z, c->shared_mem, c->stream.handle);
-    else   snprintf(d,s,"NULL");
+    /* config is a pointer into the target's stack. OOP consumer cannot
+     * dereference it. Print pointer value only. Deep expansion requires
+     * the shim to inline the struct into the record at EXIT time (§7B.2
+     * variable-size ring). For the mock, pointer value is sufficient. */
+    snprintf(d,s,"%p", (void*)((packed_libb_op0_t*)p)->config);
 }
 
 /* ---- libB op1: memcpy_async(dst, src, size, stream) ---- */
@@ -92,11 +83,10 @@ static void fmt_libb_op2_stream(const void* p, char* d, uint32_t s) { snprintf(d
 /* ---- libB op3: get_device_properties(*prop, device_id) ---- */
 typedef struct { libb_device_prop_t* prop; int device_id; } packed_libb_op3_t;
 static void fmt_libb_op3_prop(const void* p, char* d, uint32_t s) {
-    const libb_device_prop_t* pr = ((packed_libb_op3_t*)p)->prop;
-    if (pr) snprintf(d,s,"{name=\"%s\",mem=%" PRIu64 ",cu=%u,warp=%u,v%u.%u}",
-                     pr->name, pr->total_global_mem, pr->multiprocessor_count,
-                     pr->warp_size, pr->major, pr->minor);
-    else    snprintf(d,s,"NULL");
+    /* prop is a pointer into the target's stack — OOP consumer cannot deref.
+     * Deep expansion (name, mem, cu, warp, version) requires the shim to
+     * inline the struct into the record at EXIT time (§7B.2 var ring). */
+    snprintf(d,s,"%p", (void*)((packed_libb_op3_t*)p)->prop);
 }
 static void fmt_libb_op3_devid(const void* p, char* d, uint32_t s) { snprintf(d,s,"%d", ((packed_libb_op3_t*)p)->device_id); }
 

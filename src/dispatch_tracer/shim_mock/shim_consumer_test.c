@@ -25,25 +25,56 @@ static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 /* Global ctrl pointer for op_info name lookup inside the callback. */
 static shim_ctrl_t* g_con_ctrl = NULL;
 
-/* The shim serializes args as an array of shim_arg_entry_t at EXIT time,
- * matching rocprofiler-sdk's iterate_callback_tracing_kind_operation_args
- * pattern. Each entry has: name (param name), type (C type string),
- * value (human-readable string). The consumer does NOT need to know the
- * struct layout — it just reads the string triples. */
+/* The record carries compact binary packed-args. The consumer decodes them
+ * using the shared arg descriptors (shim_arg_descriptors.c), matching
+ * rocprofiler-sdk's iterate_callback_tracing_kind_operation_args pattern:
+ * string conversion happens HERE in the consumer, not in the target. */
 #include "shim_arg_info.h"
+
+/* Arg descriptors — same tables linked by both shim and consumer. */
+extern const shim_op_arg_descriptor_t g_mylib_arg_descs[];
+extern const shim_op_arg_descriptor_t g_liba_arg_descs[];
+extern const shim_op_arg_descriptor_t g_libb_arg_descs[];
+
+static const shim_op_arg_descriptor_t* consumer_get_arg_desc(uint32_t slot_idx)
+{
+    if (!g_con_ctrl) return NULL;
+    for (uint32_t i = 0; i < g_con_ctrl->n_registrations; i++) {
+        const shim_table_registration_t* t = &g_con_ctrl->registrations[i];
+        if (slot_idx >= t->slot_base && slot_idx < t->slot_base + t->n_ops) {
+            uint32_t local_op = slot_idx - t->slot_base;
+            if (strcmp(t->name, "mylib") == 0 && local_op < 2)
+                return &g_mylib_arg_descs[local_op];
+            if (strcmp(t->name, "libA_hsa") == 0 && local_op < 4)
+                return &g_liba_arg_descs[local_op];
+            if (strcmp(t->name, "libB_hip") == 0 && local_op < 4)
+                return &g_libb_arg_descs[local_op];
+        }
+    }
+    return NULL;
+}
 
 static void print_args(const shim_record_t* rec)
 {
+    /* Only decode args on EXIT records (output params have final values). */
     if (rec->phase != SHIM_PHASE_EXIT || rec->arg_bytes == 0) return;
-    if (rec->arg_bytes < sizeof(shim_arg_entry_t)) return;
 
-    uint32_t n_entries = rec->arg_bytes / sizeof(shim_arg_entry_t);
-    const shim_arg_entry_t* entries = (const shim_arg_entry_t*)rec->args;
+    const shim_op_arg_descriptor_t* desc = consumer_get_arg_desc(rec->op);
+    if (!desc) return;
 
+    /* iterate_args: walk the descriptor, call each formatter on the raw
+     * packed-args binary from the record. String conversion happens HERE
+     * in the consumer process, not in the target — matching the SDK. */
     printf("  (");
-    for (uint32_t i = 0; i < n_entries; i++) {
+    for (uint32_t i = 0; i < desc->n_args; i++) {
         if (i > 0) printf(", ");
-        printf("%s=%s", entries[i].name, entries[i].value);
+        char val[96];
+        if (desc->args[i].format) {
+            desc->args[i].format(rec->args, val, sizeof(val));
+        } else {
+            snprintf(val, sizeof(val), "?");
+        }
+        printf("%s=%s", desc->args[i].name, val);
     }
     printf(")");
 }

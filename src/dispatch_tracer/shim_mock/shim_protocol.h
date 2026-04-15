@@ -26,9 +26,10 @@
 /* Record format (§7A.5 + §7B.1)                                       */
 /* ------------------------------------------------------------------ */
 
-#define SHIM_RECORD_ARG_BYTES 952  /* pad record to 1024 bytes total (power of two)
-                                    * for correct ring-buffer & mask arithmetic.
-                                    * Fits 7 shim_arg_entry_t (128 bytes each). */
+#define SHIM_RECORD_ARG_BYTES 184  /* compact binary packed-args struct.
+                                    * String conversion happens consumer-side
+                                    * via iterate_args(), not in the record.
+                                    * Total record = 256 bytes (power of two). */
 #define SHIM_OP_NAME_MAX      64
 
 /* Per-op metadata (name + arg count). Stored in the memfd header

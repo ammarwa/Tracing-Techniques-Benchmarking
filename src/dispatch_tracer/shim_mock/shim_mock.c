@@ -220,21 +220,11 @@ static void shim_handle_event(uint32_t op, uint32_t mode,
             ((orig_op1_t)next)(a->us);
         }
 
-        /* EXIT record — use arg descriptors to serialize each arg as a
-         * (name, type, value_str) triple, matching rocprofiler-sdk's
-         * iterate_callback_tracing_kind_operation_args pattern.
-         * Output params have their final values because orig() ran. */
-        uint8_t serialized_args[SHIM_RECORD_ARG_BYTES];
-        uint32_t serialized_len = 0;
-        const shim_op_arg_descriptor_t* desc = get_arg_desc(op);
-        if (desc) {
-            serialized_len = shim_serialize_args(desc, packed_args,
-                                                 serialized_args,
-                                                 sizeof(serialized_args));
-        }
-        shim_emit_record(op, SHIM_PHASE_EXIT, &corr,
-                         serialized_len > 0 ? serialized_args : packed_args,
-                         serialized_len > 0 ? serialized_len : arg_bytes);
+        /* EXIT record — carries the RAW packed-args struct (compact binary).
+         * String conversion happens consumer-side via iterate_args(),
+         * matching rocprofiler-sdk's pattern: the record is compact, the
+         * tool decodes on demand using the shared .def descriptors. */
+        shim_emit_record(op, SHIM_PHASE_EXIT, &corr, packed_args, arg_bytes);
 
         shim_pop_correlation();
     }
