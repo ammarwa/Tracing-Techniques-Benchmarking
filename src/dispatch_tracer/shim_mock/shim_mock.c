@@ -481,19 +481,30 @@ static void shim_install_mylib_table(void** slots, uint64_t num_entries)
 
 __attribute__((visibility("default")))
 int mock_sdk_set_api_table(const char* name,
-                           uint32_t    version,
-                           void**      api_tables,
+                           uint64_t    lib_version,
+                           uint64_t    lib_instance,
+                           void**      tables,
                            uint64_t    num_tables)
 {
-    (void)version;
-    if (!name || !api_tables || num_tables == 0) return -1;
+    (void)lib_version;
+    (void)lib_instance;
+    if (!name || !tables || num_tables == 0) return -1;
+
+    /* Dereference tables[0] to get the table struct.
+     * Layout: { size_t size; void* fn_ptr[]; }
+     * Extract the function-pointer slots that follow the size field. */
+    void*    table_struct  = tables[0];
+    size_t   table_size    = *(size_t*)table_struct;
+    void**   fn_slots      = (void**)((char*)table_struct + sizeof(size_t));
+    uint64_t num_fn_entries = (table_size - sizeof(size_t)) / sizeof(void*);
+
     if (strcmp(name, "mylib") == 0) {
-        shim_install_mylib_table(api_tables, num_tables);
+        shim_install_mylib_table(fn_slots, num_fn_entries);
     } else if (strcmp(name, "libA_hsa") == 0) {
-        shim_install_generic_table(api_tables, num_tables, SHIM_LIBA_BASE,
+        shim_install_generic_table(fn_slots, num_fn_entries, SHIM_LIBA_BASE,
                                    g_wrapper_table_liba, 4);
     } else if (strcmp(name, "libB_hip") == 0) {
-        shim_install_generic_table(api_tables, num_tables, SHIM_LIBB_BASE,
+        shim_install_generic_table(fn_slots, num_fn_entries, SHIM_LIBB_BASE,
                                    g_wrapper_table_libb, 4);
     }
 
@@ -504,14 +515,14 @@ int mock_sdk_set_api_table(const char* name,
         if (idx < SHIM_MAX_REGISTRATIONS) {
             shim_table_registration_t* reg = &g_ipc.ctrl->registrations[idx];
             snprintf(reg->name, SHIM_TABLE_NAME_MAX, "%s", name);
-            reg->lib_instance  = 0;
-            reg->major_version = version;
-            reg->minor_version = 0;
+            reg->lib_instance  = (uint32_t)lib_instance;
+            reg->major_version = (uint32_t)(lib_version / 10000);
+            reg->minor_version = (uint32_t)((lib_version / 100) % 100);
             uint32_t base = g_ipc.ctrl->total_ops;
             reg->slot_base = base;
-            reg->n_ops     = (uint32_t)num_tables;
+            reg->n_ops     = (uint32_t)num_fn_entries;
             g_ipc.ctrl->n_registrations = idx + 1;
-            g_ipc.ctrl->total_ops += (uint32_t)num_tables;
+            g_ipc.ctrl->total_ops += (uint32_t)num_fn_entries;
 
             /* Register op names for this table. */
             static const char* liba_names[] = {
@@ -526,14 +537,14 @@ int mock_sdk_set_api_table(const char* name,
             if (strcmp(name, "libA_hsa") == 0) op_names = liba_names;
             else if (strcmp(name, "libB_hip") == 0) op_names = libb_names;
             if (op_names) {
-                for (uint32_t i = 0; i < num_tables && i < 4; i++) {
+                for (uint32_t i = 0; i < num_fn_entries && i < 4; i++) {
                     snprintf(g_ipc.ctrl->op_info[base + i].name,
                              SHIM_OP_NAME_MAX, "%s", op_names[i]);
                 }
             }
 
             /* Enable all new ops in the name-filter bitmap. */
-            for (uint32_t i = 0; i < num_tables; i++)
+            for (uint32_t i = 0; i < num_fn_entries; i++)
                 shim_filter_set(g_ipc.ctrl->name_filter, base + i);
         }
     }

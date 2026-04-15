@@ -422,17 +422,38 @@ static void update_table_mylib(dispatch_table_t* t)
 
 /* ------------------------------------------------------------------ */
 /* mock_sdk_set_api_table — the entry point register-lib calls.        */
+/*                                                                     */
+/* Matches mock_register_set_api_table_fn_t:                           */
+/*   int (*)(const char* name, uint64_t lib_version,                   */
+/*           uint64_t lib_instance, void** tables, uint64_t num_tables)*/
+/*                                                                     */
+/* tables[i] is a POINTER TO a table struct whose layout is:           */
+/*   struct { size_t size; fn_ptr_t fn0; fn_ptr_t fn1; ... };          */
+/* We dereference tables[0], read the size field, then compute the     */
+/* function-pointer slots that follow it.                              */
 /* ------------------------------------------------------------------ */
 
-int mock_sdk_set_api_table(const char* name,
-                           uint32_t version,
-                           void** api_tables,
-                           uint64_t num_tables)
+int mock_sdk_set_api_table(const char*  name,
+                           uint64_t     lib_version,
+                           uint64_t     lib_instance,
+                           void**       tables,
+                           uint64_t     num_tables)
 {
-    if (!name || !api_tables || num_tables == 0) return -1;
-    /* For our model each registration provides one table-struct whose
-     * address is at api_tables[0..num_tables-1] — we take index 0 for
-     * mylib (matching mylib_dispatch's registration). */
+    if (!name || !tables || num_tables == 0) return -1;
+
+    /* Dereference tables[0] to reach the actual table struct.
+     * The struct layout is: { size_t size; void (*fn0)(...); ... }
+     * We treat the function pointers as a void*[] starting right
+     * after the size field. */
+    void* table_struct = tables[0];
+    if (!table_struct) return -1;
+
+    size_t tbl_size = *(size_t*)table_struct;
+    if (tbl_size <= sizeof(size_t)) return -1;  /* no fn slots */
+
+    void** fn_slots      = (void**)((char*)table_struct + sizeof(size_t));
+    uint64_t num_fn_entries = (tbl_size - sizeof(size_t)) / sizeof(void*);
+
     pthread_mutex_lock(&g_tables_lock);
 
     int slot = find_table_by_name_locked(name);
@@ -447,11 +468,12 @@ int mock_sdk_set_api_table(const char* name,
     }
 
     dispatch_table_t* t = &g_tables[slot];
-    t->version       = version;
-    /* api_tables is the address of the caller's "void** slot array"
-     * (i.e. the runtime's api_table cast to void**). */
-    t->runtime_table = api_tables;
-    t->num_entries   = num_tables;
+    t->version       = (uint32_t)lib_version;
+    /* fn_slots points into the table struct right after the size field.
+     * This is the mutable array of function pointers the runtime owns;
+     * copy_table saves originals from here, update_table rewrites here. */
+    t->runtime_table = fn_slots;
+    t->num_entries   = num_fn_entries;
 
     if (strcmp(name, "mylib") == 0) {
         t->kind      = ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API;

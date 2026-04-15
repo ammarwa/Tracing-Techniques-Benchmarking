@@ -102,20 +102,26 @@ rocprofiler_status_t rocprofiler_stop_context(rocprofiler_context_id_t ctx);
 
 /* ---------- Dispatch-table mechanism ----------
  *
- * Entry point invoked by mock_register once the SDK is loaded. Does what
- * rocprofiler-sdk's rocprofiler_set_api_table does:
+ * Entry point invoked by mock_register once the SDK is loaded. Matches the
+ * mock_register_set_api_table_fn_t callback signature:
+ *   (name, lib_version, lib_instance, tables, num_tables)
+ *
+ * tables[i] is a POINTER TO a table struct whose first field is
+ * `size_t size` (total byte size of the struct), followed by function
+ * pointers. The implementation dereferences tables[0], reads the size
+ * field, and computes the number of function-pointer slots as:
+ *   num_fn_entries = (size - sizeof(size_t)) / sizeof(void*)
+ *
+ * Does what rocprofiler-sdk's rocprofiler_set_api_table does:
  *   - copy_table(): stash originals
  *   - update_table(): replace pointers with wrapper functors for ops that
  *     any registered context cares about (should_wrap_functor).
- *
- * `table_entries` is the count of void* slots in the table the runtime
- * published. For our mock we treat tables as plain arrays of function
- * pointers; the wrapper per (domain, op_index) knows how to dispatch.
  */
-int mock_sdk_set_api_table(const char* name,
-                           uint32_t version,
-                           void** api_tables,
-                           uint64_t num_tables);
+int mock_sdk_set_api_table(const char*  name,
+                           uint64_t     lib_version,
+                           uint64_t     lib_instance,
+                           void**       tables,
+                           uint64_t     num_tables);
 
 #ifdef __cplusplus
 }

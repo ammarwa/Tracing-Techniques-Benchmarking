@@ -102,9 +102,10 @@ static libb_error_t real_get_device_properties(libb_device_prop_t* prop,
 
 /* Mutable dispatch table. */
 static libb_api_table_t g_api_table = {
-    .launch_kernel       = &real_launch_kernel,
-    .memcpy_async        = &real_memcpy_async,
-    .stream_synchronize  = &real_stream_synchronize,
+    .size                  = sizeof(libb_api_table_t),
+    .launch_kernel         = &real_launch_kernel,
+    .memcpy_async          = &real_memcpy_async,
+    .stream_synchronize    = &real_stream_synchronize,
     .get_device_properties = &real_get_device_properties,
 };
 
@@ -124,9 +125,9 @@ libb_error_t libb_get_device_properties(libb_device_prop_t* prop, int device_id)
 
 void libb_register(void)
 {
-    void** slots = (void**)&g_api_table;
-    uint64_t n = sizeof(libb_api_table_t) / sizeof(void*);
-    mock_register_library_api_table("libB_hip", 1, slots, n);
+    void* tables[] = { &g_api_table };
+    mock_register_id_t id;
+    mock_register_library_api_table("libB_hip", 20300, /* v2.3.0 */ tables, 1, &id);
 }
 
 __attribute__((constructor))

@@ -42,6 +42,7 @@ static liba_status_t real_signal_wait(liba_signal_t signal, uint64_t timeout_ns)
 
 /* Mutable dispatch table — shim will rewrite these entries. */
 static liba_api_table_t g_api_table = {
+    .size             = sizeof(liba_api_table_t),
     .queue_create     = &real_queue_create,
     .memory_allocate  = &real_memory_allocate,
     .kernel_dispatch  = &real_kernel_dispatch,
@@ -67,9 +68,9 @@ liba_status_t liba_signal_wait(liba_signal_t signal, uint64_t timeout_ns)
 
 void liba_register(void)
 {
-    void** slots = (void**)&g_api_table;
-    uint64_t n = sizeof(liba_api_table_t) / sizeof(void*);
-    mock_register_library_api_table("libA_hsa", 1, slots, n);
+    void* tables[] = { &g_api_table };
+    mock_register_id_t id;
+    mock_register_library_api_table("libA_hsa", 10100, /* v1.1.0 */ tables, 1, &id);
 }
 
 __attribute__((constructor))

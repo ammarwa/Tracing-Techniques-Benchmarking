@@ -13,6 +13,7 @@
 #ifndef MOCK_LIBB_H
 #define MOCK_LIBB_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "mock_libA.h"  /* libB depends on libA */
 
@@ -50,6 +51,7 @@ typedef enum {
 
 /* --- API function table --- */
 typedef struct {
+    size_t size;
     libb_error_t (*launch_kernel)(const libb_launch_config_t* config);
     libb_error_t (*memcpy_async)(void* dst, const void* src,
                                   uint64_t size_bytes,

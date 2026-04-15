@@ -9,15 +9,17 @@
 #ifndef MYLIB_DISPATCH_H
 #define MYLIB_DISPATCH_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define MYLIB_API_TABLE_VERSION 1u
+#define MYLIB_API_TABLE_VERSION 10000u  /* v1.0.0: 10000*1 + 100*0 + 0 */
 
 typedef struct {
+    size_t size;
     void (*my_traced_function)(int arg1, uint64_t arg2, double arg3, void* arg4);
     void (*set_simulated_work_duration)(unsigned int sleep_us);
 } mylib_api_table_t;

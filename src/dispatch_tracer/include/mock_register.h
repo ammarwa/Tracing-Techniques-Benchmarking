@@ -1,17 +1,30 @@
 /*
- * mock_register.h - Public API mimicking rocprofiler-register.
+ * mock_register.h — Public API mimicking rocprofiler-register.
  *
- * This mock reproduces the two relevant behaviors of rocprofiler-register:
+ * Faithfully reproduces the real rocprofiler_register_library_api_table()
+ * signature and semantics from rocprofiler-register.h:
  *
- *  1. Runtimes (HIP/HSA/... — here, our mylib_dispatch) call
- *     mock_register_library_api_table() during their constructor to publish
- *     a mutable table of function pointers.
+ *  - api_tables is void** — an array of POINTERS TO table structs
+ *    (not a flat function-pointer array). api_tables[i] points to a
+ *    struct whose first field is size_t size, followed by function
+ *    pointers.
  *
- *  2. On each registration, mock_register scans for the symbol
- *     "rocprofiler_configure" via dlsym(RTLD_DEFAULT, ...). If found it
- *     dlopens libmock_sdk.so (if not already loaded) and hands off all
- *     stored tables to the SDK. If not found, it does nothing — the
- *     runtime's table stays untouched and the hot path is zero overhead.
+ *  - api_table_length is the number of table structs being passed
+ *    (typically 1 per call; HIP calls 3 times: runtime, compiler, tools).
+ *
+ *  - lib_version is encoded as 10000*major + 100*minor + patch, matching
+ *    the real HIP_ROCP_REG_VERSION / HSA version encoding.
+ *
+ *  - register_id is an output giving a unique library-instance identifier,
+ *    matching rocprofiler_register_library_indentifier_t.
+ *
+ *  On each registration, mock_register conditionally loads either:
+ *  - libshim_mock.so (via MOCK_REGISTER_LIB env var — unconditional shim)
+ *  - libmock_sdk.so (if rocprofiler_configure is found via dlsym)
+ *
+ *  The loaded library's set_api_table callback receives tables in the
+ *  rocprofiler_set_api_table format:
+ *    (name, lib_version, lib_instance, tables, num_tables)
  */
 #ifndef MOCK_REGISTER_H
 #define MOCK_REGISTER_H
@@ -23,31 +36,46 @@
 extern "C" {
 #endif
 
-/* Return values for mock_register_library_api_table. */
-#define MOCK_REGISTER_OK           0  /* Stored and (if SDK present) handed off */
-#define MOCK_REGISTER_NO_TOOL      1  /* Stored only; no rocprofiler_configure visible */
-#define MOCK_REGISTER_ERROR       -1  /* Capacity exceeded or bad arguments */
+/* Return values. */
+#define MOCK_REGISTER_OK           0
+#define MOCK_REGISTER_NO_TOOL      1
+#define MOCK_REGISTER_ERROR       -1
 
-/* Signature the SDK exports and register-lib invokes once the SDK has been
- * dlopened. The register library holds this as a published mutable function
- * pointer: the SDK fills it in from its constructor/initialize path. */
-typedef int (*mock_register_set_api_table_fn_t)(const char* name,
-                                                uint32_t version,
-                                                void** api_tables,
-                                                uint64_t num_tables);
+/* Unique library-instance identifier (output of registration).
+ * Matches rocprofiler_register_library_indentifier_t conceptually. */
+typedef struct {
+    uint32_t category;    /* assigned by register based on lib_name */
+    uint32_t instance;    /* monotonic per name */
+} mock_register_id_t;
 
-/* Runtime entry point — called by each API-table owner (our mylib_dispatch). */
-int mock_register_library_api_table(const char* name,
-                                    uint32_t version,
-                                    void** api_tables,
-                                    uint64_t num_tables);
+/* Callback signature the SDK/shim exports. Matches the real
+ * rocprofiler_set_api_table(name, lib_version, lib_instance, tables, num_tables).
+ * tables[i] is a pointer to a table struct (first field = size_t size). */
+typedef int (*mock_register_set_api_table_fn_t)(const char*  name,
+                                                uint64_t     lib_version,
+                                                uint64_t     lib_instance,
+                                                void**       tables,
+                                                uint64_t     num_tables);
 
-/* Replays all registered API tables through the SDK's set_api_table callback.
- * Invoked by the SDK during force_configure (invoke_register_propagation). */
+/* Runtime entry point — called by each API-table owner (HIP, HSA, RCCL, ...).
+ *
+ * @param lib_name          String identifier ("hip", "hsa", "rccl", ...)
+ * @param lib_version       Encoded as 10000*major + 100*minor + patch
+ * @param api_tables        Array of pointers to table structs. Each struct
+ *                          has size_t size as first field, then fn pointers.
+ * @param api_table_length  Number of table structs in api_tables (typically 1)
+ * @param register_id       Output: unique library instance identifier
+ */
+int mock_register_library_api_table(const char*        lib_name,
+                                    uint32_t           lib_version,
+                                    void**             api_tables,
+                                    uint64_t           api_table_length,
+                                    mock_register_id_t* register_id);
+
+/* Replays all registered API tables through the SDK/shim callback. */
 int mock_register_invoke_all_registrations(void);
 
-/* Published mutable function pointer. NULL until the SDK sets it.
- * Exposed as a C global so the SDK can write to it from its init path. */
+/* Published mutable function pointer. NULL until SDK/shim sets it. */
 extern mock_register_set_api_table_fn_t mock_register_set_api_table_fn;
 
 #ifdef __cplusplus

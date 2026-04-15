@@ -13,6 +13,7 @@
 #ifndef MOCK_LIBA_H
 #define MOCK_LIBA_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* --- Opaque handles (like hsa_queue_t*, hsa_signal_t, hsa_agent_t) --- */
@@ -55,6 +56,7 @@ typedef enum {
 
 /* --- API function table (dispatch-table pattern) --- */
 typedef struct {
+    size_t size;
     liba_status_t (*queue_create)(liba_agent_t agent,
                                   uint32_t size,
                                   liba_queue_t* out_queue);

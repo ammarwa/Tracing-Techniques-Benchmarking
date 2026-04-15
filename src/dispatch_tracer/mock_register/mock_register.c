@@ -6,7 +6,14 @@
  * symbol. If found, dlopens libmock_sdk.so (once) and replays all stored
  * tables through the SDK's published set_api_table callback.
  *
- * No rocprofiler_configure symbol is defined here — the scan will only
+ * The callback receives (name, lib_version, lib_instance, tables, num_tables)
+ * matching the real rocprofiler_set_api_table signature.  api_tables[i] is a
+ * POINTER TO a table struct whose first field is size_t size.
+ *
+ * Each library name gets a monotonically increasing instance counter, and
+ * the caller receives a mock_register_id_t with {category, instance}.
+ *
+ * No rocprofiler_configure symbol is defined here -- the scan will only
  * succeed if a tool library has been loaded (LD_PRELOAD) or linked in.
  */
 #define _GNU_SOURCE
@@ -21,18 +28,30 @@
 #include "mock_register.h"
 
 #define MAX_REGISTERED_TABLES 16
+#define MAX_LIB_NAMES         16
 
 typedef struct {
-    char      name[64];
-    uint32_t  version;
-    void**    api_tables;
-    uint64_t  num_tables;
-    int       in_use;
+    char               name[64];
+    uint32_t           version;
+    void**             api_tables;
+    uint64_t           api_table_length;
+    mock_register_id_t register_id;
+    int                in_use;
 } registered_entry_t;
+
+/* Per-name instance counter for assigning register_id.instance. */
+typedef struct {
+    char     name[64];
+    uint32_t category;    /* assigned once, sequentially */
+    uint32_t next_instance;
+} lib_name_entry_t;
 
 static registered_entry_t g_registry[MAX_REGISTERED_TABLES];
 static size_t             g_registry_count = 0;
 static pthread_mutex_t    g_registry_lock  = PTHREAD_MUTEX_INITIALIZER;
+
+static lib_name_entry_t   g_lib_names[MAX_LIB_NAMES];
+static size_t             g_lib_name_count = 0;
 
 /* Published mutable function pointer the SDK fills in. NULL means
  * no SDK has been loaded yet, so registrations are stored-only. */
@@ -40,6 +59,41 @@ mock_register_set_api_table_fn_t mock_register_set_api_table_fn = NULL;
 
 /* Guarded by g_registry_lock. */
 static void* g_sdk_handle = NULL;
+
+/* Look up (or create) the per-name entry and return the next
+ * register_id for that name.  Caller holds g_registry_lock. */
+static mock_register_id_t assign_register_id_locked(const char* name)
+{
+    /* Search for existing name. */
+    for (size_t i = 0; i < g_lib_name_count; ++i) {
+        if (strcmp(g_lib_names[i].name, name) == 0) {
+            mock_register_id_t id;
+            id.category = g_lib_names[i].category;
+            id.instance = g_lib_names[i].next_instance++;
+            return id;
+        }
+    }
+
+    /* New name -- allocate a category. */
+    mock_register_id_t id;
+    if (g_lib_name_count < MAX_LIB_NAMES) {
+        lib_name_entry_t* e = &g_lib_names[g_lib_name_count];
+        snprintf(e->name, sizeof(e->name), "%s", name);
+        e->category      = (uint32_t)g_lib_name_count;
+        e->next_instance = 0;
+
+        id.category = e->category;
+        id.instance = e->next_instance++;
+        g_lib_name_count++;
+    } else {
+        /* Overflow -- return a sentinel. */
+        fprintf(stderr, "[mock_register] lib_name table full (%d names)\n",
+                MAX_LIB_NAMES);
+        id.category = UINT32_MAX;
+        id.instance = UINT32_MAX;
+    }
+    return id;
+}
 
 /* Try to discover a tool by looking up rocprofiler_configure via
  * RTLD_DEFAULT. If present in the process image (e.g. a tool library
@@ -51,7 +105,7 @@ static int tool_present(void)
     /* Clear any stale error state. */
     (void)dlerror();
     void* sym = dlsym(RTLD_DEFAULT, "rocprofiler_configure");
-    /* Ignore dlerror — a missing symbol returns NULL. */
+    /* Ignore dlerror -- a missing symbol returns NULL. */
     return sym != NULL;
 }
 
@@ -82,7 +136,7 @@ static void maybe_load_sdk_locked(void)
         }
     }
     if (!g_sdk_handle) {
-        /* Couldn't load the SDK — leave things as stored-only. */
+        /* Couldn't load the SDK -- leave things as stored-only. */
         return;
     }
 
@@ -107,8 +161,9 @@ static void replay_all_locked(void)
         if (!g_registry[i].in_use) continue;
         mock_register_set_api_table_fn(g_registry[i].name,
                                        g_registry[i].version,
+                                       g_registry[i].register_id.instance,
                                        g_registry[i].api_tables,
-                                       g_registry[i].num_tables);
+                                       g_registry[i].api_table_length);
     }
 }
 
@@ -152,16 +207,18 @@ static void mock_register_early_load(void)
     pthread_mutex_unlock(&g_registry_lock);
 }
 
-int mock_register_library_api_table(const char* name,
-                                    uint32_t version,
-                                    void** api_tables,
-                                    uint64_t num_tables)
+int mock_register_library_api_table(const char*         lib_name,
+                                    uint32_t            lib_version,
+                                    void**              api_tables,
+                                    uint64_t            api_table_length,
+                                    mock_register_id_t* register_id)
 {
-    if (!name || !api_tables || num_tables == 0) return MOCK_REGISTER_ERROR;
+    if (!lib_name || !api_tables || api_table_length == 0 || !register_id)
+        return MOCK_REGISTER_ERROR;
 
     pthread_mutex_lock(&g_registry_lock);
 
-    /* Find a free slot. Dedup by name is intentionally NOT done — the
+    /* Find a free slot. Dedup by name is intentionally NOT done -- the
      * rocprofiler-register behavior allows multiple registrations. */
     int slot = -1;
     for (size_t i = 0; i < MAX_REGISTERED_TABLES; ++i) {
@@ -174,29 +231,36 @@ int mock_register_library_api_table(const char* name,
         return MOCK_REGISTER_ERROR;
     }
 
+    /* Assign a unique register_id for this library instance. */
+    mock_register_id_t id = assign_register_id_locked(lib_name);
+    *register_id = id;
+
     registered_entry_t* e = &g_registry[slot];
-    snprintf(e->name, sizeof(e->name), "%s", name);
-    e->version    = version;
-    e->api_tables = api_tables;
-    e->num_tables = num_tables;
-    e->in_use     = 1;
+    snprintf(e->name, sizeof(e->name), "%s", lib_name);
+    e->version          = lib_version;
+    e->api_tables       = api_tables;
+    e->api_table_length = api_table_length;
+    e->register_id      = id;
+    e->in_use           = 1;
     if ((size_t)slot + 1 > g_registry_count) g_registry_count = slot + 1;
 
     /* Is a tool present in the image? If so, make sure the SDK is loaded
      * and hand off this (and any previously-deferred) registration.
      * In shim-mode the set_api_table callback has already been published
      * by the early-load constructor, so we can skip the tool_present probe
-     * and the dlopen entirely — just replay this table through the shim. */
+     * and the dlopen entirely -- just replay this table through the shim. */
     int rc;
     if (mock_register_set_api_table_fn != NULL) {
         mock_register_set_api_table_fn(e->name, e->version,
-                                       e->api_tables, e->num_tables);
+                                       e->register_id.instance,
+                                       e->api_tables, e->api_table_length);
         rc = MOCK_REGISTER_OK;
     } else if (tool_present()) {
         maybe_load_sdk_locked();
         if (mock_register_set_api_table_fn != NULL) {
             mock_register_set_api_table_fn(e->name, e->version,
-                                           e->api_tables, e->num_tables);
+                                           e->register_id.instance,
+                                           e->api_tables, e->api_table_length);
             rc = MOCK_REGISTER_OK;
         } else {
             rc = MOCK_REGISTER_NO_TOOL;

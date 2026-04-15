@@ -168,16 +168,30 @@ T+3  shim constructor:
        - socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC) → abstract namespace
          bind "\0rocprof-shim_<pid>"
          listen(backlog=1)   ← single-controller model (see §14)
-       - publish set_api_table callback (exported as `mock_sdk_set_api_table` in the mock; production shim would use `rocprofiler_shim_set_api_table`) to register
+       - publish set_api_table callback matching the real rocprofiler_set_api_table
+         signature: (name, lib_version, lib_instance, tables, num_tables)
+         where tables[i] → table struct with size_t size + fn pointers
        - pthread_create(g_bg_thread, bg_main)
        - bg thread blocks on accept()
-T+4  libamdhip64 calls rocprofiler_register_library_api_table("hip", tbl)
-     → register calls shim_set_api_table_fn("hip", tbl, N_hip)
-     → shim's shim_set_api_table:
-         for each slot i in tbl:
-           g_orig[i] = tbl[i]                          (store release)
-           tbl[i] = &shim_wrap_hip_op_i                (atomic store release)
-         g_installed = 1
+T+4  libamdhip64 calls rocprofiler_register_library_api_table(
+         "hip",                    // lib_name
+         import_func,              // re-import callback (for late loading)
+         10100,                    // lib_version = 10000*1 + 100*1 + 0
+         &hip_runtime_table,       // api_tables: void*[1] = { &HipDispatchTable }
+         1,                        // api_table_length = 1 table
+         &register_id)             // output: unique {category, instance}
+     → register stores {name, version, tables[0], instance_id}
+     → register calls shim_set_api_table_fn(
+           "hip", lib_version, lib_instance, tables, 1)
+     → shim dereferences tables[0] → HipDispatchTable struct
+       struct has size_t size as first field, then fn ptrs:
+         table_struct = tables[0]
+         table_size   = *(size_t*)table_struct
+         fn_slots     = (void**)((char*)table_struct + sizeof(size_t))
+         num_fn_entries = (table_size - sizeof(size_t)) / sizeof(void*)
+       for each fn_slot i:
+           g_orig[base + i] = fn_slots[i]              (store release)
+           fn_slots[i] = &shim_wrap_hip_op_i           (atomic store release)
      → register also records the table for possible SDK replay
 T+5  libhsa-runtime64 same dance for "hsa" domain
 T+6  libomptarget's OMPT init (separate from dispatch tables, see §9)
@@ -1017,8 +1031,17 @@ Abstract socket + sealed anonymous memfd together give **zero persistent filesys
 ```c
 /* Called by rocprofiler-register unconditionally when any runtime
  * registers a dispatch table. Shim rewrites the slots to its wrappers. */
-int mock_sdk_set_api_table(const char* name, uint32_t version,
-                           void** api_tables, uint64_t num_tables);
+/* Called by rocprofiler-register for each runtime registration.
+ * Matches the real rocprofiler_set_api_table signature:
+ *   (name, lib_version, lib_instance, tables, num_tables)
+ * tables[i] is a pointer to a table struct whose first field is
+ * size_t size, followed by function pointers. The shim dereferences
+ * tables[0], skips the size field, and iterates the fn-ptr slots. */
+int rocprofiler_shim_set_api_table(const char*  name,
+                                    uint64_t     lib_version,
+                                    uint64_t     lib_instance,
+                                    void**       tables,
+                                    uint64_t     num_tables);
 
 /* SDK can query this to learn the original runtime function behind
  * a shim-wrapped slot (for layered wrapping — see §8). */

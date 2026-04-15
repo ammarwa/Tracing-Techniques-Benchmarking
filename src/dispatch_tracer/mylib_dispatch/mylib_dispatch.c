@@ -55,6 +55,7 @@ static void real_set_simulated_work_duration(unsigned int sleep_us)
 /* -------- Mutable dispatch table -------- */
 
 static mylib_api_table_t g_api_table = {
+    .size                        = sizeof(mylib_api_table_t),
     .my_traced_function          = &real_my_traced_function,
     .set_simulated_work_duration = &real_set_simulated_work_duration,
 };
@@ -76,16 +77,14 @@ void set_simulated_work_duration(unsigned int sleep_us)
 __attribute__((constructor))
 static void mylib_dispatch_register(void)
 {
-    /* Publish the api_table to mock_register. The "tables" array layout
-     * follows the rocprofiler-register convention: we publish the
-     * address of our api_table's first slot plus the number of entries
-     * so the SDK's update_table can index into it. */
-    void** table_slots = (void**)&g_api_table;
-    uint64_t num_slots =
-        sizeof(mylib_api_table_t) / sizeof(void*);
-
+    /* Publish the api_table to mock_register using the pointer-to-table
+     * convention: tables[] is an array of pointers to table structs
+     * (each struct has size_t size as first field). */
+    void* tables[] = { &g_api_table };
+    mock_register_id_t id;
     (void)mock_register_library_api_table("mylib",
                                           MYLIB_API_TABLE_VERSION,
-                                          table_slots,
-                                          num_slots);
+                                          tables,
+                                          1,
+                                          &id);
 }
