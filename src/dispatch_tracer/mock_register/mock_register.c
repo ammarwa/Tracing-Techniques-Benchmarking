@@ -115,7 +115,7 @@ static void replay_all_locked(void)
 /* ---------------------------------------------------------------- */
 /* Early-load constructor: when MOCK_REGISTER_LIB is set, dlopen the  */
 /* override library BEFORE any runtime calls register_library. This   */
-/* mirrors Jonathan Madsen's proposed shim model where rocprofiler-   */
+/* mirrors the alternative shim model where rocprofiler-   */
 /* register unconditionally loads the shim at startup. Without this,  */
 /* tool_present() would return NULL and the conditional dlopen in     */
 /* maybe_load_sdk_locked would never trigger for a tool that only     */

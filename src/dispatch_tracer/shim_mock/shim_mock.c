@@ -1,7 +1,7 @@
 /*
  * shim_mock.c — libshim_mock.so
  *
- * Mock of Jonathan Madsen's proposed rocprofiler-sdk-shim design:
+ * Mock of proposed rocprofiler-sdk-shim design:
  * rocprofiler-register unconditionally dlopens this library when a
  * runtime registers a dispatch table. The shim wraps every table entry
  * with a thin "maybe-call-profiler" functor of the shape:
@@ -16,7 +16,7 @@
  * functor degenerates to one atomic-acquire load + one well-predicted
  * branch + a tail call to the original function pointer. The purpose of
  * this mock is to measure that path against baseline (no wrappers at
- * all) and confirm Jonathan's "noise-equivalent" claim — or refute it.
+ * all) and confirm the "noise-equivalent" claim — or refute it.
  *
  * This library is a drop-in replacement for libmock_sdk.so at the
  * mock_register dlopen seam:
@@ -59,7 +59,7 @@ static int             g_shim_installed[SHIM_NUM_OPS] = { 0, 0 };
 /* Profiler function-pointer signatures. Each profiler functor gets the
  * original function pointer as its first argument plus the original
  * call arguments, and is responsible for (optionally) invoking the
- * original. This matches Jonathan's sketch. */
+ * original. This matches the shim design sketch. */
 typedef void (*shim_prof_op0_t)(void* orig, int a1, uint64_t a2, double a3, void* a4);
 typedef void (*shim_prof_op1_t)(void* orig, unsigned int us);
 

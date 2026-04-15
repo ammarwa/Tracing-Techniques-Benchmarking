@@ -3,13 +3,13 @@
 This document compares the two late-attach OOP-profiling designs that have been proposed for rocprofiler-sdk-adjacent tracing:
 
 - **Late-load stub** (the design surveyed in the rest of this directory): a tiny library is `LD_PRELOAD`'d into the target process; it defers loading rocprofiler-sdk until a controller attaches.
-- **rocprofiler-sdk-shim** (Jonathan Madsen's proposal): a shim library is `dlopen`'d unconditionally by rocprofiler-register when it receives a dispatch table, installs a lightweight "maybe-call-profiler" functor over every entry from the start, and flips a pointer at attach time instead of loading the SDK.
+- **rocprofiler-sdk-shim** (the proposal): a shim library is `dlopen`'d unconditionally by rocprofiler-register when it receives a dispatch table, installs a lightweight "maybe-call-profiler" functor over every entry from the start, and flips a pointer at attach time instead of loading the SDK.
 
 Both designs solve the same real problem — late-attach, no-sudo, no-ptrace OOP profiling for HIP/HSA/RCCL/OMPT — but from opposite architectural ends. This doc lays out what is different, what is the same, whether either violates the requirements we set in [CONTROL_CHANNEL_SURVEY.md § Requirements](CONTROL_CHANNEL_SURVEY.md#requirements), and how our preferred IPC hybrid (**memfd + socket**, see [MEMFD.md](MEMFD.md)) plugs into each.
 
 ## TL;DR
 
-| Dimension | Late-load stub (ours) | rocprofiler-sdk-shim (Jonathan's) |
+| Dimension | Late-load stub (ours) | rocprofiler-sdk-shim (alternative) |
 |---|---|---|
 | How the tracer enters the process | `LD_PRELOAD=librocp_stub_<channel>.so` | None — rocprofiler-register always `dlopen`s the shim when a runtime registers a table |
 | State of dispatch tables before any OOP attach | Original pointers, never wrapped | Wrapped from process start by a shim `functor(args...)` |
@@ -44,7 +44,7 @@ Hot path pre-attach:
 
 **Claim:** hot-path cost is the same as baseline. Measured (20 × 1M iters): baseline 3.604 ± 0.23 ns, stub-loaded stub variants 3.42–3.54 ± 0.04–0.16 ns, all within the 95% two-sample margin of the baseline.
 
-### rocprofiler-sdk-shim (Jonathan's)
+### rocprofiler-sdk-shim (alternative)
 
 ```
 Process start:
@@ -70,7 +70,7 @@ Hot path pre-attach:
     → tail call to original
 ```
 
-**Claim:** the atomic-load + branch is "indistinguishable from noise". Jonathan backed it up with prior `disabled-sdk-contexts` measurements from rocprofiler-sdk where the equivalent "check if a context is active, none are" path has never surfaced above noise. Our direct measurement (§7a) finds the fast path costs **+0.8 ± 0.25 ns** at 20×1M-iter resolution on AMD EPYC 9354 — cheap (2–3 cycles), well below real-SDK active-tracing cost, but measurably nonzero. The qualitative claim is right; the strict "zero" was an overreach.
+**Claim:** the atomic-load + branch is "indistinguishable from noise". The proposal backed it up with prior `disabled-sdk-contexts` measurements from rocprofiler-sdk where the equivalent "check if a context is active, none are" path has never surfaced above noise. Our direct measurement (§7a) finds the fast path costs **+0.8 ± 0.25 ns** at 20×1M-iter resolution on AMD EPYC 9354 — cheap (2–3 cycles), well below real-SDK active-tracing cost, but measurably nonzero. The qualitative claim is right; the strict "zero" was an overreach.
 
 The two designs trade a hard 0 for a measured ~0.8 ns in exchange for getting rid of `LD_PRELOAD`.
 
@@ -84,13 +84,13 @@ The two designs trade a hard 0 for a measured ~0.8 ns in exchange for getting ri
 | Turning tracing off | `rocprofiler_stop_context` — wrappers stay installed, Level-2 noop path (~50-200 ns with real SDK) | Atomic store of `NULL` back into `profiler_functor[Op]` — back to noise-floor cost |
 | Unloading on detach | Not attempted (SDK init is one-shot; SDK stays loaded till process exit) | Not needed — shim is always loaded; swap back to null |
 
-Jonathan's design completely dominates on attach latency — it's three orders of magnitude faster because there is no `dlopen` on the critical path. Our 1.8 ms is fine for a human-initiated attach, but for anything programmatic (e.g. "trace this one kernel launch") his is the right shape.
+The shim design completely dominates on attach latency — it's three orders of magnitude faster because there is no `dlopen` on the critical path. Our 1.8 ms is fine for a human-initiated attach, but for anything programmatic (e.g. "trace this one kernel launch") the shim design is the right shape.
 
 ## 3. Coexistence of in-process rocprofiler-sdk and OOP tools
 
 Our late-load design has a structural problem here: if the user is already running a rocprofv3 session (in-process SDK tool loaded), the SDK's `update_table()` has already rewritten every entry to point at SDK wrappers, and `init_status != 0`, so `rocprofiler_force_configure` will return `ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED`. Our late-load mechanism cannot attach in that case. The workaround is "don't combine" or "use ptrace attach" — which is the path we were trying to eliminate.
 
-Jonathan's shim fixes this by making the layering explicit:
+The shim design fixes this by making the layering explicit:
 
 ```
 runtime  →  shim.functor  →  (if in-process SDK)  SDK.functor  →  original
@@ -128,7 +128,7 @@ In-process:                                     Controller:
     SDK inits, update_table installs wrappers
 ```
 
-### Jonathan's shim design (hypothetical)
+### The shim design (hypothetical)
 
 ```
 In-process:                                     External shim tool:
@@ -163,18 +163,18 @@ OMPT is the odd one out in both designs because **it is not a dispatch table** �
 
 Both designs need to solve the same problem in the same way:
 
-- The shim (Jonathan's) or the stub (ours) must export `ompt_start_tool`.
+- The shim (alternative) or the stub (ours) must export `ompt_start_tool`.
 - `initialize(lookup, ...)` must save the `ompt_set_callback` function pointer for later use.
 - No callbacks are installed at OpenMP init (OMPT hot path stays at runtime-native cost).
 - At controller attach, whichever library owns the OOP side uses the saved `ompt_set_callback` pointer to install real OMPT callbacks on the live runtime.
 
 Neither design has a natural advantage here — this is a property of the OMPT spec, not of either wrapping model. Our doc already captures the mechanism; a shim implementation would reuse the same pattern.
 
-## 6. ABI contract — a cost Jonathan's design adds
+## 6. ABI contract — a cost the shim design adds
 
 With our design, the only ABI the stub depends on is the rocprofiler-sdk public C API (`rocprofiler_force_configure`, `rocprofiler_configure_*`, `rocprofiler_start_context`, etc.). That's already a published, versioned contract.
 
-With Jonathan's design, there is a **new** ABI between rocprofiler-sdk-shim and rocprofiler-sdk: when an in-process SDK tool is also loaded, the SDK's `update_table()` has to know how to wrap the shim's `functor` (not the raw runtime function), and when it calls through, the shim's `functor` expects to be called with `orig` bound to the SDK's wrapper. That contract — what the shim stores as `original_functor`, how the SDK signals "wrap me, don't wrap my original" — needs to be defined, documented, and versioned alongside the rocprofiler-sdk releases.
+With the shim design, there is a **new** ABI between rocprofiler-sdk-shim and rocprofiler-sdk: when an in-process SDK tool is also loaded, the SDK's `update_table()` has to know how to wrap the shim's `functor` (not the raw runtime function), and when it calls through, the shim's `functor` expects to be called with `orig` bound to the SDK's wrapper. That contract — what the shim stores as `original_functor`, how the SDK signals "wrap me, don't wrap my original" — needs to be defined, documented, and versioned alongside the rocprofiler-sdk releases.
 
 This is a perfectly reasonable cost to pay for the architectural cleanness, but it is a real cost that our design avoids.
 
@@ -182,7 +182,7 @@ This is a perfectly reasonable cost to pay for the architectural cleanness, but 
 
 Rules from [CONTROL_CHANNEL_SURVEY.md § Requirements](CONTROL_CHANNEL_SURVEY.md#requirements) and our design goals:
 
-| Rule | Ours | Jonathan's |
+| Rule | Ours | Shim design |
 |---|---|---|
 | No sudo, no capabilities, no kernel version requirement | ✓ | ✓ |
 | Cross-user security enforceable by the kernel | ✓ (`SO_PEERCRED` via same IPC survey) | ✓ (same IPC survey applies) |
@@ -196,7 +196,7 @@ Rules from [CONTROL_CHANNEL_SURVEY.md § Requirements](CONTROL_CHANNEL_SURVEY.md
 | rocprofiler-sdk loaded into every OOP-profiled process | Yes, at attach | **Stronger** — never loaded for OOP-only use |
 | New code to design and maintain | ~20 KiB stub per channel; reuses SDK as-is | `librocprofiler-sdk-shim.so` + external shim tool + new shim ABI |
 
-Net: Jonathan's design relaxes "genuine 0 ns" to "+0.8 ns measured per call" (see §7a) and takes on the cost of designing and shipping a new library with its own ABI. In return it strengthens four other properties (no preload, no SDK for OOP, coexistence, attach cost). The IPC-channel survey we've already done applies to both with the same recommended hybrid.
+Net: The shim design relaxes "genuine 0 ns" to "+0.8 ns measured per call" (see §7a) and takes on the cost of designing and shipping a new library with its own ABI. In return it strengthens four other properties (no preload, no SDK for OOP, coexistence, attach cost). The IPC-channel survey we've already done applies to both with the same recommended hybrid.
 
 ## 7a. Measured: the shim fast path adds +0.8 ns/call
 
@@ -226,7 +226,7 @@ void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 | stub signal                  | 3.452 | 0.023 | ±0.010 | +0.014 ± 0.022 | no |
 | **shim (profiler=NULL)**     | **4.242** | 0.570 | ±0.250 | **+0.804 ± 0.251** | **yes** |
 
-**Honest interpretation — revised.** The four late-load stubs are statistically indistinguishable from baseline, as their design predicts (no wrappers installed, original dispatch pointers preserved). The **shim fast path is not** — it adds ~0.8 ns/call, which is roughly 2–3 CPU cycles at this hardware's clock rate and exceeds the two-sample 95% margin. Jonathan's "noise-equivalent" claim is partially refuted at this sample size: the path is cheap, but not free.
+**Honest interpretation — revised.** The four late-load stubs are statistically indistinguishable from baseline, as their design predicts (no wrappers installed, original dispatch pointers preserved). The **shim fast path is not** — it adds ~0.8 ns/call, which is roughly 2–3 CPU cycles at this hardware's clock rate and exceeds the two-sample 95% margin. the "noise-equivalent" claim is partially refuted at this sample size: the path is cheap, but not free.
 
 Why it isn't zero: every call performs two atomic-acquire loads (`g_shim_profiler[op]`, `g_shim_orig[op]`), a branch, and a tail call — rather than a single indirect call through an unmodified function-pointer slot. The branch predictor handles the always-taken fast path well, but each atomic load is still a memory access that the compiler cannot elide, and the second one (the `orig`) is only strictly necessary because this mock keeps originals in a separate atomic-pointer array. A production shim that bakes the original address into the wrapper as a PC-relative symbol (or uses a GOTCHA-style trampoline) would likely erase most of the remaining 0.8 ns.
 
@@ -236,7 +236,7 @@ _An earlier version of this table reported 3.483 ns / −0.095 ± 0.165 for the 
 
 Raw data: `report/dispatch_noise.json` (includes per-run samples for all six configurations).
 
-## 8. Open questions to take back to Jonathan
+## 8. Open questions to follow up on
 
 1. ~~**Hot-path cost validation.**~~ **Done** (see §7a): measured 3.483 ns vs baseline 3.578 ns, not distinguishable at 95%. Worth re-running on a production x86-64 and on aarch64 if that hardware is in scope, but the pattern is validated.
 2. **OMPT handling.** The shim needs to export `ompt_start_tool` for the same reasons our stub does. Is that in scope for rocprofiler-sdk-shim or does it live in a separate library?
@@ -247,8 +247,8 @@ Raw data: `report/dispatch_noise.json` (includes per-run samples for all six con
 
 ## 9. Recommendation
 
-Jonathan's design is architecturally cleaner for the OOP-profiling problem as a long-lived product. It gives up a statistically-verified 0 ns for a mathematically-tiny atomic-load-plus-branch (which he is almost certainly right is noise-equivalent), and in exchange it removes `LD_PRELOAD`, keeps rocprofiler-sdk out of every OOP-profiled process, and makes in-process + OOP coexistence natural. The IPC transport question we've already settled (memfd+sock hybrid) applies to it unchanged.
+The shim design is architecturally cleaner for the OOP-profiling problem as a long-lived product. It gives up a statistically-verified 0 ns for a mathematically-tiny atomic-load-plus-branch (which the proposal argued is noise-equivalent), and in exchange it removes `LD_PRELOAD`, keeps rocprofiler-sdk out of every OOP-profiled process, and makes in-process + OOP coexistence natural. The IPC transport question we've already settled (memfd+sock hybrid) applies to it unchanged.
 
 Our late-load stub is the right pattern for a **mock that validates the 0-ns claim and the control-channel security properties with no changes to rocprofiler-sdk or rocprofiler-register**. It is not the right pattern for the long-lived design, because it requires every OOP-profiled process to preload an extra `.so` and because it loads the full SDK into the process for OOP-only use.
 
-The two designs are complementary, not competing. If the project adopts Jonathan's shim as the long-term architecture, the work in this repo — the four-channel survey, the memfd+sock hybrid, the security comparison, the OMPT late-bind mechanism — becomes the transport and OMPT layer under it. None of it is wasted; most of it is necessary regardless.
+The two designs are complementary, not competing. If the project adopts The shim as the long-term architecture, the work in this repo — the four-channel survey, the memfd+sock hybrid, the security comparison, the OMPT late-bind mechanism — becomes the transport and OMPT layer under it. None of it is wasted; most of it is necessary regardless.

@@ -1,5 +1,5 @@
 # ============================================================================
-# shim_mock — validation of Jonathan Madsen's rocprofiler-sdk-shim proposal
+# shim_mock — validation of the alternative rocprofiler-sdk-shim proposal
 # ============================================================================
 
 message("${Green}[dispatch_tracer/shim_mock] Building shim-design validation library${ColorReset}")

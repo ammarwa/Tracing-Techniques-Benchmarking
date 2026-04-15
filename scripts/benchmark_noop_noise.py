@@ -116,7 +116,7 @@ def main():
                               {"LD_PRELOAD": str(stub)},
                               args.iters, args.runs))
 
-    # Shim design (Jonathan's proposal): no LD_PRELOAD, but mock_register
+    # Shim design (alternative architecture): no LD_PRELOAD, but mock_register
     # dlopens libshim_mock.so which installs "atomic-load + branch + tail-call"
     # wrappers over every table entry. profiler_functor stays NULL, so each
     # call pays exactly the fast-path cost the shim design claims should be
