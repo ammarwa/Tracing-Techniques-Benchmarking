@@ -529,7 +529,7 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 4. **Record batching and flow control** — the shim's internal watermark vs the consumer's watermark creates a two-tier buffering system. Tuning guidance (watermark values, batch sizes, socket buffer sizes) is implementation-time work.
 
-5. **Graceful flush semantics** — when the consumer calls `flush_buffer`, the shim must drain the ring synchronously and deliver all pending records before returning the response. The SDK's `flush_buffer` semantics need to align with this (ensure all in-flight emplaces complete before the flush returns).
+5. **Flush semantics** — when the consumer calls `flush_buffer`, it flushes the consumer's own user-created buffer (in the consumer process). This does NOT flush the shim's internal ring buffer — the internal ring is controlled solely by the shim's watermark. The consumer has no visibility into or control over the internal ring's flush timing.
 
 6. ~~**API versioning**~~ — **resolved**: a `HANDSHAKE` message is exchanged at connect time (see §6). Protocol version, SDK header version, and record struct sizes are validated; mismatch → connection rejected.
 
