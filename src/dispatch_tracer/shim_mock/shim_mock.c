@@ -195,10 +195,10 @@ static void shim_handle_event(uint32_t op, uint32_t mode,
     {
         shim_correlation_id_t corr = shim_push_correlation();
 
-        /* ENTER record — includes typed arg payload */
-        shim_emit_record(op, SHIM_PHASE_ENTER, &corr, packed_args, arg_bytes);
+        /* ENTER record — no args yet (output params not filled). */
+        shim_emit_record(op, SHIM_PHASE_ENTER, &corr, NULL, 0);
 
-        /* Call through the chain */
+        /* Call the original — output args are filled by this call. */
         void* next = atomic_load_explicit(&g_next_in_chain[op],
                                           memory_order_acquire);
         if (!next) next = orig_fn;
@@ -211,7 +211,8 @@ static void shim_handle_event(uint32_t op, uint32_t mode,
             ((orig_op1_t)next)(a->us);
         }
 
-        /* EXIT record */
+        /* EXIT record — args captured AFTER orig() returns, so output
+         * params (out_queue, prop, etc.) have their final values. */
         shim_emit_record(op, SHIM_PHASE_EXIT, &corr, packed_args, arg_bytes);
 
         shim_pop_correlation();

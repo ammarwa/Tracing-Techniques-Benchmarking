@@ -60,7 +60,9 @@ static const char* find_table_for_op(uint32_t slot_idx, uint32_t* local_op)
 
 static void print_args(const shim_record_t* rec)
 {
-    if (rec->phase != SHIM_PHASE_ENTER || rec->arg_bytes == 0) return;
+    /* Args are captured on EXIT (after orig() returns) so output params
+     * like out_queue, prop, etc. have their final values. */
+    if (rec->phase != SHIM_PHASE_EXIT || rec->arg_bytes == 0) return;
 
     uint32_t local_op = 0;
     const char* tbl = find_table_for_op(rec->op, &local_op);
