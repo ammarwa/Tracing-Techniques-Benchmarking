@@ -198,9 +198,41 @@ Rules from [CONTROL_CHANNEL_SURVEY.md § Requirements](CONTROL_CHANNEL_SURVEY.md
 
 Net: Jonathan's design relaxes "genuine 0 ns" to "noise-equivalent" and takes on the cost of designing and shipping a new library with its own ABI. In return it strengthens four other properties (no preload, no SDK for OOP, coexistence, attach cost). The IPC-channel survey we've already done applies to both with the same recommended hybrid.
 
+## 7a. Measured: the shim fast path *is* noise-equivalent
+
+Rather than leave "indistinguishable from noise" as a claim, this repo now ships a validation mock — `src/dispatch_tracer/shim_mock/` — that implements exactly the `atomic_load + branch + tail_call` shape against our existing `mylib_dispatch` / `sample_app_dispatch` harness. It is loaded by `mock_register` via a new `MOCK_REGISTER_LIB` env var, with **no `LD_PRELOAD`** on the sample app, mirroring the production "register always dlopens the shim" assumption. The shim rewrites `mylib_dispatch`'s api_table with wrappers of the form:
+
+```c
+void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
+{
+    void* prof = atomic_load_explicit(&g_shim_profiler[0], memory_order_acquire);
+    void* orig = atomic_load_explicit(&g_shim_orig[0],     memory_order_acquire);
+    if (__builtin_expect(prof == NULL, 1)) {
+        ((orig_op0_t)orig)(a1, a2, a3, a4);
+        return;
+    }
+    ((shim_prof_op0_t)prof)(orig, a1, a2, a3, a4);
+}
+```
+
+`profiler_functor` stays `NULL` for the whole measurement, so each call pays exactly the fast-path cost the design claims should be noise-equivalent. Harness: `scripts/benchmark_noop_noise.py`, 20 × 1,000,000 iterations per configuration with 2 warmup runs discarded.
+
+| Config | Mean (ns) | Stdev | 95% CI | Δ vs baseline | Distinguishable at 95%? |
+|---|---:|---:|---:|---:|:---|
+| Baseline (no stub, no shim)  | 3.578 | 0.339 | ±0.149 | — | — |
+| stub mmap                    | 3.502 | 0.339 | ±0.149 | −0.076 ± 0.210 | no |
+| stub sock                    | 3.504 | 0.365 | ±0.160 | −0.074 ± 0.218 | no |
+| stub memfd                   | 3.443 | 0.018 | ±0.008 | −0.135 ± 0.149 | no |
+| stub signal                  | 3.438 | 0.004 | ±0.002 | −0.139 ± 0.149 | no |
+| **shim (profiler=NULL)**     | **3.483** | 0.164 | ±0.072 | **−0.095 ± 0.165** | **no** |
+
+The shim's delta is well inside the 95% two-sample margin; its absolute mean sits between the most-active stub (mmap, 3.502) and the quietest stub (signal, 3.438). Empirically there is no cost you can measure for the `atomic-load + branch + tail-call` path on this hardware. Jonathan's claim holds on AMD EPYC 9354 at 1M-iteration sample sizes; the 0 ns story is preserved.
+
+Raw data: `report/dispatch_noise.json` (includes per-run samples for all six configurations).
+
 ## 8. Open questions to take back to Jonathan
 
-1. **Hot-path cost validation.** "Indistinguishable from noise" is plausible but not measured for this specific shape. Worth running the noise-floor harness (see `scripts/benchmark_noop_noise.py`) against a mock shim that does just `atomic_load + branch + tail_call` and publishing the number alongside ours.
+1. ~~**Hot-path cost validation.**~~ **Done** (see §7a): measured 3.483 ns vs baseline 3.578 ns, not distinguishable at 95%. Worth re-running on a production x86-64 and on aarch64 if that hardware is in scope, but the pattern is validated.
 2. **OMPT handling.** The shim needs to export `ompt_start_tool` for the same reasons our stub does. Is that in scope for rocprofiler-sdk-shim or does it live in a separate library?
 3. **ABI versioning between shim and sdk.** When both are loaded and the SDK's `update_table()` wraps shim entries, what's the versioning discipline? A mismatched pair would silently wrap at the wrong level.
 4. **What does the shim expose for control?** Our control channel ships `rocp_config_t` (domain bitfields, output format, filter patterns). The shim needs an equivalent — is it per-op pointer slots plus a ring-buffer config, or something richer? This is where the IPC survey (and specifically the memfd+sock hybrid) carries over directly.

@@ -60,13 +60,20 @@ static void maybe_load_sdk_locked(void)
 {
     if (g_sdk_handle != NULL) return;
 
-    /* Try common resolution paths. RTLD_GLOBAL so the SDK's symbols are
-     * visible for subsequent dlsym(RTLD_DEFAULT, ...) lookups. */
-    const char* candidates[] = {
+    /* MOCK_REGISTER_LIB env var lets a test swap the backing library out
+     * (e.g. libshim_mock.so for the shim-design validation). When set, it
+     * is the only candidate; otherwise fall back to libmock_sdk.so. */
+    const char* shim_override = getenv("MOCK_REGISTER_LIB");
+    const char* default_candidates[] = {
         "libmock_sdk.so",
         "./libmock_sdk.so",
         NULL
     };
+    const char* override_candidates[] = { shim_override, NULL };
+    const char** candidates =
+        (shim_override && shim_override[0]) ? override_candidates : default_candidates;
+    /* Try common resolution paths. RTLD_GLOBAL so the backing library's
+     * symbols are visible for subsequent dlsym(RTLD_DEFAULT, ...) lookups. */
     for (size_t i = 0; candidates[i]; ++i) {
         void* h = dlopen(candidates[i], RTLD_NOW | RTLD_GLOBAL);
         if (h) {

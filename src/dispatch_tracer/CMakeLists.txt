@@ -98,3 +98,8 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/signal/CMakeLists.txt)
     add_subdirectory(signal)
 endif()
+
+# shim_mock — validation of the rocprofiler-sdk-shim design alternative
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/shim_mock/CMakeLists.txt)
+    add_subdirectory(shim_mock)
+endif()

@@ -48,12 +48,11 @@ class Cell:
         }
 
 
-def one_run(stub: Path | None, iters: int, timeout: float = 60.0) -> float:
+def one_run(extra_env: dict, iters: int, timeout: float = 60.0) -> float:
     app = BUILD_DIR / "bin" / "sample_app_dispatch"
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = str(BUILD_DIR / "lib")
-    if stub is not None:
-        env["LD_PRELOAD"] = str(stub)
+    env.update(extra_env)
     # Empty function: no SIMULATED_WORK_US.
     r = subprocess.run([str(app), str(iters)],
                        env=env, capture_output=True, text=True, timeout=timeout)
@@ -63,24 +62,24 @@ def one_run(stub: Path | None, iters: int, timeout: float = 60.0) -> float:
     raise RuntimeError(f"no avg line in output: {r.stdout[-200:]}")
 
 
-def warmup(stub: Path | None, iters: int) -> None:
+def warmup(extra_env: dict, iters: int) -> None:
     # Warm page cache, branch predictor state, CPU frequency up to steady state.
     for _ in range(2):
         try:
-            one_run(stub, iters, timeout=30)
+            one_run(extra_env, iters, timeout=30)
         except Exception:
             pass
 
 
-def run_cell(name: str, stub: Path | None, iters: int, runs: int) -> Cell:
-    print(f"  [{name:18s}] warming up ...", flush=True)
-    warmup(stub, iters)
+def run_cell(name: str, extra_env: dict, iters: int, runs: int) -> Cell:
+    print(f"  [{name:22s}] warming up ...", flush=True)
+    warmup(extra_env, iters)
     samples = []
     for i in range(runs):
-        samples.append(one_run(stub, iters))
+        samples.append(one_run(extra_env, iters))
     cell = Cell(config=name, iterations=iters, runs=runs, samples_ns=samples)
     s = cell.summary()
-    print(f"  [{name:18s}] n={runs:3d} mean={s['mean_ns']:6.3f}  "
+    print(f"  [{name:22s}] n={runs:3d} mean={s['mean_ns']:6.3f}  "
           f"stdev={s['stdev_ns']:5.3f}  ci95=±{s['ci95_ns']:5.3f}  "
           f"range=[{s['min_ns']:5.3f}, {s['max_ns']:5.3f}] ns", flush=True)
     return cell
@@ -110,10 +109,22 @@ def main():
     print()
 
     cells: List[Cell] = []
-    cells.append(run_cell("baseline (no stub)", None, args.iters, args.runs))
+    cells.append(run_cell("baseline (no stub)", {}, args.iters, args.runs))
     for opt in OPTIONS:
+        stub = BUILD_DIR / "lib" / f"librocp_stub_{opt}.so"
         cells.append(run_cell(f"stub {opt}",
-                              BUILD_DIR / "lib" / f"librocp_stub_{opt}.so",
+                              {"LD_PRELOAD": str(stub)},
+                              args.iters, args.runs))
+
+    # Shim design (Jonathan's proposal): no LD_PRELOAD, but mock_register
+    # dlopens libshim_mock.so which installs "atomic-load + branch + tail-call"
+    # wrappers over every table entry. profiler_functor stays NULL, so each
+    # call pays exactly the fast-path cost the shim design claims should be
+    # noise-equivalent to baseline.
+    shim = BUILD_DIR / "lib" / "libshim_mock.so"
+    if shim.exists():
+        cells.append(run_cell("shim (profiler=NULL)",
+                              {"MOCK_REGISTER_LIB": str(shim)},
                               args.iters, args.runs))
 
     out = Path(args.output)
@@ -133,10 +144,10 @@ def main():
     bsum = baseline.summary()
     print()
     print("=" * 78)
-    print(f"{'Config':<20} {'Mean (ns)':>10} {'Stdev':>8} {'95% CI':>10}  "
+    print(f"{'Config':<24} {'Mean (ns)':>10} {'Stdev':>8} {'95% CI':>10}  "
           f"{'Δ vs baseline':>16}")
     print("-" * 78)
-    print(f"{baseline.config:<20} {bsum['mean_ns']:10.3f} {bsum['stdev_ns']:8.3f} "
+    print(f"{baseline.config:<24} {bsum['mean_ns']:10.3f} {bsum['stdev_ns']:8.3f} "
           f"±{bsum['ci95_ns']:8.3f}  {'—':>16}")
     for c in cells[1:]:
         s = c.summary()
@@ -145,7 +156,7 @@ def main():
         margin = 1.96 * ((s["stdev_ns"]**2 / s["runs"]) +
                          (bsum["stdev_ns"]**2 / bsum["runs"])) ** 0.5
         sig = "" if abs(delta) <= margin else " *"
-        print(f"{c.config:<20} {s['mean_ns']:10.3f} {s['stdev_ns']:8.3f} "
+        print(f"{c.config:<24} {s['mean_ns']:10.3f} {s['stdev_ns']:8.3f} "
               f"±{s['ci95_ns']:8.3f}  {delta:+10.3f}±{margin:5.3f}{sig}")
     print("=" * 78)
     print("(* = delta exceeds the 95% two-sample margin, i.e. distinguishable)")
