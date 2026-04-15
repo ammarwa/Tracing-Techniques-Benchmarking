@@ -40,6 +40,8 @@
 
 #include "mock_register.h"
 #include "mylib_dispatch.h"
+#include "mock_libA.h"
+#include "mock_libB.h"
 #include "shim_protocol.h"
 #include "shim_ipc.h"
 
@@ -47,7 +49,14 @@
 /* Per-op state                                                        */
 /* ------------------------------------------------------------------ */
 
-#define SHIM_NUM_OPS 2   /* op0 = my_traced_function, op1 = set_simulated_work_duration */
+/* Total ops across all registered tables:
+ *   mylib:    op 0 = my_traced_function, op 1 = set_simulated_work_duration
+ *   libA_hsa: op 2 = queue_create, op 3 = memory_allocate,
+ *             op 4 = kernel_dispatch, op 5 = signal_wait
+ *   libB_hip: op 6 = launch_kernel, op 7 = memcpy_async,
+ *             op 8 = stream_synchronize, op 9 = get_device_properties
+ */
+#define SHIM_NUM_OPS 10
 
 /* Saved original function pointers (const after install). */
 static _Atomic(void*) g_runtime_original[SHIM_NUM_OPS] = { NULL, NULL };
@@ -252,6 +261,180 @@ static void shim_wrap_op1(unsigned int us)
     shim_handle_event(1, mode, orig, &args, sizeof(args));
 }
 
+/* ================================================================== */
+/* libA_hsa wrappers (ops 2-5) — typed per-op, matching mock_libA.h    */
+/* ================================================================== */
+
+typedef liba_status_t (*liba_queue_create_fn)(liba_agent_t, uint32_t, liba_queue_t*);
+typedef liba_status_t (*liba_memory_allocate_fn)(liba_memory_region_t, uint64_t, void**);
+typedef liba_status_t (*liba_kernel_dispatch_fn)(liba_queue_t, const liba_dispatch_packet_t*, liba_signal_t);
+typedef liba_status_t (*liba_signal_wait_fn)(liba_signal_t, uint64_t);
+
+typedef struct { liba_agent_t agent; uint32_t size; liba_queue_t* out; } packed_liba_op0_t;
+typedef struct { liba_memory_region_t region; uint64_t size; void** out_ptr; } packed_liba_op1_t;
+typedef struct { liba_queue_t queue; const liba_dispatch_packet_t* pkt; liba_signal_t completion; } packed_liba_op2_t;
+typedef struct { liba_signal_t signal; uint64_t timeout_ns; } packed_liba_op3_t;
+
+#define SHIM_LIBA_BASE 2
+
+static liba_status_t shim_wrap_liba_queue_create(liba_agent_t agent, uint32_t size, liba_queue_t* out)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBA_BASE + 0), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 0], memory_order_acquire);
+        return ((liba_queue_create_fn)orig)(agent, size, out);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 0], memory_order_acquire);
+    packed_liba_op0_t args = { agent, size, out };
+    shim_handle_event(SHIM_LIBA_BASE + 0, mode, orig, &args, sizeof(args));
+    return LIBA_STATUS_SUCCESS;
+}
+
+static liba_status_t shim_wrap_liba_memory_allocate(liba_memory_region_t region, uint64_t size, void** out_ptr)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBA_BASE + 1), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 1], memory_order_acquire);
+        return ((liba_memory_allocate_fn)orig)(region, size, out_ptr);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 1], memory_order_acquire);
+    packed_liba_op1_t args = { region, size, out_ptr };
+    shim_handle_event(SHIM_LIBA_BASE + 1, mode, orig, &args, sizeof(args));
+    return LIBA_STATUS_SUCCESS;
+}
+
+static liba_status_t shim_wrap_liba_kernel_dispatch(liba_queue_t queue, const liba_dispatch_packet_t* pkt, liba_signal_t completion)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBA_BASE + 2), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 2], memory_order_acquire);
+        return ((liba_kernel_dispatch_fn)orig)(queue, pkt, completion);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 2], memory_order_acquire);
+    packed_liba_op2_t args = { queue, pkt, completion };
+    shim_handle_event(SHIM_LIBA_BASE + 2, mode, orig, &args, sizeof(args));
+    return LIBA_STATUS_SUCCESS;
+}
+
+static liba_status_t shim_wrap_liba_signal_wait(liba_signal_t signal, uint64_t timeout_ns)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBA_BASE + 3), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 3], memory_order_acquire);
+        return ((liba_signal_wait_fn)orig)(signal, timeout_ns);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBA_BASE + 3], memory_order_acquire);
+    packed_liba_op3_t args = { signal, timeout_ns };
+    shim_handle_event(SHIM_LIBA_BASE + 3, mode, orig, &args, sizeof(args));
+    return LIBA_STATUS_SUCCESS;
+}
+
+/* ================================================================== */
+/* libB_hip wrappers (ops 6-9) — typed per-op, matching mock_libB.h    */
+/* ================================================================== */
+
+typedef libb_error_t (*libb_launch_kernel_fn)(const libb_launch_config_t*);
+typedef libb_error_t (*libb_memcpy_async_fn)(void*, const void*, uint64_t, libb_stream_t);
+typedef libb_error_t (*libb_stream_sync_fn)(libb_stream_t);
+typedef libb_error_t (*libb_get_dev_prop_fn)(libb_device_prop_t*, int);
+
+typedef struct { const libb_launch_config_t* config; } packed_libb_op0_t;
+typedef struct { void* dst; const void* src; uint64_t size; libb_stream_t stream; } packed_libb_op1_t;
+typedef struct { libb_stream_t stream; } packed_libb_op2_t;
+typedef struct { libb_device_prop_t* prop; int device_id; } packed_libb_op3_t;
+
+#define SHIM_LIBB_BASE 6
+
+static libb_error_t shim_wrap_libb_launch_kernel(const libb_launch_config_t* cfg)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBB_BASE + 0), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 0], memory_order_acquire);
+        return ((libb_launch_kernel_fn)orig)(cfg);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 0], memory_order_acquire);
+    packed_libb_op0_t args = { cfg };
+    shim_handle_event(SHIM_LIBB_BASE + 0, mode, orig, &args, sizeof(args));
+    return LIBB_SUCCESS;
+}
+
+static libb_error_t shim_wrap_libb_memcpy_async(void* dst, const void* src, uint64_t size, libb_stream_t stream)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBB_BASE + 1), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 1], memory_order_acquire);
+        return ((libb_memcpy_async_fn)orig)(dst, src, size, stream);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 1], memory_order_acquire);
+    packed_libb_op1_t args = { dst, src, size, stream };
+    shim_handle_event(SHIM_LIBB_BASE + 1, mode, orig, &args, sizeof(args));
+    return LIBB_SUCCESS;
+}
+
+static libb_error_t shim_wrap_libb_stream_sync(libb_stream_t stream)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBB_BASE + 2), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 2], memory_order_acquire);
+        return ((libb_stream_sync_fn)orig)(stream);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 2], memory_order_acquire);
+    packed_libb_op2_t args = { stream };
+    shim_handle_event(SHIM_LIBB_BASE + 2, mode, orig, &args, sizeof(args));
+    return LIBB_SUCCESS;
+}
+
+static libb_error_t shim_wrap_libb_get_dev_prop(libb_device_prop_t* prop, int device_id)
+{
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(SHIM_LIBB_BASE + 3), memory_order_acquire);
+    if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
+        void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 3], memory_order_acquire);
+        return ((libb_get_dev_prop_fn)orig)(prop, device_id);
+    }
+    void* orig = atomic_load_explicit(&g_runtime_original[SHIM_LIBB_BASE + 3], memory_order_acquire);
+    packed_libb_op3_t args = { prop, device_id };
+    shim_handle_event(SHIM_LIBB_BASE + 3, mode, orig, &args, sizeof(args));
+    return LIBB_SUCCESS;
+}
+
+/* ================================================================== */
+/* Generic table installation helper                                   */
+/* ================================================================== */
+
+static void* g_wrapper_table_liba[] = {
+    (void*)&shim_wrap_liba_queue_create,
+    (void*)&shim_wrap_liba_memory_allocate,
+    (void*)&shim_wrap_liba_kernel_dispatch,
+    (void*)&shim_wrap_liba_signal_wait,
+};
+
+static void* g_wrapper_table_libb[] = {
+    (void*)&shim_wrap_libb_launch_kernel,
+    (void*)&shim_wrap_libb_memcpy_async,
+    (void*)&shim_wrap_libb_stream_sync,
+    (void*)&shim_wrap_libb_get_dev_prop,
+};
+
+static void shim_install_generic_table(void** slots, uint64_t num_entries,
+                                       uint32_t base_slot,
+                                       void** wrapper_table, uint32_t n_wrappers)
+{
+    pthread_mutex_lock(&g_shim_install_lock);
+    for (uint32_t i = 0; i < num_entries && i < n_wrappers; i++) {
+        uint32_t slot = base_slot + i;
+        if (slot >= SHIM_NUM_OPS || g_shim_installed[slot]) continue;
+        void* cur = slots[i];
+        if (cur != wrapper_table[i]) {
+            atomic_store_explicit(&g_runtime_original[slot], cur, memory_order_release);
+            atomic_store_explicit(&g_next_in_chain[slot], cur, memory_order_release);
+            atomic_store_explicit((_Atomic(void*)*)&slots[i], wrapper_table[i],
+                                  memory_order_release);
+        }
+        g_shim_installed[slot] = 1;
+    }
+    pthread_mutex_unlock(&g_shim_install_lock);
+}
+
 /* ------------------------------------------------------------------ */
 /* Installation: rewrite the runtime's api_table to point at our       */
 /* wrappers and save the originals.                                    */
@@ -306,17 +489,16 @@ int mock_sdk_set_api_table(const char* name,
     if (!name || !api_tables || num_tables == 0) return -1;
     if (strcmp(name, "mylib") == 0) {
         shim_install_mylib_table(api_tables, num_tables);
+    } else if (strcmp(name, "libA_hsa") == 0) {
+        shim_install_generic_table(api_tables, num_tables, SHIM_LIBA_BASE,
+                                   g_wrapper_table_liba, 4);
+    } else if (strcmp(name, "libB_hip") == 0) {
+        shim_install_generic_table(api_tables, num_tables, SHIM_LIBB_BASE,
+                                   g_wrapper_table_libb, 4);
     }
-    /* For libA_hsa and libB_hip, we register their tables in the memfd
-     * header (for the consumer to see) but do NOT install typed wrappers
-     * (we'd need per-op code-generated wrappers for each function
-     * signature, which the real shim does but the mock doesn't). Instead
-     * the tables stay unwrapped and calls go through directly. The
-     * correlation chain still works because libB's real implementation
-     * calls libA's public entry points, which go through the dispatch
-     * table — if mylib's table IS wrapped, the cross-library chain fires.
-     * For the multi-lib test, both libA and libB are registered for
-     * metadata visibility but only mylib gets actual wrappers. */
+
+    /* Register every table's metadata in the memfd header so the consumer
+     * can see per-table registrations with name, version, slot range. */
     if (g_ipc_ok && g_ipc.ctrl) {
         uint32_t idx = g_ipc.ctrl->n_registrations;
         if (idx < SHIM_MAX_REGISTRATIONS) {
@@ -325,10 +507,34 @@ int mock_sdk_set_api_table(const char* name,
             reg->lib_instance  = 0;
             reg->major_version = version;
             reg->minor_version = 0;
-            reg->slot_base     = g_ipc.ctrl->total_ops;
-            reg->n_ops         = (uint32_t)num_tables;
+            uint32_t base = g_ipc.ctrl->total_ops;
+            reg->slot_base = base;
+            reg->n_ops     = (uint32_t)num_tables;
             g_ipc.ctrl->n_registrations = idx + 1;
             g_ipc.ctrl->total_ops += (uint32_t)num_tables;
+
+            /* Register op names for this table. */
+            static const char* liba_names[] = {
+                "liba_queue_create", "liba_memory_allocate",
+                "liba_kernel_dispatch", "liba_signal_wait"
+            };
+            static const char* libb_names[] = {
+                "libb_launch_kernel", "libb_memcpy_async",
+                "libb_stream_synchronize", "libb_get_device_properties"
+            };
+            const char** op_names = NULL;
+            if (strcmp(name, "libA_hsa") == 0) op_names = liba_names;
+            else if (strcmp(name, "libB_hip") == 0) op_names = libb_names;
+            if (op_names) {
+                for (uint32_t i = 0; i < num_tables && i < 4; i++) {
+                    snprintf(g_ipc.ctrl->op_info[base + i].name,
+                             SHIM_OP_NAME_MAX, "%s", op_names[i]);
+                }
+            }
+
+            /* Enable all new ops in the name-filter bitmap. */
+            for (uint32_t i = 0; i < num_tables; i++)
+                shim_filter_set(g_ipc.ctrl->name_filter, base + i);
         }
     }
     return 0;

@@ -13,6 +13,7 @@ target_include_directories(shim_mock
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/../include
             ${CMAKE_CURRENT_SOURCE_DIR}/../mylib_dispatch
+            ${CMAKE_CURRENT_SOURCE_DIR}   # for mock_libA.h, mock_libB.h
 )
 target_compile_options(shim_mock PRIVATE -O2 -Wall -Wextra -fPIC)
 target_link_libraries(shim_mock PRIVATE mock_register pthread)
