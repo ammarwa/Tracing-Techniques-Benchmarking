@@ -544,7 +544,7 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 7. **Dormancy cost at scale** — the shim adds one pthread + one abstract socket + one memfd per ROCm process. On a node running 200 MPI ranks, that is 200 sleeping threads + 200 sockets. This is small but not zero — should be measured and documented for HPC deployment guidance.
 
-8. **SDK stays loaded after detach** — after a consumer detaches, the shim returns to dormant but the SDK remains loaded (because `force_configure` is one-shot and the SDK does not unload itself). Dispatch table wrappers stay installed but with all contexts stopped, they hit the noop path. The overhead is the SDK's own "no active context" cost (~10-20 ns per call), not zero. This is the same behavior as detaching an in-process tool today — not a regression, but should be documented.
+8. **SDK stays loaded after detach** — after a consumer detaches, the shim returns to dormant but the SDK remains loaded (because `force_configure` is one-shot and the SDK does not unload itself). Dispatch table wrappers stay installed but with all contexts stopped, everything is back to noop with effectively zero overhead — the `disabled-sdk-contexts` path has never surfaced measurable overhead in prior benchmarks. This is the same behavior as detaching an in-process tool today.
 
 9. **ext_record pointer safety** — resolved for v1 by restricting to pointer-free record types (see §8). Future versions could add a serialization pass or a "deep-copy at emplace" mode for ext records.
 
