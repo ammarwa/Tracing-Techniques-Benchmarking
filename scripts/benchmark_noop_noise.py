@@ -117,10 +117,9 @@ def main():
                               args.iters, args.runs))
 
     # Shim design (alternative architecture): no LD_PRELOAD, but mock_register
-    # dlopens libshim_mock.so which installs "atomic-load + branch + tail-call"
-    # wrappers over every table entry. profiler_functor stays NULL, so each
-    # call pays exactly the fast-path cost the shim design claims should be
-    # noise-equivalent to baseline.
+    # dlopens libshim_mock.so which installs wrappers over every table entry.
+    # op_mode stays MODE_OFF (0), so each call pays exactly the fast-path
+    # cost: one atomic load of the mode + one branch + tail-call original.
     shim = BUILD_DIR / "lib" / "libshim_mock.so"
     if shim.exists():
         cells.append(run_cell("shim (profiler=NULL)",

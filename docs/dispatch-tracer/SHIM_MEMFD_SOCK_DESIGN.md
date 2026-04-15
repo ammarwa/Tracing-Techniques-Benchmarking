@@ -19,7 +19,7 @@ It covers:
 
 Everything below assumes no sudo, no capabilities (CAP_BPF / CAP_SYS_PTRACE / etc.), no specific kernel version beyond Linux 3.17 (for `memfd_create` + `F_SEAL_*`), no binary rewriting in the default path, and works across architectures.
 
-## 1. Libraries in the process
+## 1. Libraries
 
 | Library | How it enters the process | When | Purpose |
 |---|---|---|---|
@@ -27,9 +27,10 @@ Everything below assumes no sudo, no capabilities (CAP_BPF / CAP_SYS_PTRACE / et
 | `librocprofiler-register.so.0` | `DT_NEEDED` of every runtime above | Implicitly, when the runtime loads | Stores the tables, scans for tools, decides who to hand them to |
 | **`librocprofiler-sdk-shim.so`** | **`dlopen`'d unconditionally by rocprofiler-register** when any runtime calls `register_library_api_table` | Implicitly, at first runtime registration | Wraps every table entry with `shim_wrap_<Op>`; owns the memfd+sock control channel; publishes the OOP profiler API |
 | `librocprofiler-sdk.so` | `dlopen`'d by rocprofiler-register only if an in-process SDK tool is present (user has `ROCP_TOOL_LIBRARIES=...` or a linked tool that exports `rocprofiler_configure`) | When register's scan succeeds | Does in-process profiling as today — `update_table()` wraps the shim's `functor` (not the raw runtime function) |
-| `libX-oop-tool-consumer.so` (external process, not in-target) | User's OOP profiler binary linked against `librocprofiler-shim-consumer.so` | Separate process | Connects to the target's abstract socket, receives the memfd, consumes records |
+| **`librocprofiler-shim-consumer.so`** (external process) | Linked by the OOP tool binary | Separate process, at tool launch | Provides the consumer-side API (`rocp_shim_attach`, `rocp_shim_poll`, etc.) — connects to the target's abstract socket, receives the memfd, reads records |
+| `libX-oop-tool.so` (external process) | User's OOP profiler binary, links against `librocprofiler-shim-consumer.so` | Separate process | The tool itself — calls the consumer API, processes records, outputs traces |
 
-The user's process has **only the shim plus register** in its address space by default. The SDK enters only when an in-process SDK tool is requested. The OOP consumer lives in its own process entirely.
+The user's **target process** has only the shim plus register in its address space by default. The SDK enters only when an in-process SDK tool is requested. The OOP consumer library and the user's tool binary live in a **separate process** entirely — they are never loaded into the target.
 
 ## 2. High-level component diagram
 
