@@ -35,18 +35,13 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #include "mock_register.h"
 #include "mylib_dispatch.h"
-
-/* ------------------------------------------------------------------ */
-/* Mode selectors (match SHIM_MEMFD_SOCK_DESIGN §5.1)                  */
-/* ------------------------------------------------------------------ */
-
-#define ROCP_SHIM_MODE_OFF         0
-#define ROCP_SHIM_MODE_RECORD      1
-#define ROCP_SHIM_MODE_RECORD_ARGS 2
-#define ROCP_SHIM_MODE_RECORD_FULL 3
+#include "shim_protocol.h"
+#include "shim_ipc.h"
 
 /* ------------------------------------------------------------------ */
 /* Per-op state                                                        */
@@ -54,28 +49,30 @@
 
 #define SHIM_NUM_OPS 2   /* op0 = my_traced_function, op1 = set_simulated_work_duration */
 
-/* Correlation ID triple — same shape as rocprofiler_correlation_id_t. */
-typedef struct {
-    uint64_t internal;
-    uint64_t external;
-    uint64_t ancestor;
-} shim_correlation_id_t;
-
-/* Saved original function pointers (const after install).
- * The shim wrapper tail-calls through these on the fast path. */
+/* Saved original function pointers (const after install). */
 static _Atomic(void*) g_runtime_original[SHIM_NUM_OPS] = { NULL, NULL };
 
-/* Mutable "next in chain" — starts == runtime_original; updated to
- * point at the SDK's wrapper if the SDK loads and wraps on top of us.
- * The shim's handler calls this, not runtime_original, so the layered
- * chain works: shim_wrap → sdk_wrap → real_runtime. (§8 of design) */
+/* Mutable "next in chain" for SDK layering (§8). */
 static _Atomic(void*) g_next_in_chain[SHIM_NUM_OPS]    = { NULL, NULL };
 
-/* Mode selectors — written by the consumer via shared memory.
- * For this mock we expose them as exported globals that the benchmark
- * harness can write directly. The real shim reads these from the memfd. */
-static _Atomic uint32_t g_op_mode[SHIM_NUM_OPS] = { ROCP_SHIM_MODE_OFF,
-                                                      ROCP_SHIM_MODE_OFF };
+/* IPC layer — memfd + socket + ring buffer + eventfd.
+ * Initialized in shim_register_ctor. When IPC is active, op_mode lives
+ * in the mmap'd ctrl region; when IPC init fails (e.g. memfd not
+ * supported), we fall back to local atomics for benchmark-only mode. */
+static shim_ipc_target_t g_ipc;
+static int               g_ipc_ok = 0;
+
+/* Fallback local mode (used when IPC not available, e.g. benchmark). */
+static _Atomic uint32_t g_local_op_mode[SHIM_NUM_OPS] = { ROCP_SHIM_MODE_OFF,
+                                                            ROCP_SHIM_MODE_OFF };
+
+/* Returns the op_mode slot — from shared memory if IPC is up, else local. */
+static inline _Atomic uint32_t* shim_op_mode_ptr(int op)
+{
+    if (g_ipc_ok && g_ipc.ctrl)
+        return &g_ipc.ctrl->op_mode[op];
+    return &g_local_op_mode[op];
+}
 
 /* Book-keeping. Not touched on the hot path. */
 static pthread_mutex_t g_shim_install_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -100,36 +97,91 @@ static inline void                  shim_pop_correlation (void);
 
 static _Atomic uint64_t g_records_emitted = 0;
 
+static void shim_emit_record(uint32_t slot_idx, uint32_t phase,
+                             const shim_correlation_id_t* corr)
+{
+    if (!g_ipc_ok) {
+        atomic_fetch_add_explicit(&g_records_emitted, 1, memory_order_relaxed);
+        return;
+    }
+    shim_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.tsc            = shim_rdtsc();
+    rec.kind           = 0; /* mock: single domain */
+    rec.op             = slot_idx;
+    rec.phase          = phase;
+    rec.thread_id      = (uint64_t)gettid();
+    rec.correlation_id = *corr;
+    rec.slot_idx       = slot_idx;
+    shim_ring_write(&g_ipc, &rec);
+}
+
+static int shim_check_value_filter(uint32_t slot_idx, void* packed_args)
+{
+    if (!g_ipc_ok || !g_ipc.ctrl) return 1; /* pass */
+    uint32_t count = g_ipc.ctrl->value_filter_count[slot_idx];
+    if (count == 0) return 1;
+    /* Evaluate declarative rules (§13.5 Phase 3) */
+    for (uint32_t i = 0; i < count && i < SHIM_MAX_VALUE_RULES_PER_OP; i++) {
+        const shim_value_rule_t* r = &g_ipc.ctrl->value_rules[slot_idx][i];
+        /* For the mock we only support arg_index 0 (first scalar arg).
+         * The real shim's code generator would know the struct layout. */
+        uint64_t val = 0;
+        if (packed_args && r->arg_index == 0)
+            val = *(uint64_t*)packed_args; /* type-punned for mock */
+        int pass = 0;
+        switch (r->comparison) {
+        case SHIM_CMP_EQ:      pass = (val == r->operand); break;
+        case SHIM_CMP_NEQ:     pass = (val != r->operand); break;
+        case SHIM_CMP_GT:      pass = (val >  r->operand); break;
+        case SHIM_CMP_LT:      pass = (val <  r->operand); break;
+        case SHIM_CMP_BITMASK: pass = ((val & r->operand) != 0); break;
+        default: pass = 1; break;
+        }
+        if (!pass) return 0; /* AND semantics: any rule fails → reject */
+    }
+    return 1;
+}
+
 static void shim_handle_event(uint32_t op, uint32_t mode,
                               void* orig_fn, void* packed_args)
 {
-    (void)packed_args; (void)mode;
+    /* Phase 1: name filter bitmap (§13.5) — racy but benign (see §13.5 comment) */
+    if (g_ipc_ok && g_ipc.ctrl && !shim_filter_test(g_ipc.ctrl->name_filter, op))
+        goto call_original;
 
-    shim_correlation_id_t corr = shim_push_correlation();
-    (void)corr;
+    /* Phase 3: value filter (§13.5) */
+    if (!shim_check_value_filter(op, packed_args))
+        goto call_original;
 
-    /* ENTER record (mock: just count) */
-    atomic_fetch_add_explicit(&g_records_emitted, 1, memory_order_relaxed);
+    {
+        shim_correlation_id_t corr = shim_push_correlation();
 
-    /* Call the original (or the SDK's wrapper if layered). */
-    void* next = atomic_load_explicit(&g_next_in_chain[op], memory_order_acquire);
-    if (!next) next = orig_fn;
+        /* ENTER record */
+        shim_emit_record(op, SHIM_PHASE_ENTER, &corr);
 
-    if (op == 0) {
-        /* my_traced_function — we don't have the args unpacked here in
-         * the mock because the handler is type-erased. The real shim's
-         * code generator emits a per-op handler that knows the signature.
-         * For the mock we just call through with dummy args to keep the
-         * calling pattern realistic. */
-        ((orig_op0_t)next)(0, 0, 0.0, NULL);
-    } else if (op == 1) {
-        ((orig_op1_t)next)(0);
+        /* Call through the chain */
+        void* next = atomic_load_explicit(&g_next_in_chain[op],
+                                          memory_order_acquire);
+        if (!next) next = orig_fn;
+
+        if (op == 0)
+            ((orig_op0_t)next)(0, 0, 0.0, NULL);
+        else if (op == 1)
+            ((orig_op1_t)next)(0);
+
+        /* EXIT record */
+        shim_emit_record(op, SHIM_PHASE_EXIT, &corr);
+
+        shim_pop_correlation();
     }
+    return;
 
-    /* EXIT record (mock: just count) */
-    atomic_fetch_add_explicit(&g_records_emitted, 1, memory_order_relaxed);
-
-    shim_pop_correlation();
+call_original:
+    if (op == 0)
+        ((orig_op0_t)orig_fn)(0, 0, 0.0, NULL);
+    else if (op == 1)
+        ((orig_op1_t)orig_fn)(0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -144,7 +196,7 @@ static void shim_handle_event(uint32_t op, uint32_t mode,
 
 static void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 {
-    uint32_t mode = atomic_load_explicit(&g_op_mode[0], memory_order_acquire);
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(0), memory_order_acquire);
     if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
         void* orig = atomic_load_explicit(&g_runtime_original[0],
                                           memory_order_acquire);
@@ -158,7 +210,7 @@ static void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
 
 static void shim_wrap_op1(unsigned int us)
 {
-    uint32_t mode = atomic_load_explicit(&g_op_mode[1], memory_order_acquire);
+    uint32_t mode = atomic_load_explicit(shim_op_mode_ptr(1), memory_order_acquire);
     if (__builtin_expect(mode == ROCP_SHIM_MODE_OFF, 1)) {
         void* orig = atomic_load_explicit(&g_runtime_original[1],
                                           memory_order_acquire);
@@ -254,7 +306,7 @@ int shim_set_op_mode(int op, uint32_t mode)
 {
     if (op < 0 || op >= SHIM_NUM_OPS) return -1;
     if (mode > ROCP_SHIM_MODE_RECORD_FULL) return -1;
-    atomic_store_explicit(&g_op_mode[op], mode, memory_order_release);
+    atomic_store_explicit(shim_op_mode_ptr(op), mode, memory_order_release);
     return 0;
 }
 
@@ -262,7 +314,7 @@ __attribute__((visibility("default")))
 uint32_t shim_get_op_mode(int op)
 {
     if (op < 0 || op >= SHIM_NUM_OPS) return ROCP_SHIM_MODE_OFF;
-    return atomic_load_explicit(&g_op_mode[op], memory_order_acquire);
+    return atomic_load_explicit(shim_op_mode_ptr(op), memory_order_acquire);
 }
 
 /* Returns the runtime-original function pointer (const after install).
@@ -371,5 +423,29 @@ uint64_t shim_current_internal_id(void)
 __attribute__((constructor))
 static void shim_register_ctor(void)
 {
+    /* Initialize IPC (memfd + socket + ring + eventfd).
+     * If this fails (e.g. old kernel without memfd_create), the shim
+     * falls back to local-mode with g_local_op_mode — still works for
+     * the benchmark's fast-path measurement, just no IPC. */
+    if (shim_ipc_init(&g_ipc) == 0) {
+        g_ipc_ok = 1;
+        /* Register mylib as a table in the memfd header (§13.6). */
+        if (g_ipc.ctrl->n_registrations < SHIM_MAX_REGISTRATIONS) {
+            uint32_t idx = g_ipc.ctrl->n_registrations;
+            shim_table_registration_t* reg = &g_ipc.ctrl->registrations[idx];
+            snprintf(reg->name, SHIM_TABLE_NAME_MAX, "mylib");
+            reg->lib_instance  = 0;
+            reg->major_version = 1;
+            reg->minor_version = 0;
+            reg->slot_base     = 0;
+            reg->n_ops         = SHIM_NUM_OPS;
+            g_ipc.ctrl->n_registrations = idx + 1;
+            g_ipc.ctrl->total_ops       = SHIM_NUM_OPS;
+            /* Enable all ops in the name-filter bitmap by default */
+            for (uint32_t i = 0; i < SHIM_NUM_OPS; i++)
+                shim_filter_set(g_ipc.ctrl->name_filter, i);
+        }
+    }
+
     mock_register_set_api_table_fn = &mock_sdk_set_api_table;
 }
