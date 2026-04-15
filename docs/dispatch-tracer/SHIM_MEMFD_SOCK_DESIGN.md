@@ -218,8 +218,10 @@ connect("\0rocprof-shim_<target_pid>")
 recv msghdr:
   verify header magic "SHIM"
   extract memfd from SCM_RIGHTS
-close(sock)  ← optional; socket is only needed
-              for the handoff and rare queries
+/* Consumer MUST keep the socket open for the session lifetime.
+ * The shim's bg thread monitors it via poll(POLLHUP) to detect
+ * consumer death and zero all op_mode slots within µs. Closing
+ * the socket is interpreted as consumer crash/detach. */
 
 mmap(memfd, PROT_READ|PROT_WRITE, MAP_SHARED)
   → consumer_ctrl
@@ -329,18 +331,29 @@ Reads and writes to the body proceed with normal acquire/release atomics on `hea
 
 **Mutable control fields and their publication protocol**: beyond `op_mode`, several fields are consumer-written and hot-path-read at runtime:
 
-- `name_filter[D]` bitmaps (§13.5 Phase 1)
+- `name_filter[D]` bitmaps — **domain-wide**, not per-op (§13.5 Phase 1)
 - `value_filter_count[Op]` and per-op rule arrays (§13.5 Phase 3)
 - `arg_policy[Op]` (§7B.4)
 
-These are **not** const-after-init. A consumer reconfiguring filters mid-session could race with the hot path reading a partially-updated bitmap or rule array. The publication protocol is **install-while-off**:
+These are **not** const-after-init. A consumer reconfiguring filters mid-session could race with the hot path. The publication protocols differ by field scope:
+
+**Per-op fields** (`value_filter_count[Op]`, rule arrays, `arg_policy[Op]`): install-while-off protocol:
 
 1. Consumer sets `op_mode[Op] = ROCP_SHIM_MODE_OFF` (release store).
-2. Consumer updates `name_filter`, `value_filter_count`, rule arrays, `arg_policy` for that op. These are plain (non-atomic) writes — safe because the hot path skips this op entirely while mode is OFF.
-3. Consumer sets `op_mode[Op] = ROCP_SHIM_MODE_RECORD` (release store). The hot path's acquire-load of `op_mode` pairs with this release, guaranteeing all filter/rule writes from step 2 are visible before the first record is emitted.
+2. Consumer updates the per-op fields. These are plain (non-atomic) writes — safe because the hot path skips this op entirely while mode is OFF.
+3. Consumer sets `op_mode[Op] = ROCP_SHIM_MODE_RECORD` (release store). The hot path's acquire-load of `op_mode` pairs with this release, guaranteeing all writes from step 2 are visible.
 4. Consumer bumps `gen_counter`.
 
-For **initial attach** (all ops start at MODE_OFF), this is automatic — the consumer writes all filters before setting any mode to non-OFF. For **mid-session reconfigure**, the consumer must briefly disable the op (step 1), update, then re-enable (step 3). The brief disable window (< 1 µs) means at most a few calls on fast-path threads skip tracing during the transition — acceptable for a profiling tool.
+**Domain-wide fields** (`name_filter[D]` bitmap): the bitmap is shared across all ops in a domain. Turning off one op does not quiesce other active ops that read the same bitmap word. The install-while-off protocol is insufficient here. Instead, bitmap updates use **atomic word-level updates**:
+
+- Each `name_filter[D]` is stored as an array of `_Atomic uint64_t` words (one bit per op, 64 ops per word).
+- To enable/disable an op in the bitmap, the consumer uses `atomic_fetch_or` or `atomic_fetch_and` on the relevant word. These are single-instruction on x86-64 (`lock or` / `lock and`) and guarantee no torn reads.
+- The hot path reads the bitmap word with `atomic_load_explicit(..., memory_order_relaxed)` — no acquire needed because the bitmap is independent of other fields (it's a standalone accept/reject gate).
+- Cost: same as before (~0.3 ns for one cache-line-resident atomic load + bit test).
+
+For **initial attach** (all ops start at MODE_OFF), the consumer writes the full bitmap before enabling any op — no race.
+
+For **mid-session reconfigure** of per-op fields, the brief disable window (< 1 µs) means at most a few calls skip tracing — acceptable for a profiling tool.
 
 All other header fields (magic, version, pid, start_time, registrations[], ring layout) are genuinely const-after-init.
 
@@ -942,7 +955,7 @@ close(memfd)
 | Consumer clean exit without DETACH | Same POLLHUP mechanism — TCP-like close propagates to the server side. Slots zeroed within µs. | N/A |
 | Target SIGKILL | memfd refcount drops, anonymous memory freed. eventfd refcount drops. abstract socket dies with bound-socket close. | Consumer's mmap becomes zero-filled (kernel unmaps the backing pages). Consumer's `poll(eventfd)` returns EPOLLHUP. Consumer detects and exits. |
 
-**Consumer-liveness detection is load-bearing for correctness.** The target reads op_mode values and ring-buffer tail from shared memory; if the consumer dies, the modes remain non-OFF and the shim keeps writing records nobody reads. The primary mechanism is `POLLHUP` on the control socket (µs-scale detection); the bg thread keeps the socket fd open for exactly this purpose even after the handshake completes. Fallback for the case where the consumer intentionally closed the socket post-handoff: a `liveness` counter in the memfd header, polled at 1 Hz by the bg thread, with all slots zeroed on staleness. Both mechanisms are part of the shim's design, not post-hoc.
+**Consumer-liveness detection is load-bearing for correctness.** The target reads `op_mode` values and ring-buffer tail from shared memory; if the consumer dies, the modes remain non-OFF and the shim keeps writing records nobody reads. The detection mechanism is `POLLHUP` on the control socket (µs-scale detection). The consumer **must** keep the control socket open for the entire session lifetime (§4); closing the socket is treated as detach/crash and triggers immediate zeroing of all `op_mode` slots. There is no fallback liveness counter — the socket is the sole liveness signal, which keeps the contract simple and the detection fast.
 
 ## 11. Ring buffer protocol
 
@@ -1282,7 +1295,14 @@ If no value filter is set for an op, Phase 3 is skipped.
 ```c
 static void shim_wrap_<domain>_<op>(args...)
 {
-    /* Phase 1: name/type bitmap (resolved at install time). */
+    /* Phase 1: name/type bitmap (resolved at install time).
+     * Intentionally reads BEFORE the op_mode acquire-load for cheapest
+     * possible rejection of uninteresting ops. This is a racy read
+     * during mid-session reconfigure: a stale "1" bit causes one extra
+     * record (benign), a stale "0" bit drops one event (acceptable for
+     * profiling). The install-while-off protocol (§5) guarantees that
+     * by the time op_mode transitions OFF→RECORD, the bitmap is fully
+     * written — so the race window is only during the brief OFF gap. */
     if (!filter_bitmap_test(g_ctrl->name_filter[DOMAIN], OP))
         goto fast_path;
 
@@ -1435,7 +1455,6 @@ src/
 │   │   ├── shim_ring.c           # Ring-buffer producer
 │   │   ├── shim_ompt.c           # ompt_start_tool + ompt_set_callback bridge
 │   │   ├── shim_abi_query.c      # rocprofiler_shim_get_runtime_original etc.
-│   │   ├── shim_heartbeat.c      # Consumer-liveness watchdog
 │   │   └── shim_cleanup.c        # atexit + signal cleanup
 │   └── tests/
 │       ├── noise_floor_test.c    # §15.1
