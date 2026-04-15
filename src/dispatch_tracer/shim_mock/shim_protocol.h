@@ -27,6 +27,18 @@
 /* ------------------------------------------------------------------ */
 
 #define SHIM_RECORD_ARG_BYTES 128
+#define SHIM_OP_NAME_MAX      64
+
+/* Per-op metadata (name + arg count). Stored in the memfd header
+ * alongside registrations, so the consumer can print meaningful
+ * function names and decode args without linking the target's headers. */
+typedef struct {
+    char     name[SHIM_OP_NAME_MAX];
+    uint32_t n_args;
+    uint32_t arg_total_bytes;   /* sizeof the packed arg struct */
+} shim_op_info_t;
+
+#define SHIM_MAX_OP_INFOS SHIM_MAX_TOTAL_OPS
 
 typedef struct {
     uint64_t internal;
@@ -149,6 +161,10 @@ typedef struct {
 
     /* Per-op arg policy */
     uint32_t         arg_policy[SHIM_MAX_TOTAL_OPS];
+
+    /* Per-op metadata — function names + arg layout info.
+     * Consumer reads this to print meaningful names and decode args. */
+    shim_op_info_t   op_info[SHIM_MAX_OP_INFOS];
 
     /* Ring buffer follows at ring_offset */
 } shim_ctrl_t;

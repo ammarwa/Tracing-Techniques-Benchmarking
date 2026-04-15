@@ -22,21 +22,46 @@
 static volatile int g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
+/* Global ctrl pointer for op_info name lookup inside the callback. */
+static shim_ctrl_t* g_con_ctrl = NULL;
+
+/* Packed arg structs — same as in shim_mock.c. In the real shim these
+ * come from rocprofiler-sdk's generated headers. */
+typedef struct { int a1; uint64_t a2; double a3; void* a4; } packed_op0_args_t;
+typedef struct { unsigned int us; } packed_op1_args_t;
+
 static void on_record(const shim_record_t* rec, void* user_data)
 {
     uint64_t* count = (uint64_t*)user_data;
     (*count)++;
-    if (*count <= 20 || (*count % 10000) == 0) {
-        printf("[tsc=%" PRIu64 "] %s  op=%u  tid=%" PRIu64
-               "  corr={i=%" PRIu64 " e=%" PRIu64 " a=%" PRIu64 "}\n",
-               rec->tsc,
-               rec->phase == SHIM_PHASE_ENTER ? "ENTER" :
-               rec->phase == SHIM_PHASE_EXIT  ? "EXIT " : "UNRCH",
-               rec->op, rec->thread_id,
-               rec->correlation_id.internal,
-               rec->correlation_id.external,
-               rec->correlation_id.ancestor);
+    if (*count > 40 && (*count % 10000) != 0) return;
+
+    const char* name = "?";
+    if (g_con_ctrl && rec->op < g_con_ctrl->total_ops)
+        name = g_con_ctrl->op_info[rec->op].name;
+
+    const char* phase = rec->phase == SHIM_PHASE_ENTER ? "ENTER" :
+                        rec->phase == SHIM_PHASE_EXIT  ? "EXIT " : "UNRCH";
+
+    printf("[tsc=%" PRIu64 "] %s  %s  tid=%" PRIu64
+           "  corr={i=%" PRIu64 " e=%" PRIu64 " a=%" PRIu64 "}",
+           rec->tsc, phase, name, rec->thread_id,
+           rec->correlation_id.internal,
+           rec->correlation_id.external,
+           rec->correlation_id.ancestor);
+
+    /* Print args if present (ENTER records only, for readability). */
+    if (rec->phase == SHIM_PHASE_ENTER && rec->arg_bytes > 0) {
+        if (rec->op == 0 && rec->arg_bytes >= sizeof(packed_op0_args_t)) {
+            const packed_op0_args_t* a = (const packed_op0_args_t*)rec->args;
+            printf("  args(a1=%d, a2=%" PRIu64 ", a3=%.1f, a4=%p)",
+                   a->a1, a->a2, a->a3, a->a4);
+        } else if (rec->op == 1 && rec->arg_bytes >= sizeof(packed_op1_args_t)) {
+            const packed_op1_args_t* a = (const packed_op1_args_t*)rec->args;
+            printf("  args(us=%u)", a->us);
+        }
     }
+    printf("\n");
 }
 
 int main(int argc, char** argv)
@@ -56,6 +81,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "attach(%d) failed\n", target);
         return 1;
     }
+
+    g_con_ctrl = con.ctrl;
 
     /* Print registrations (§13.6) */
     printf("=== Attached to pid=%u, %u registrations, %u total_ops ===\n",

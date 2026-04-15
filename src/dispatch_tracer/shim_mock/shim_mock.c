@@ -82,6 +82,19 @@ static int             g_shim_installed[SHIM_NUM_OPS] = { 0, 0 };
 typedef void (*orig_op0_t)(int, uint64_t, double, void*);
 typedef void (*orig_op1_t)(unsigned int);
 
+/* Packed arg structs for the two mock ops — matches §7B.1.
+ * In the real shim these are generated from the SDK's arg metadata. */
+typedef struct {
+    int      a1;
+    uint64_t a2;
+    double   a3;
+    void*    a4;   /* pointer value only — cannot be dereferenced OOP */
+} packed_op0_args_t;
+
+typedef struct {
+    unsigned int us;
+} packed_op1_args_t;
+
 /* ------------------------------------------------------------------ */
 /* Forward declarations for correlation helpers (defined below).       */
 /* ------------------------------------------------------------------ */
@@ -98,7 +111,8 @@ static inline void                  shim_pop_correlation (void);
 static _Atomic uint64_t g_records_emitted = 0;
 
 static void shim_emit_record(uint32_t slot_idx, uint32_t phase,
-                             const shim_correlation_id_t* corr)
+                             const shim_correlation_id_t* corr,
+                             const void* packed_args, uint32_t arg_bytes)
 {
     if (!g_ipc_ok) {
         atomic_fetch_add_explicit(&g_records_emitted, 1, memory_order_relaxed);
@@ -113,6 +127,12 @@ static void shim_emit_record(uint32_t slot_idx, uint32_t phase,
     rec.thread_id      = (uint64_t)gettid();
     rec.correlation_id = *corr;
     rec.slot_idx       = slot_idx;
+    if (packed_args && arg_bytes > 0) {
+        uint32_t copy = arg_bytes < SHIM_RECORD_ARG_BYTES
+                      ? arg_bytes : SHIM_RECORD_ARG_BYTES;
+        memcpy(rec.args, packed_args, copy);
+        rec.arg_bytes = copy;
+    }
     shim_ring_write(&g_ipc, &rec);
 }
 
@@ -144,44 +164,52 @@ static int shim_check_value_filter(uint32_t slot_idx, void* packed_args)
 }
 
 static void shim_handle_event(uint32_t op, uint32_t mode,
-                              void* orig_fn, void* packed_args)
+                              void* orig_fn,
+                              const void* packed_args, uint32_t arg_bytes)
 {
-    /* Phase 1: name filter bitmap (§13.5) — racy but benign (see §13.5 comment) */
+    (void)mode;
+    /* Phase 1: name filter bitmap (§13.5) — racy but benign */
     if (g_ipc_ok && g_ipc.ctrl && !shim_filter_test(g_ipc.ctrl->name_filter, op))
         goto call_original;
 
     /* Phase 3: value filter (§13.5) */
-    if (!shim_check_value_filter(op, packed_args))
+    if (!shim_check_value_filter(op, (void*)packed_args))
         goto call_original;
 
     {
         shim_correlation_id_t corr = shim_push_correlation();
 
-        /* ENTER record */
-        shim_emit_record(op, SHIM_PHASE_ENTER, &corr);
+        /* ENTER record — includes typed arg payload */
+        shim_emit_record(op, SHIM_PHASE_ENTER, &corr, packed_args, arg_bytes);
 
         /* Call through the chain */
         void* next = atomic_load_explicit(&g_next_in_chain[op],
                                           memory_order_acquire);
         if (!next) next = orig_fn;
 
-        if (op == 0)
-            ((orig_op0_t)next)(0, 0, 0.0, NULL);
-        else if (op == 1)
-            ((orig_op1_t)next)(0);
+        if (op == 0) {
+            const packed_op0_args_t* a = (const packed_op0_args_t*)packed_args;
+            ((orig_op0_t)next)(a->a1, a->a2, a->a3, a->a4);
+        } else if (op == 1) {
+            const packed_op1_args_t* a = (const packed_op1_args_t*)packed_args;
+            ((orig_op1_t)next)(a->us);
+        }
 
         /* EXIT record */
-        shim_emit_record(op, SHIM_PHASE_EXIT, &corr);
+        shim_emit_record(op, SHIM_PHASE_EXIT, &corr, packed_args, arg_bytes);
 
         shim_pop_correlation();
     }
     return;
 
 call_original:
-    if (op == 0)
-        ((orig_op0_t)orig_fn)(0, 0, 0.0, NULL);
-    else if (op == 1)
-        ((orig_op1_t)orig_fn)(0);
+    if (op == 0) {
+        const packed_op0_args_t* a = (const packed_op0_args_t*)packed_args;
+        ((orig_op0_t)orig_fn)(a->a1, a->a2, a->a3, a->a4);
+    } else if (op == 1) {
+        const packed_op1_args_t* a = (const packed_op1_args_t*)packed_args;
+        ((orig_op1_t)orig_fn)(a->us);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -205,7 +233,8 @@ static void shim_wrap_op0(int a1, uint64_t a2, double a3, void* a4)
     }
     void* orig = atomic_load_explicit(&g_runtime_original[0],
                                       memory_order_acquire);
-    shim_handle_event(0, mode, orig, NULL);
+    packed_op0_args_t args = { a1, a2, a3, a4 };
+    shim_handle_event(0, mode, orig, &args, sizeof(args));
 }
 
 static void shim_wrap_op1(unsigned int us)
@@ -219,7 +248,8 @@ static void shim_wrap_op1(unsigned int us)
     }
     void* orig = atomic_load_explicit(&g_runtime_original[1],
                                       memory_order_acquire);
-    shim_handle_event(1, mode, orig, NULL);
+    packed_op1_args_t args = { us };
+    shim_handle_event(1, mode, orig, &args, sizeof(args));
 }
 
 /* ------------------------------------------------------------------ */
@@ -441,6 +471,17 @@ static void shim_register_ctor(void)
             reg->n_ops         = SHIM_NUM_OPS;
             g_ipc.ctrl->n_registrations = idx + 1;
             g_ipc.ctrl->total_ops       = SHIM_NUM_OPS;
+            /* Register op metadata — names + arg sizes */
+            snprintf(g_ipc.ctrl->op_info[0].name, SHIM_OP_NAME_MAX,
+                     "my_traced_function");
+            g_ipc.ctrl->op_info[0].n_args = 4;
+            g_ipc.ctrl->op_info[0].arg_total_bytes = sizeof(packed_op0_args_t);
+
+            snprintf(g_ipc.ctrl->op_info[1].name, SHIM_OP_NAME_MAX,
+                     "set_simulated_work_duration");
+            g_ipc.ctrl->op_info[1].n_args = 1;
+            g_ipc.ctrl->op_info[1].arg_total_bytes = sizeof(packed_op1_args_t);
+
             /* Enable all ops in the name-filter bitmap by default */
             for (uint32_t i = 0; i < SHIM_NUM_OPS; i++)
                 shim_filter_set(g_ipc.ctrl->name_filter, i);
