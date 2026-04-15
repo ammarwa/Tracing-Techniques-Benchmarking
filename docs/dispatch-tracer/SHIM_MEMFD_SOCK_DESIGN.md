@@ -462,12 +462,7 @@ Same IPC primitives as the earlier design — these are transport-layer choices 
 - Buffer record emplace path (writes to buffer's backing store — if that's a memfd mmap, records go there automatically)
 - Record format (`buffer_tracing_*_record_t` structs are unchanged)
 
-**Estimated SDK changes:** The scope depends on the approach to external buffer storage:
-
-- **If the SDK's `ring_buffer` class can accept an externally-provided mmap region** (new `init_external(void* ptr, size_t size)` path, suppress `munmap` in `destroy()`): ~300-500 LOC touching the buffer infrastructure (`record_header_buffer`, `ring_buffer`, `buffer::instance`). The double-buffering scheme needs rethinking since you cannot double-buffer a single shared memfd region.
-- **Alternative (watermark-callback copy):** The shim's `tool_initialize` creates a normal SDK buffer, and the SDK's watermark callback copies records from the SDK's internal buffer into the shim's memfd ring. This avoids any change to the `ring_buffer` class but adds one extra copy. SDK changes: ~100-150 LOC (watermark callback wiring only).
-
-The alternative is recommended for v1 — minimal SDK disruption, same functional result. The direct external-storage path is a v2 optimization that eliminates the copy.
+**Estimated SDK changes:** ~100-200 LOC. When `force_configure` comes through the shim, the SDK detects the shim client and automatically uses the shim's internal ring buffer for buffer operations. No new buffer API needed — the existing `create_buffer` path internally routes to the shim's ring. The SDK already has the concept of "where do buffer records go"; the only change is adding the shim's ring as a destination when the shim is the configuring client.
 
 ## 14. What changes in rocprofiler-register
 
@@ -525,7 +520,7 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 2. **In-process + OOP coexistence** — if an in-process tool already called `force_configure`, the OOP consumer gets `CONFIGURATION_LOCKED`. A future enhancement could allow the SDK to accept multiple clients (each with its own buffer). This requires SDK-side changes beyond v1.
 
-3. **SDK buffer backing store mechanism** — the exact API for the shim to provide its memfd ring as the SDK's buffer storage needs detailed SDK-side design. Options: a new `rocprofiler_create_buffer_with_external_memory()` variant, or the shim's `tool_initialize` pre-allocates the memory and passes it through the existing `create_buffer` with a convention.
+3. ~~**SDK buffer backing store mechanism**~~ — **not an issue.** No new API needed. When `force_configure` is called through the shim, the SDK detects the shim client and automatically uses the shim's internal ring buffer for its buffer operations. The existing `create_buffer` API works as-is — the SDK internally routes to the shim's ring when it knows the configuration came through the shim.
 
 4. **Record batching and flow control** — the shim's internal watermark vs the consumer's watermark creates a two-tier buffering system. Tuning guidance (watermark values, batch sizes, socket buffer sizes) is implementation-time work.
 
