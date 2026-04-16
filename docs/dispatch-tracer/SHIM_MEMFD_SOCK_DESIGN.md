@@ -92,7 +92,7 @@ gcc my_tool.c -lroc-shim-consumer -o my_oop_tool
 | `libroc-shim.so` | Target | rocprofiler-register (unconditional `dlopen`) | IPC channel + ring buffers + API proxy to SDK |
 | `libroc-shim-consumer.so` | Consumer | Consumer tool (linked at build time) | Exports `rocprofiler_*` stubs that marshall over socket |
 | `librocprofiler-register.so` | Target | DT_NEEDED by HIP/HSA/RCCL/OpenMP runtimes | Stores dispatch tables, loads shim + SDK |
-| `librocprofiler-sdk.so` | Target | Loaded by shim via `force_configure` at consumer attach | Does all profiling — wraps tables, generates records |
+| `librocprofiler-sdk.so` | Target | Loaded via `force_configure` at consumer attach (standard SDK initialization path) | Does all profiling — wraps tables, generates records |
 
 The consumer process has **only `libroc-shim-consumer.so`** — no SDK, no register, no shim. It speaks the SDK's API but links a thin socket-proxy library.
 
@@ -189,7 +189,7 @@ struct shim_response {
 | `rocprofiler_configure_buffer_tracing_service` | consumer → shim → SDK | Enables domain+ops for context+buffer |
 | `rocprofiler_start_context` | consumer → shim → SDK | SDK starts wrapping, records start flowing |
 | `rocprofiler_stop_context` | consumer → shim → SDK | SDK stops, wrappers go noop |
-| `rocprofiler_flush_buffer` | consumer → shim → SDK | Shim drains ring → socket → consumer buffer |
+| `rocprofiler_flush_buffer` | consumer → shim → SDK | Flushes the consumer's user buffer. Does NOT flush the shim's internal ring (controlled by shim watermark only). |
 | `rocprofiler_destroy_buffer` | consumer → shim → SDK | Shim tears down internal ring |
 | `rocprofiler_destroy_context` | consumer → shim → SDK | SDK cleanup |
 | `tool_initialize` callback | shim → consumer | Relayed during force_configure |
@@ -200,7 +200,7 @@ struct shim_response {
 
 - Callback tracing services (inherently in-process, not supported OOP)
 - `rocprofiler_iterate_*` introspection APIs (consumer can use these locally against SDK headers)
-- PC sampling, counter collection (future scope)
+- PC sampling, counter collection, ATT service (future scope)
 
 ## 6. The tool_initialize relay
 
@@ -377,13 +377,8 @@ stop_context(ctx)
                                  ← STOP_RESP {OK}
 
 flush_buffer(buf)
-  → FLUSH_BUFFER {buf}
-                                 drain remaining records
-                                 from shim ring → socket
-                                 ← FLUSH_RESP {n_records}
-
-  recv final records
-  consumer callback fires
+  → flushes consumer's user buffer locally
+    (does NOT affect shim internal ring)
 
 destroy_buffer(buf)
   → DESTROY_BUFFER {buf}
@@ -448,7 +443,7 @@ Same IPC primitives as the earlier design — these are transport-layer choices 
 
 | Change | Where | Scope |
 |---|---|---|
-| Accept external buffer backing store | `force_configure` path / buffer creation | When the configuring tool is the shim, the SDK uses the shim's memfd-backed ring as the buffer's storage instead of allocating its own memory. The emplace path is unchanged — it just writes to different memory. |
+| Use shim ring as buffer destination | `force_configure` path | When the configuring client is the shim, the SDK automatically routes buffer writes to the shim's internal ring. No new API needed — the SDK detects the shim client and uses the ring. |
 | Detect shim presence | `force_configure` path | SDK detects that the tool came through the shim (e.g., a flag in the tool_configure result, or the shim sets an env var). |
 | Call shim watermark callback | Buffer watermark path | The shim's callback is wired as the buffer's watermark callback via standard `create_buffer` API. No special path needed if the SDK already supports caller-provided watermark callbacks. |
 
@@ -457,7 +452,7 @@ Same IPC primitives as the earlier design — these are transport-layer choices 
 - Dispatch table wrapping (SDK already does this)
 - Correlation IDs (SDK already generates them)
 - Arg serialization (SDK already does this for buffer tracing)
-- `force_configure` semantics (already public API, one-shot)
+- `force_configure` semantics (already public API, supports multiple clients)
 - Context/service configuration logic
 - Buffer record emplace path (writes to buffer's backing store — if that's a memfd mmap, records go there automatically)
 - Record format (`buffer_tracing_*_record_t` structs are unchanged)
@@ -530,9 +525,11 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 7. **Dormancy cost at scale** — the shim adds one pthread + one abstract socket + one memfd per ROCm process. On a node running 200 MPI ranks, that is 200 sleeping threads + 200 sockets. This is small but not zero — measuring and documenting the overhead at scale is tracked as future work in the rocprofiler-sdk benchmarking suite.
 
-8. **SDK stays loaded after detach** — after a consumer detaches, the shim returns to dormant but the SDK remains loaded (because `force_configure` is one-shot and the SDK does not unload itself). Dispatch table wrappers stay installed but with all contexts stopped, everything is back to noop with effectively zero overhead — the `disabled-sdk-contexts` path has never surfaced measurable overhead in prior benchmarks. This is the same behavior as detaching an in-process tool today.
+8. **SDK stays loaded after detach** — after a consumer detaches, the shim returns to dormant but the SDK remains loaded (the SDK does not unload itself). Dispatch table wrappers stay installed but with all contexts stopped, everything is back to noop with effectively zero overhead — the `disabled-sdk-contexts` path has never surfaced measurable overhead in prior benchmarks. This is the same behavior as detaching an in-process tool today.
 
 9. ~~**ext_record pointer safety**~~ — **not an issue.** The SDK's buffer tracing already deep-copies args at emplace time — the `ext_record_t` structs in the buffer contain fully resolved values, not live pointers into the target's stack. Since the SDK handles all record generation and the shim transports SDK-native records as-is, pointer safety is handled by the SDK's existing deep-copy mechanism. No restriction to pointer-free record types is needed.
+
+10. **Future service proxying** — v1 proxies only buffered tracing services (API tracing, kernel dispatch). PC sampling, counter collection, and ATT (Advanced Thread Trace) are deferred to future scope. Each has distinct data-volume and latency characteristics that may require dedicated ring buffer policies or separate transport channels. ATT in particular generates high-volume stream data that may benefit from direct ring sharing rather than socket delivery. The shim's architecture (per-buffer rings, extensible message protocol) is designed to accommodate these without v1 changes, but the specific proxying strategy for each service is an open design question for v2.
 
 ## 18. Integration risks
 
@@ -540,13 +537,13 @@ The consumer includes standard `rocprofiler-sdk` headers. No shim-specific heade
 
 The design requires register to unconditionally `dlopen` the shim. Today register only loads libraries when a tool is detected or `ROCPROFILER_REGISTER_FORCE_LOAD` is set. This is a deliberate behavioral change that needs register maintainer buy-in. `ROC_SHIM_DISABLE=1` provides a kill switch.
 
-### 18.2 force_configure one-shot semantics
+### 18.2 force_configure multi-client semantics
 
 rocprofiler-sdk already supports multiple clients calling `force_configure`, each with their own contexts and buffers. The shim is just a messenger relaying `force_configure` as another client — it does not compete with in-process tools. Both can coexist, each writing to their own buffers.
 
 ### 18.3 SDK buffer storage externalization
 
-The SDK must accept the shim's memfd ring as the buffer backing store. If the SDK's buffer implementation tightly couples allocation with its internal memory manager, this may require refactoring the buffer creation path. Estimated scope: small if the SDK already supports caller-provided memory; moderate if not.
+The SDK must accept the shim's memfd ring as the buffer backing store. No new API is needed — when `force_configure` is called through the shim, the SDK detects the shim client and automatically routes buffer writes to the shim's ring. The existing `create_buffer` API works as-is; the only internal change is adding the shim's ring as a buffer destination when the SDK knows the configuration came through the shim.
 
 ### 18.4 Socket protocol stability
 

@@ -1,61 +1,50 @@
 /*
- * shim_ipc.h — memfd+sock IPC layer for the shim mock.
+ * shim_ipc.h — Low-level IPC helpers for the shim mock.
  *
- * Target-side: shim_ipc_init() creates the memfd, maps it, seals it,
- *   binds the abstract socket, and spawns the bg thread.
- * Consumer-side: shim_consumer_attach() connects, receives the memfd
- *   via SCM_RIGHTS, mmaps it, and returns a handle.
+ * Provides abstract socket, SCM_RIGHTS fd passing, SO_PEERCRED auth,
+ * message framing, and ring buffer operations.
  *
- * Matches SHIM_MEMFD_SOCK_DESIGN.md §4, §5, §6, §10.4, §11.
+ * Matches SHIM_MEMFD_SOCK_DESIGN.md §11, §12.
  */
 #ifndef SHIM_IPC_H
 #define SHIM_IPC_H
 
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "shim_protocol.h"
 
-/* Default ring size (overridden by ROCP_SHIM_RING_SIZE_MB env var). */
-#define SHIM_DEFAULT_RING_SIZE (1 << 20) /* 1 MiB */
+/* ---- Message framing ---- */
 
-/* ---- Target-side (in-process shim) ---- */
+int shim_msg_send(int sock, const shim_msg_header_t* hdr,
+                  const void* payload, size_t payload_size);
+int shim_msg_recv(int sock, shim_msg_header_t* hdr,
+                  void* payload, size_t max_payload);
 
-typedef struct {
-    shim_ctrl_t*       ctrl;         /* mmap'd memfd */
-    shim_ring_header_t* ring_hdr;    /* points into the mmap after ctrl */
-    uint8_t*           ring_data;    /* record data region */
-    int                memfd;
-    int                eventfd;
-    int                listen_sock;
-    int                client_sock;  /* current consumer's socket (-1 if none) */
-    pthread_t          bg_thread;
-    int                bg_thread_ok;
-    _Atomic int        shutdown;
-} shim_ipc_target_t;
-
-int  shim_ipc_init(shim_ipc_target_t* ipc);
-void shim_ipc_destroy(shim_ipc_target_t* ipc);
-
-/* Write a record to the ring. Returns 0 on success, -1 if ring full (dropped). */
-int  shim_ring_write(shim_ipc_target_t* ipc, const shim_record_t* rec);
-
-/* ---- Consumer-side (external process) ---- */
+/* ---- Ring buffer ---- */
 
 typedef struct {
-    shim_ctrl_t*       ctrl;         /* mmap'd memfd (shared with target) */
-    shim_ring_header_t* ring_hdr;
-    uint8_t*           ring_data;
-    int                memfd;
-    int                eventfd;
-    int                sock;
-    size_t             mmap_size;
-} shim_ipc_consumer_t;
+    shim_ring_header_t* hdr;
+    uint8_t*            data;
+    size_t              data_size;
+    int                 memfd;
+    pthread_spinlock_t  write_lock;
+    int                 lock_initialized;
+} shim_ring_t;
 
-int  shim_consumer_attach(pid_t target_pid, shim_ipc_consumer_t* out);
-void shim_consumer_detach(shim_ipc_consumer_t* con);
+int  shim_ring_create(shim_ring_t* ring, size_t capacity);
+void shim_ring_destroy(shim_ring_t* ring);
+int  shim_ring_write(shim_ring_t* ring, const void* record, size_t size);
+int  shim_ring_read(shim_ring_t* ring, void* out, size_t record_size);
+size_t shim_ring_available(shim_ring_t* ring);
 
-/* Read records from the ring. Calls cb for each. Returns count read. */
-typedef void (*shim_record_cb_t)(const shim_record_t* rec, void* user_data);
-int  shim_consumer_poll(shim_ipc_consumer_t* con,
-                        shim_record_cb_t cb, void* user_data,
-                        int timeout_ms);
+/* ---- SCM_RIGHTS ---- */
+
+int shim_send_fd(int sock, int fd, const void* data, size_t len);
+int shim_recv_fd(int sock, int* fd, void* data, size_t len);
+
+/* ---- Misc ---- */
+
+uint64_t shim_get_start_time(void);
 
 #endif /* SHIM_IPC_H */

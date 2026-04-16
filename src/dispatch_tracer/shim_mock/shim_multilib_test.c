@@ -1,18 +1,19 @@
 /*
- * shim_multilib_test.c — Test app for cross-library correlation.
+ * shim_multilib_test.c — Target app for the shim mock.
  *
- * Calls libB (HIP-level) APIs which internally call libA (HSA-level).
- * When the shim wraps both tables, the consumer sees ENTER/EXIT pairs
- * for both libraries with ancestor fields linking child (libA) to
- * parent (libB) calls.
+ * Calls libB (HIP-level) and libA (HSA-level) APIs in a loop.
+ * The shim is dormant until a consumer attaches. When the consumer
+ * force_configures the SDK (via the shim), the SDK wraps dispatch
+ * tables and generates buffer records into the shim's ring.
  *
- * Usage: shim_multilib_test [iterations]
+ * Usage: shim_multilib_test [iterations] [--wait]
+ *   --wait: print PID and wait for consumer to attach before starting
  *
- * Respects SIMULATED_WORK_US env var — adds a busy-wait between
- * iterations to slow down the loop, same as sample_app_dispatch.
+ * Respects SIMULATED_WORK_US env var.
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,17 +36,26 @@ static void busy_sleep_us(unsigned int microseconds)
 
 int main(int argc, char** argv)
 {
-    int iters = argc > 1 ? atoi(argv[1]) : 10;
+    int iters = argc > 1 ? atoi(argv[1]) : 100;
+    int wait_mode = 0;
+    for (int a = 1; a < argc; a++)
+        if (strcmp(argv[a], "--wait") == 0) wait_mode = 1;
 
     const char* work_env = getenv("SIMULATED_WORK_US");
     unsigned int work_us = work_env ? (unsigned int)atoi(work_env) : 0;
 
-    printf("[multilib_test pid=%d] %d iterations, work=%u us\n",
+    printf("[target pid=%d] %d iterations, work=%u us\n",
            getpid(), iters, work_us);
+    fflush(stdout);
 
-    /* Give the shim bg thread time to finish binding. */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
-    nanosleep(&ts, NULL);
+    if (wait_mode) {
+        printf("[target] waiting for consumer to attach (press Enter to start)...\n");
+        fflush(stdout);
+        getchar();
+    } else {
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+    }
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);

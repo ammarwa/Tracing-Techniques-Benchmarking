@@ -1,185 +1,184 @@
 /*
- * shim_consumer_test.c — minimal OOP consumer for the shim mock.
+ * shim_consumer_test.c — OOP consumer for the new shim architecture.
+ *
+ * Uses the standard rocp_* API (linked via libroc-shim-consumer.so).
+ * Identical API to an in-process tool — just linked differently.
  *
  * Usage: shim_consumer_test <target_pid> [duration_sec]
  *
- * Validates the end-to-end path: socket connect → SO_PEERCRED →
- * SCM_RIGHTS memfd+eventfd → mmap → enable ops → poll ring → print
- * records → detach. Matches SHIM_MEMFD_SOCK_DESIGN §4, §10, §13.
+ * Validates: connect → handshake → force_configure relay →
+ * create_buffer → create_context → configure_buffer_tracing →
+ * start_context → records flow → stop → detach.
  */
 #define _GNU_SOURCE
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "shim_protocol.h"
-#include "shim_ipc.h"
+#include "mock_rocp_sdk.h"
+
+/* Consumer-side connect/disconnect (from shim_consumer_lib.c) */
+extern int  shim_consumer_connect(pid_t target_pid);
+extern void shim_consumer_disconnect(void);
 
 static volatile int g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
-/* Global ctrl pointer for op_info name lookup inside the callback. */
-static shim_ctrl_t* g_con_ctrl = NULL;
+/* ------------------------------------------------------------------ */
+/* Buffer callback — fires when consumer buffer hits watermark         */
+/* ------------------------------------------------------------------ */
 
-/* The record carries compact binary packed-args. The consumer decodes them
- * using the shared arg descriptors (shim_arg_descriptors.c), matching
- * rocprofiler-sdk's iterate_callback_tracing_kind_operation_args pattern:
- * string conversion happens HERE in the consumer, not in the target. */
-#include "shim_arg_info.h"
+static _Atomic uint64_t g_total_records = 0;
 
-/* Arg descriptors — same tables linked by both shim and consumer. */
-extern const shim_op_arg_descriptor_t g_mylib_arg_descs[];
-extern const shim_op_arg_descriptor_t g_liba_arg_descs[];
-extern const shim_op_arg_descriptor_t g_libb_arg_descs[];
-
-static const shim_op_arg_descriptor_t* consumer_get_arg_desc(uint32_t slot_idx)
+static void on_buffer_records(rocp_context_id_t ctx,
+                              rocp_buffer_id_t buffer_id,
+                              const shim_buffer_record_t* records,
+                              uint64_t n_records,
+                              void* user_data,
+                              uint64_t drop_count)
 {
-    if (!g_con_ctrl) return NULL;
-    for (uint32_t i = 0; i < g_con_ctrl->n_registrations; i++) {
-        const shim_table_registration_t* t = &g_con_ctrl->registrations[i];
-        if (slot_idx >= t->slot_base && slot_idx < t->slot_base + t->n_ops) {
-            uint32_t local_op = slot_idx - t->slot_base;
-            if (strcmp(t->name, "mylib") == 0 && local_op < 2)
-                return &g_mylib_arg_descs[local_op];
-            if (strcmp(t->name, "libA_hsa") == 0 && local_op < 4)
-                return &g_liba_arg_descs[local_op];
-            if (strcmp(t->name, "libB_hip") == 0 && local_op < 4)
-                return &g_libb_arg_descs[local_op];
+    (void)ctx; (void)buffer_id; (void)user_data; (void)drop_count;
+
+    uint64_t prev = atomic_fetch_add(&g_total_records, n_records);
+    for (uint64_t i = 0; i < n_records; i++) {
+        if (prev + i < 20 || ((prev + i) % 5000) == 0) {
+            const shim_buffer_record_t* r = &records[i];
+            printf("[rec %" PRIu64 "] kind=%u op=%u corr=%" PRIu64
+                   " start=%" PRIu64 " end=%" PRIu64 " tid=%" PRIu64
+                   " delta=%" PRIu64 "\n",
+                   prev + i, r->kind, r->operation,
+                   r->correlation_id,
+                   r->start_timestamp, r->end_timestamp,
+                   r->thread_id,
+                   r->end_timestamp - r->start_timestamp);
         }
     }
-    return NULL;
 }
 
-static void print_args(const shim_record_t* rec)
+/* ------------------------------------------------------------------ */
+/* tool_initialize — called during force_configure relay               */
+/* ------------------------------------------------------------------ */
+
+static rocp_context_id_t g_ctx;
+static rocp_buffer_id_t  g_buf;
+
+static int my_tool_init(void* fini, void* tool_data)
 {
-    /* Only decode args on EXIT records (output params have final values). */
-    if (rec->phase != SHIM_PHASE_EXIT || rec->arg_bytes == 0) return;
+    (void)fini; (void)tool_data;
 
-    const shim_op_arg_descriptor_t* desc = consumer_get_arg_desc(rec->op);
-    if (!desc) return;
+    rocp_status_t rc;
 
-    /* iterate_args: walk the descriptor, call each formatter on the raw
-     * packed-args binary from the record. String conversion happens HERE
-     * in the consumer process, not in the target — matching the SDK.
-     *
-     * If the op has a deep_copy function AND the record has extra data
-     * beyond the basic packed-args size, the deep-copy payload is appended
-     * after the packed args. Pointer-arg formatters use format_deep to
-     * read the inlined struct copy instead of the target-side pointer. */
-    uint32_t packed_size = 0;
-    if (g_con_ctrl && rec->op < SHIM_MAX_TOTAL_OPS)
-        packed_size = g_con_ctrl->op_info[rec->op].arg_total_bytes;
-
-    const uint8_t* deep_payload = NULL;
-    if (desc->deep_copy && rec->arg_bytes > packed_size)
-        deep_payload = rec->args + packed_size;
-
-    printf("  (");
-    for (uint32_t i = 0; i < desc->n_args; i++) {
-        if (i > 0) printf(", ");
-        char val[128];
-        if (deep_payload && desc->args[i].format_deep) {
-            desc->args[i].format_deep(deep_payload, val, sizeof(val));
-        } else if (desc->args[i].format) {
-            desc->args[i].format(rec->args, val, sizeof(val));
-        } else {
-            snprintf(val, sizeof(val), "?");
-        }
-        printf("%s=%s", desc->args[i].name, val);
+    rc = rocp_create_context(&g_ctx);
+    if (rc != ROCP_STATUS_SUCCESS) {
+        fprintf(stderr, "[tool] create_context failed\n");
+        return -1;
     }
-    printf(")");
+    printf("[tool] context created: id=%" PRIu64 "\n", g_ctx.handle);
+
+    rc = rocp_create_buffer(g_ctx, 65536, 4096,
+                            on_buffer_records, NULL, &g_buf);
+    if (rc != ROCP_STATUS_SUCCESS) {
+        fprintf(stderr, "[tool] create_buffer failed\n");
+        return -1;
+    }
+    printf("[tool] buffer created: id=%" PRIu64 "\n", g_buf.handle);
+
+    rc = rocp_configure_buffer_tracing_service(
+        g_ctx, SHIM_BUF_TRACING_HIP_RUNTIME_API,
+        NULL, 0, g_buf);
+    if (rc != ROCP_STATUS_SUCCESS) {
+        fprintf(stderr, "[tool] configure_buffer_tracing failed\n");
+        return -1;
+    }
+    printf("[tool] HIP runtime API tracing enabled (all ops)\n");
+
+    rc = rocp_configure_buffer_tracing_service(
+        g_ctx, SHIM_BUF_TRACING_HSA_CORE_API,
+        NULL, 0, g_buf);
+    if (rc != ROCP_STATUS_SUCCESS) {
+        fprintf(stderr, "[tool] configure HSA tracing failed\n");
+        return -1;
+    }
+    printf("[tool] HSA core API tracing enabled (all ops)\n");
+
+    rc = rocp_start_context(g_ctx);
+    if (rc != ROCP_STATUS_SUCCESS) {
+        fprintf(stderr, "[tool] start_context failed\n");
+        return -1;
+    }
+    printf("[tool] context started — records should flow now\n");
+
+    return 0;
 }
 
-static void on_record(const shim_record_t* rec, void* user_data)
+static rocp_tool_configure_result_t g_tool_result = {
+    .size       = sizeof(rocp_tool_configure_result_t),
+    .initialize = my_tool_init,
+    .finalize   = NULL,
+};
+
+static rocp_tool_configure_result_t* my_tool_configure(
+    uint32_t version, const char* runtime_version,
+    uint32_t priority, void* client_id)
 {
-    uint64_t* count = (uint64_t*)user_data;
-    (*count)++;
-    if (*count > 40 && (*count % 10000) != 0) return;
-
-    const char* name = "?";
-    if (g_con_ctrl && rec->op < g_con_ctrl->total_ops)
-        name = g_con_ctrl->op_info[rec->op].name;
-
-    const char* phase = rec->phase == SHIM_PHASE_ENTER ? "ENTER" :
-                        rec->phase == SHIM_PHASE_EXIT  ? "EXIT " : "UNRCH";
-
-    printf("[tsc=%" PRIu64 "] %s  %s  tid=%" PRIu64
-           "  corr={i=%" PRIu64 " e=%" PRIu64 " a=%" PRIu64 "}",
-           rec->tsc, phase, name, rec->thread_id,
-           rec->correlation_id.internal,
-           rec->correlation_id.external,
-           rec->correlation_id.ancestor);
-
-    print_args(rec);
-    printf("\n");
+    (void)version; (void)runtime_version; (void)priority; (void)client_id;
+    return &g_tool_result;
 }
+
+/* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <pid> [duration_sec] [--full]\n", argv[0]);
+        fprintf(stderr, "usage: %s <target_pid> [duration_sec]\n", argv[0]);
         return 2;
     }
     pid_t target = atoi(argv[1]);
     int duration = argc > 2 ? atoi(argv[2]) : 5;
-    int full_mode = 0;
-    for (int a = 1; a < argc; a++)
-        if (strcmp(argv[a], "--full") == 0) full_mode = 1;
     signal(SIGINT, on_sigint);
 
-    /* 1. Attach (§4) */
-    shim_ipc_consumer_t con;
-    int rc = shim_consumer_attach(target, &con);
-    if (rc) {
-        fprintf(stderr, "attach(%d) failed\n", target);
+    /* 1. Connect to target's shim */
+    printf("=== Connecting to pid=%d ===\n", target);
+    if (shim_consumer_connect(target) < 0) {
+        fprintf(stderr, "connect failed\n");
         return 1;
     }
 
-    g_con_ctrl = con.ctrl;
-
-    /* Print registrations (§13.6) */
-    printf("=== Attached to pid=%u, %u registrations, %u total_ops ===\n",
-           con.ctrl->pid, con.ctrl->n_registrations, con.ctrl->total_ops);
-    for (uint32_t i = 0; i < con.ctrl->n_registrations; i++) {
-        const shim_table_registration_t* t = &con.ctrl->registrations[i];
-        printf("  table[%u]: name=\"%s\" instance=%u v%u.%u slots=[%u..%u)\n",
-               i, t->name, t->lib_instance,
-               t->major_version, t->minor_version,
-               t->slot_base, t->slot_base + t->n_ops);
+    /* 2. force_configure → tool_init relay */
+    printf("=== Calling force_configure ===\n");
+    rocp_status_t rc = rocp_force_configure(my_tool_configure);
+    if (rc != ROCP_STATUS_SUCCESS) {
+        fprintf(stderr, "force_configure failed\n");
+        shim_consumer_disconnect();
+        return 1;
     }
+    printf("=== force_configure succeeded ===\n");
 
-    /* 2. Enable all ops (§5.1 install-while-off).
-     *    --full: MODE_RECORD_FULL (deep-copy pointed-at structs)
-     *    default: MODE_RECORD (scalars + pointer values only) */
-    uint32_t mode = full_mode ? ROCP_SHIM_MODE_RECORD_FULL : ROCP_SHIM_MODE_RECORD;
-    const char* mode_str = full_mode ? "RECORD_FULL" : "RECORD";
-    for (uint32_t i = 0; i < con.ctrl->total_ops; i++) {
-        atomic_store_explicit(&con.ctrl->op_mode[i], mode, memory_order_release);
-    }
-    atomic_fetch_add(&con.ctrl->gen_counter, 1);
-    printf("=== Enabled %u ops, mode=%s ===\n", con.ctrl->total_ops, mode_str);
-
-    /* 3. Poll loop */
-    uint64_t total_records = 0;
+    /* 3. Wait for records */
+    printf("=== Collecting for %d seconds ===\n", duration);
     time_t start = time(NULL);
     while (!g_stop && (time(NULL) - start) < duration) {
-        int n = shim_consumer_poll(&con, on_record, &total_records, 500);
-        (void)n;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+        nanosleep(&ts, NULL);
     }
 
-    /* 4. Stats (§13.2) */
-    uint64_t traced  = atomic_load(&con.ctrl->events_traced);
-    uint64_t dropped = atomic_load(&con.ctrl->events_dropped);
-    printf("=== Stats: traced=%" PRIu64 " dropped=%" PRIu64
-           " consumer_read=%" PRIu64 " ===\n",
-           traced, dropped, total_records);
+    /* 4. Stop + flush + cleanup */
+    printf("=== Stopping ===\n");
+    rocp_stop_context(g_ctx);
+    rocp_flush_buffer(g_buf);
 
-    /* 5. Detach (§10.3) — zeros all op_mode slots */
-    shim_consumer_detach(&con);
+    uint64_t total = atomic_load(&g_total_records);
+    printf("=== Total records: %" PRIu64 " ===\n", total);
+
+    rocp_destroy_buffer(g_buf);
+    rocp_destroy_context(g_ctx);
+    shim_consumer_disconnect();
     printf("=== Detached ===\n");
     return 0;
 }
